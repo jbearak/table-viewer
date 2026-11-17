@@ -711,6 +711,20 @@ interface CsvEditFileState {
 const csv_edit_file_states = new Map<string, CsvEditFileState>();
 
 /**
+ * Per file key and sheet, which panel's request last committed that sheet's
+ * durable rules in this process. Every panel of a file in this process writes
+ * through the same store, so a panel that commits equal rules after another
+ * takes the record over. Rules another process writes differ from the record,
+ * or, when equal and written between a commit and its reconciliation, are
+ * taken for the recorded panel's own (plan I3).
+ */
+const transform_commit_provenance = new Map<string, Map<number, {
+    readonly panel: symbol;
+    readonly requestId: string;
+    readonly rules: SheetTransformState | undefined;
+}>>();
+
+/**
  * Test seam: forget every in-process save and edit owner, as a process that
  * died mid-save would. Tests that stop a structural save after each step use
  * it before reopening the file in a new controller.
@@ -718,6 +732,13 @@ const csv_edit_file_states = new Map<string, CsvEditFileState>();
 export function simulate_process_restart_for_tests(): void {
     IN_FLIGHT_STRUCTURAL_SAVES.clear();
     csv_edit_file_states.clear();
+    transform_commit_provenance.clear();
+}
+/** Test seam: how many commit records this process keeps, across files and sheets. */
+export function transform_commit_record_count_for_tests(): number {
+    let count = 0;
+    for (const sheets of transform_commit_provenance.values()) count += sheets.size;
+    return count;
 }
 let next_edit_session_host_epoch = 0;
 
@@ -3100,6 +3121,14 @@ export function attach_viewer(
     const file_coordinator = acquire_file_coordinator(uri, durable_state_store);
     const state_path = file_coordinator.statePath;
     const file_key = file_coordinator.authority().fileKey;
+    const transform_provenance_panel = Symbol('transform provenance panel');
+    /** This panel's commit, when it is the last in this process for the sheet. */
+    const transform_commit_record = (sheet_index: number) => {
+        const record = transform_commit_provenance.get(file_key)?.get(sheet_index);
+        return record === undefined || record.panel !== transform_provenance_panel
+            ? undefined
+            : { requestId: record.requestId, rules: record.rules };
+    };
     let file_edit_state = editing_supported
         ? csv_edit_file_states.get(file_key)
         : undefined;
@@ -8482,6 +8511,19 @@ export function attach_viewer(
                 : undefined;
             return { ...current, transforms };
         }, undefined, transform_is_current_before_commit, write_basis);
+        if (committed) {
+            const { onlyChangedRows: _session_only, ...durable } = state;
+            let sheets = transform_commit_provenance.get(file_key);
+            if (sheets === undefined) {
+                sheets = new Map();
+                transform_commit_provenance.set(file_key, sheets);
+            }
+            sheets.set(message.sheetIndex, {
+                panel: transform_provenance_panel,
+                requestId: message.requestId,
+                rules: transform_has_entries(durable) ? durable : undefined,
+            });
+        }
         if (!committed) {
             // Name the real reason when it is the admission that lapsed: "the source
             // changed" would be a lie, and the phases that refuse here all end on
@@ -9343,6 +9385,8 @@ export function attach_viewer(
                     durableRowHeights: durable_row_heights,
                     ...(compare_mode ? { onRowWindowServed: start_compare_diff } : {}),
                     onTransformAnswered: note_transform_answered,
+                    settleTransforms: true,
+                    transformCommit: transform_commit_record,
                 },
                 (installed) => {
                     installed.begin_receiver_epoch(session.current_receiver_epoch);
@@ -13610,6 +13654,10 @@ export function attach_viewer(
             if (editing_supported) {
                 finish_transform_admission(transform_admission.operation);
             }
+            // Last: after the answer and after the reconciliation it led to, so the
+            // projection it carries is everything this request did. A request a
+            // newer one took the sheet from was settled then, and this does nothing.
+            core?.settle_transform(message);
         }
     }
 
@@ -18529,6 +18577,14 @@ export function attach_viewer(
             if (disposed) return;
             disposed = true;
             renderer_ready = false;
+            // This panel's commit records go with it: nothing can name them again.
+            const provenance = transform_commit_provenance.get(file_key);
+            if (provenance !== undefined) {
+                for (const [sheet, record] of provenance) {
+                    if (record.panel === transform_provenance_panel) provenance.delete(sheet);
+                }
+                if (provenance.size === 0) transform_commit_provenance.delete(file_key);
+            }
             for (const request of pending_sheet_selections) {
                 request.reject(new Error(
                     'Viewer controller was disposed before the worksheet could be selected.',

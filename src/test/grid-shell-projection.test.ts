@@ -4393,6 +4393,34 @@ describe('GridShell column projection', () => {
             expect(item('Clear sort on this column')?.getAttribute('aria-disabled')).toBe('true');
             expect(item('Clear all sorts')?.getAttribute('aria-disabled')).toBe('true');
         });
+
+        it('keeps a column\'s sort and filter items enabled while the person\'s own request is in flight, built from the rules asked for', async () => {
+            const filter = {
+                id: 'f1', colIndex: 1, operator: 'contains' as const,
+                value: 'z', caseSensitive: false, enabled: true,
+            };
+            const on_transform_change = vi.fn();
+            await render_grid(props({
+                transform_sections: true,
+                transform_state: unsorted,
+                transform_pending: true,
+                transform_choice_pending: false,
+                pending_transform_target: { ...sorted, filters: [filter] },
+                on_transform_change,
+            }));
+            const on_header_context_menu = grid_mock.props!.onHeaderContextMenu as
+                (column: number, event: Record<string, unknown>) => void;
+            await act(async () => on_header_context_menu(0, {
+                preventDefault: vi.fn(),
+                bounds: { x: 0, y: 0, width: 100, height: 36 },
+                localEventX: 20,
+                localEventY: 10,
+            }));
+            expect(item('Clear all sorts')?.getAttribute('aria-disabled')).toBeNull();
+            await act(async () => item('Clear all filters')!.click());
+            // The sort asked for is kept: the new choice is composed onto it.
+            expect(on_transform_change).toHaveBeenCalledWith({ ...sorted, filters: [] });
+        });
     });
 
     it('preserves an inside multi-row marker selection and hides its coalesced intervals', async () => {

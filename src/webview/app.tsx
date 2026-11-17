@@ -1,4 +1,18 @@
 import { cell_key, parse_cell_key } from '../cell-key';
+import { perf_mark } from './perf-marks';
+import { transform_states_equal } from '../transform-state-equality';
+import {
+    begin_view_action,
+    cancel_view_action,
+    choose_in_view_action,
+    refresh_view_action,
+    resend_in_view_action,
+    settle_view_action,
+    transforms_semantically_equal,
+    view_action_cancel_target,
+    view_action_owns,
+    type ViewAction,
+} from './view-action-model';
 import React, {
     useState,
     useEffect,
@@ -143,6 +157,7 @@ import {
     type RetainedSnapshotCommandResult,
     type StructuralEditingCapability,
     type UnresolvedLfsObject,
+    type WorkbookSnapshot,
     type WorkbookSnapshotCompare,
     type WorkbookSnapshotIdentity,
 } from '../viewer-snapshot';
@@ -502,6 +517,19 @@ interface PendingViewTransform {
     /** The rules requested. Absent for Hide rows: only the host knows its source rows. */
     readonly target?: SheetTransformState;
     readonly replay?: ViewReplay & { readonly delta: TransformViewDelta };
+}
+
+/** The window's view action, with what its step needs that the model does not keep. */
+interface PendingViewAction {
+    readonly action: ViewAction;
+    readonly worksheet: WorksheetTarget;
+    readonly schema: string;
+    /** The baseline when the action began; it moves only for a change made elsewhere. */
+    readonly initialBaseline: SheetTransformState | undefined;
+    /** The newest request was refused. */
+    readonly refused: boolean;
+    /** Where the newest choice or cancel came from: a resend returns focus there. */
+    readonly origin: TransformOrigin;
 }
 
 /** The one column visibility write awaiting `columnVisibilityChanged`. */
@@ -1001,60 +1029,7 @@ function transform_rollback_baseline(
     return { sort: [], filters: [], schema };
 }
 
-export function transforms_semantically_equal(
-    left: SheetTransformState | undefined,
-    right: SheetTransformState | undefined,
-): boolean {
-    if (!transform_has_entries(left) && !transform_has_entries(right)) return true;
-    if (!left || !right) return false;
-    // Session state, but a semantic difference like any other: without this a
-    // toggle of "only changed rows" over an existing sort compared equal to the
-    // sort alone, and handle_transform_change dropped the request as a no-op.
-    if ((left.onlyChangedRows === true) !== (right.onlyChangedRows === true)) return false;
-    if (JSON.stringify(left.sort) !== JSON.stringify(right.sort)) return false;
-    const left_hidden = [...(left.hiddenRows ?? [])].sort((a, b) => a - b);
-    const right_hidden = [...(right.hiddenRows ?? [])].sort((a, b) => a - b);
-    if (JSON.stringify(left_hidden) !== JSON.stringify(right_hidden)) return false;
-    const semantic_filters = (filters: readonly FilterEntry[]) => filters
-        .map((entry) => {
-            const base = {
-                colIndex: entry.colIndex,
-                operator: entry.operator,
-                enabled: entry.enabled,
-            };
-            if (entry.operator === 'isEmpty' || entry.operator === 'isNotEmpty') {
-                return base;
-            }
-            if (entry.operator === 'isOneOf') {
-                return {
-                    ...base,
-                    // Total order with null first and code-unit string compare, so
-                    // equal exclusion sets always serialize identically (locale
-                    // collation can tie distinct strings, e.g. '' vs null or
-                    // composed vs decomposed Unicode).
-                    excludedValues: [...(entry.excludedValues ?? [])].sort(
-                        (a, b) => {
-                            if (a === b) return 0;
-                            if (a === null) return -1;
-                            if (b === null) return 1;
-                            return a < b ? -1 : 1;
-                        },
-                    ),
-                };
-            }
-            return {
-                ...base,
-                value: entry.value ?? '',
-                secondValue: is_range_filter_operator(entry.operator)
-                    ? entry.secondValue ?? ''
-                    : undefined,
-                caseSensitive: entry.caseSensitive,
-            };
-        })
-        .sort((a, b) => a.colIndex - b.colIndex);
-    return JSON.stringify(semantic_filters(left.filters))
-        === JSON.stringify(semantic_filters(right.filters));
-}
+export { transforms_semantically_equal };
 
 /**
  * The durable rules to reconcile against, with the compare window's session
@@ -1164,6 +1139,8 @@ type ReplayLanding = 'applied' | 'unstaged' | 'diverged';
 export function App(): React.JSX.Element {
     const [meta, set_meta] = useState<WorkbookMeta | null>(null);
     const [generation, set_generation] = useState(0);
+    // After the commit that renders it, for the latency spec.
+    useEffect(() => { perf_mark('tv:view-generation-rendered', { generation }); }, [generation]);
     // Bumped on every initial snapshot (a fresh document load — including the
     // preview pane reusing its panel for a different file). Folded into the GridShell key
     // so the row loader remounts clean; a new file can otherwise collide with the
@@ -3289,6 +3266,37 @@ export function App(): React.JSX.Element {
      * id is cleared or replaced.
      */
     const pending_view_transforms_ref = useRef<(PendingViewTransform | undefined)[]>([]);
+    /**
+     * The person's sort, filter, and Unhide all choices on one sheet since its
+     * last install, and every request sent for them (plan I1-I4). At most one in
+     * a window: a choice on another sheet is refused while it is pending. It ends
+     * when the host has settled every request it sent, which can be after the
+     * install, so until then it counts as a view request in flight: an edit
+     * recorded between the install and the settlement would enter history ahead
+     * of the step the person made first.
+     */
+    const view_action_ref = useRef<PendingViewAction | undefined>(undefined);
+    /**
+     * Whether a sort or filter choice on a sheet waits: a request is pending
+     * there that is not the person's own view action's, that is a hide, a
+     * replay, or a restore. The action's own request does not hold a choice,
+     * because a new choice replaces it.
+     */
+    const view_choice_waits = (sheet_index: number): boolean => {
+        const request_id = pending_transform_request_ids_ref.current[sheet_index];
+        if (request_id === undefined) return false;
+        const pending = view_action_ref.current;
+        return pending === undefined
+            || pending.action.sheetIndex !== sheet_index
+            || !view_action_owns(pending.action, request_id);
+    };
+    /** `publish_history_menu_state`, declared further down: the Edit menu names the action. */
+    const publish_history_menu_ref = useRef<() => void>(() => {});
+    /** `cancel_view_action_on_sheet` and `cancel_blocked`, which are declared further down. */
+    const cancel_view_action_ref = useRef<
+        (sheet_index: number, origin?: TransformOrigin) => boolean
+    >(() => false);
+    const cancel_blocked_ref = useRef<() => boolean>(() => true);
     const pending_column_write_ref = useRef<PendingColumnWrite | null>(null);
     const pending_width_write_ref = useRef<PendingWidthWrite | null>(null);
     /**
@@ -3308,7 +3316,8 @@ export function App(): React.JSX.Element {
     const [view_request_pending, set_view_request_pending] = useState(false);
     const view_request_is_pending = useCallback((): boolean => {
         if (
-            pending_view_transforms_ref.current.some((pending) => pending !== undefined)
+            view_action_ref.current !== undefined
+            || pending_view_transforms_ref.current.some((pending) => pending !== undefined)
             || pending_column_write_ref.current !== null
             || pending_width_write_ref.current !== null
         ) return true;
@@ -3904,7 +3913,7 @@ export function App(): React.JSX.Element {
         // Given for a gesture that records a step and for a replay; a restore
         // and a cancel give none.
         view?: Omit<PendingViewTransform, 'requestId'>,
-    ) => {
+    ): string => {
         const request_id = [
             'transform',
             transform_request_prefix_ref.current,
@@ -3914,9 +3923,10 @@ export function App(): React.JSX.Element {
         pending_transform_request_ids_ref.current[sheet_index] = request_id;
         pending_transform_states_ref.current[sheet_index] = state;
         pending_transform_origins_ref.current[sheet_index] = origin;
-        // Replaces whatever was pending on this sheet: a replaced gesture never
-        // answers to this window and records nothing, and a replaced replay (a
-        // cancel) leaves its entry where it was.
+        // Replaces whatever was pending on this sheet. A replaced request of the
+        // person's view action is still answered, and the action keeps its id for
+        // that answer and records once the host has settled all it sent; a replaced
+        // replay (a cancel) leaves its entry where it was.
         pending_view_transforms_ref.current[sheet_index] = view === undefined
             ? undefined
             : { ...view, requestId: request_id };
@@ -3944,7 +3954,135 @@ export function App(): React.JSX.Element {
             sourceGeneration: source_generation_ref.current,
             intent,
         });
+        return request_id;
     }, [sync_view_request_pending]);
+
+    /**
+     * Send the view action's request again: a change made elsewhere moved its
+     * baseline while its newest request was out, so it is composed onto the new
+     * baseline, and this request supersedes the one in flight (I3).
+     */
+    const send_view_action_again = useCallback(() => {
+        const pending = view_action_ref.current;
+        if (pending === undefined) return;
+        const { action } = pending;
+        const request_id = request_transform(
+            action.sheetIndex,
+            action.requested,
+            action.cancelled ? 'cancel' : 'user',
+            pending.origin,
+            action.cancelled ? undefined : {
+                worksheet: pending.worksheet,
+                schema: pending.schema,
+                baseline: action.baseline,
+                target: action.requested,
+            },
+        );
+        view_action_ref.current = {
+            ...pending,
+            action: resend_in_view_action(action, request_id),
+            refused: false,
+        };
+    }, [request_transform]);
+
+    /**
+     * The host settled one of the view action's requests. When it has settled
+     * every one, the action records one step, from its baseline to what is
+     * installed (I2), and a press waiting behind it is decided as today: dropped
+     * with a message when the person's choice came to nothing because it was
+     * refused or another window's change took its place, and let run otherwise.
+     */
+    const settle_view_action_answer = useCallback((
+        msg: Extract<HostMessage, { type: 'transformSettled' }>,
+    ) => {
+        const pending = view_action_ref.current;
+        if (pending === undefined || !view_action_owns(pending.action, msg.requestId)) return;
+        const installed = msg.projection === undefined
+            ? state_ref.current.transforms?.[msg.sheetIndex]
+            : msg.projection.rules;
+        const settlement = settle_view_action(pending.action, msg.requestId, installed, msg.committedBy);
+        if (settlement.kind === 'pending') {
+            view_action_ref.current = { ...pending, action: settlement.action };
+            // Not for a choice the host refused: it is not asked for again.
+            if (settlement.resend && !pending.refused) send_view_action_again();
+            return;
+        }
+        view_action_ref.current = undefined;
+        perf_mark('tv:view-action-ended', { requestId: msg.requestId });
+        // The progress text and Cancel go only now, after the install: a toolbar
+        // control that started the action, Cancel above all, may be what goes, so
+        // the toolbar takes focus back as it does on an install.
+        if (pending.origin === 'toolbar') {
+            set_toolbar_focus_restore({
+                sheet_index: pending.action.sheetIndex,
+                document_epoch: document_epoch_ref.current,
+            });
+        }
+        const step = transform_view_step(
+            pending.worksheet,
+            pending.schema,
+            settlement.baseline,
+            settlement.installed,
+        );
+        record_view_step(step);
+        sync_view_request_pending();
+        publish_history_menu_ref.current();
+        if (
+            step === undefined
+            && !pending.action.cancelled
+            // Moved by a change made elsewhere, by the same strict comparison
+            // that moved it (I3).
+            && (pending.refused
+                || !transform_states_equal(
+                    settlement.baseline ?? EMPTY_TRANSFORM,
+                    pending.initialBaseline ?? EMPTY_TRANSFORM,
+                ))
+        ) {
+            drop_press_behind_unrecorded_gesture();
+        }
+    }, [drop_press_behind_unrecorded_gesture, record_view_step, send_view_action_again, sync_view_request_pending]);
+    const settle_view_action_ref = useRef(settle_view_action_answer);
+    settle_view_action_ref.current = settle_view_action_answer;
+
+    /**
+     * A snapshot on the same source was applied while the view action is
+     * pending. Its durable rules for the action's sheet are this window's own
+     * only when this panel's commit record names one of the action's requests
+     * and wrote those very rules; any other change was made elsewhere and moves
+     * the action's baseline (I3).
+     */
+    const refresh_view_action_after_snapshot = useCallback((snapshot: WorkbookSnapshot) => {
+        const pending = view_action_ref.current;
+        if (pending === undefined) return;
+        const sheet_index = pending.action.sheetIndex;
+        const durable = state_ref.current.transforms?.[sheet_index];
+        const record = snapshot.transformCommits?.[sheet_index];
+        // The host's own comparison, ids and schema included (I3): rules that only
+        // look the same were not committed by this window.
+        const { onlyChangedRows: _session_only, ...durable_rules } = durable ?? EMPTY_TRANSFORM;
+        const committed_by = record !== undefined
+            && transform_states_equal(durable_rules, record.rules ?? EMPTY_TRANSFORM)
+            ? record.requestId
+            : undefined;
+        // The compare toggle is session state and never durable: the snapshot's
+        // rules carry the action's own.
+        const rules = pending.action.baseline?.onlyChangedRows === true
+            ? {
+                ...(durable ?? { ...EMPTY_TRANSFORM, schema: pending.action.schema }),
+                onlyChangedRows: true as const,
+            }
+            : durable;
+        const refreshed = refresh_view_action(pending.action, rules, committed_by);
+        if (refreshed.action === pending.action) return;
+        view_action_ref.current = { ...pending, action: refreshed.action };
+        publish_history_menu_ref.current();
+        // A choice the host refused is not asked for again, even onto a change
+        // made elsewhere (`app.tsx` transformRefused): the baseline moves, and
+        // the action ends when the refusal is settled.
+        if (refreshed.resend && !pending.refused) send_view_action_again();
+    }, [send_view_action_again]);
+    const refresh_view_action_ref = useRef(refresh_view_action_after_snapshot);
+    refresh_view_action_ref.current = refresh_view_action_after_snapshot;
 
     /** Drop a save verdict and any informational notice tied to that verdict. */
     const clear_save_verdict = useCallback(() => {
@@ -5382,7 +5520,12 @@ export function App(): React.JSX.Element {
                         // surviving action would be the previous workbook's
                         // edits, waiting to be replayed through whatever
                         // worksheet identity happened to match here.
+                        // The action goes first, so the menu the cleared history
+                        // publishes does not name it.
+                        view_action_ref.current = undefined;
                         history_store_ref.current!.clear();
+                        // An empty history does not notify, so the menu is told here.
+                        publish_history_menu_ref.current();
                         history_document_ref.current += 1;
                         // Every view request of the outgoing document is
                         // abandoned outright: nothing is compared, nothing is
@@ -6100,20 +6243,46 @@ export function App(): React.JSX.Element {
                     // flight during an owned edit session, where committing an edit
                     // makes the host redeliver the projection at the same generation.
                     if (row_basis_changed) {
-                        set_pending_transforms([]);
-                        set_pending_transform_labels([]);
-                        pending_transform_request_ids_ref.current = [];
-                        pending_transform_states_ref.current = [];
-                        pending_transform_origins_ref.current = [];
+                        // The view action's request is kept on the same source: the
+                        // host still computes it, and only a new source or receiver
+                        // stops it (I3, `panel-core.ts` handle_set_transform). The
+                        // action decides on this snapshot once it is applied.
+                        if (source_changed && view_action_ref.current !== undefined) {
+                            view_action_ref.current = undefined;
+                            publish_history_menu_ref.current();
+                        }
+                        const kept_sheet = view_action_ref.current?.action.sheetIndex;
+                        const kept = kept_sheet === undefined ? undefined : {
+                            id: pending_transform_request_ids_ref.current[kept_sheet],
+                            state: pending_transform_states_ref.current[kept_sheet],
+                            origin: pending_transform_origins_ref.current[kept_sheet],
+                            view: pending_view_transforms_ref.current[kept_sheet],
+                        };
+                        const keep = <T,>(values: T[], value: T | undefined): T[] => {
+                            if (kept_sheet === undefined || value === undefined) return [];
+                            const next: T[] = [];
+                            next[kept_sheet] = value;
+                            return next;
+                        };
+                        set_pending_transforms(keep([], kept?.id === undefined ? undefined : true));
+                        set_pending_transform_labels((previous) => keep(
+                            [],
+                            kept?.id === undefined || kept_sheet === undefined ? undefined : previous[kept_sheet],
+                        ));
+                        pending_transform_request_ids_ref.current = keep([], kept?.id);
+                        pending_transform_states_ref.current = keep([], kept?.state);
+                        pending_transform_origins_ref.current = keep([], kept?.origin);
                         notify_transform_settled();
                         // The view requests dropped with them are settled below
                         // by what this snapshot shows.
                         overtaken_view_requests_ref.current.views.push(
                             ...pending_view_transforms_ref.current.filter(
-                                (pending): pending is PendingViewTransform => pending !== undefined,
+                                (pending): pending is PendingViewTransform => (
+                                    pending !== undefined && pending !== kept?.view
+                                ),
                             ),
                         );
-                        pending_view_transforms_ref.current = [];
+                        pending_view_transforms_ref.current = keep([], kept?.view);
                         sync_view_request_pending();
                         // Different rows mean the earlier refusal was about a basis
                         // that no longer exists, and the permutation the host dropped
@@ -6575,6 +6744,7 @@ export function App(): React.JSX.Element {
                     // View requests this snapshot overtook, judged by the state
                     // it has just installed.
                     settle_overtaken_view_requests();
+                    refresh_view_action_ref.current(snapshot);
                     // A fit the host refused may be tried again now.
                     owed_fit_held_ref.current = new Set();
                     // Counted here and nowhere else: what a held press and a
@@ -6739,7 +6909,15 @@ export function App(): React.JSX.Element {
                         message: `Could not update the table view: ${msg.reason}`,
                     });
                 }
-                if (refused_replay === undefined && refusal_origin !== 'restore') {
+                const refused_action = view_action_ref.current;
+                if (
+                    refused_action !== undefined
+                    && view_action_owns(refused_action.action, msg.requestId)
+                ) {
+                    // The action ends when the host settles it; what a press behind
+                    // it does is decided then, by whether anything was recorded.
+                    view_action_ref.current = { ...refused_action, refused: true };
+                } else if (refused_replay === undefined && refusal_origin !== 'restore') {
                     // The person's own gesture was refused, so nothing was recorded: a press
                     // held behind it was for its step, and would otherwise undo the one under it
                     // (as with Cancel).
@@ -6748,13 +6926,47 @@ export function App(): React.JSX.Element {
                 return;
             }
 
-            if (msg.type === 'transformInstalled') {
+            if (msg.type === 'transformSettled') {
+                perf_mark('tv:view-request-settled', { requestId: msg.requestId });
+                const settled_action = view_action_ref.current;
                 if (
-                    pending_transform_request_ids_ref.current[msg.sheetIndex]
-                    !== msg.requestId
+                    settled_action === undefined
+                    || settled_action.action.sheetIndex !== msg.sheetIndex
+                    || !view_action_owns(settled_action.action, msg.requestId)
+                ) return;
+                // What the host has installed now, which a reconciliation after the
+                // answer can have changed: taken whole, as an install is, before the
+                // action decides on it (I3). It does not wait for a snapshot.
+                if (
+                    msg.projection !== undefined
+                    && msg.projection.view.basis.generation > generation_ref.current
                 ) {
-                    return;
+                    handler({
+                        data: {
+                            type: 'transformInstalled',
+                            sheetIndex: msg.sheetIndex,
+                            requestId: msg.requestId,
+                            intent: 'user',
+                            ...msg.projection,
+                        } satisfies HostMessage,
+                    } as MessageEvent);
                 }
+                settle_view_action_ref.current(msg);
+                return;
+            }
+
+            if (msg.type === 'transformInstalled') {
+                const answers_newest = pending_transform_request_ids_ref.current[msg.sheetIndex]
+                    === msg.requestId;
+                // An answer for a request of the view action that a newer one
+                // replaced: the host did install it, so the window shows it, and
+                // the action records it if nothing later does (I3).
+                const pending_action = view_action_ref.current;
+                const action_owned = pending_action !== undefined
+                    && pending_action.action.sheetIndex === msg.sheetIndex
+                    && view_action_owns(pending_action.action, msg.requestId);
+                if (!answers_newest && !action_owned) return;
+                if (!answers_newest && msg.view.basis.generation <= generation_ref.current) return;
                 const view = msg.view;
                 const mapping_changed =
                     mapping_generations_ref.current[msg.sheetIndex]
@@ -6796,7 +7008,7 @@ export function App(): React.JSX.Element {
                 // that would leave this window on a generation the host has
                 // left. A restore and a cancel keep the fold-or-return.
                 const pending_view = pending_view_transforms_ref.current[msg.sheetIndex];
-                const view_request = pending_view?.requestId === msg.requestId
+                const view_request = answers_newest && pending_view?.requestId === msg.requestId
                     ? pending_view
                     : undefined;
                 if (view_request !== undefined) {
@@ -6818,39 +7030,48 @@ export function App(): React.JSX.Element {
                     }
                 }
                 if (view.basis.generation !== generation_ref.current) {
+                    // An action's request folded the open editor when it was made,
+                    // and cells have offered none since, like any view request's.
                     if (
                         view_request === undefined
+                        && !action_owned
                         && editing_ref.current?.commit_live_edit() === false
                     ) return;
                     set_grid_mount_epoch((epoch) => epoch + 1);
                 }
-                const origin = pending_transform_origins_ref.current[msg.sheetIndex];
-                pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
-                pending_transform_states_ref.current[msg.sheetIndex] = undefined;
-                pending_transform_origins_ref.current[msg.sheetIndex] = undefined;
-                notify_transform_settled();
-                if (origin === 'grid' || origin === 'history') {
-                    set_grid_focus_restore({
-                        sheet_index: msg.sheetIndex,
-                        generation: view.basis.generation,
-                        document_epoch: document_epoch_ref.current,
+                // Read before the newest request's bookkeeping is cleared; an older
+                // request of the action has none of its own left.
+                const origin = answers_newest
+                    ? pending_transform_origins_ref.current[msg.sheetIndex]
+                    : undefined;
+                if (answers_newest) {
+                    pending_transform_request_ids_ref.current[msg.sheetIndex] = undefined;
+                    pending_transform_states_ref.current[msg.sheetIndex] = undefined;
+                    pending_transform_origins_ref.current[msg.sheetIndex] = undefined;
+                    notify_transform_settled();
+                    if (origin === 'grid' || origin === 'history') {
+                        set_grid_focus_restore({
+                            sheet_index: msg.sheetIndex,
+                            generation: view.basis.generation,
+                            document_epoch: document_epoch_ref.current,
+                        });
+                    } else if (origin === 'toolbar') {
+                        set_toolbar_focus_restore({
+                            sheet_index: msg.sheetIndex,
+                            document_epoch: document_epoch_ref.current,
+                        });
+                    }
+                    set_pending_transforms((prev) => {
+                        const next = [...prev];
+                        next[msg.sheetIndex] = false;
+                        return next;
                     });
-                } else if (origin === 'toolbar') {
-                    set_toolbar_focus_restore({
-                        sheet_index: msg.sheetIndex,
-                        document_epoch: document_epoch_ref.current,
+                    set_pending_transform_labels((prev) => {
+                        const next = [...prev];
+                        next[msg.sheetIndex] = '';
+                        return next;
                     });
                 }
-                set_pending_transforms((prev) => {
-                    const next = [...prev];
-                    next[msg.sheetIndex] = false;
-                    return next;
-                });
-                set_pending_transform_labels((prev) => {
-                    const next = [...prev];
-                    next[msg.sheetIndex] = '';
-                    return next;
-                });
                 set_generation(view.basis.generation);
                 generation_ref.current = view.basis.generation;
                 // Something installed, so whatever was refusing has cleared: the next
@@ -6993,8 +7214,9 @@ export function App(): React.JSX.Element {
                 set_transforms(next_transforms);
                 // The gesture landed: its step is what it changed, from the
                 // rules it was composed against to the rules installed. Hide
-                // rows learns its source rows here.
-                if (view_request !== undefined && view_request.replay === undefined) {
+                // rows learns its source rows here. A view action's step waits
+                // for the host to settle everything the action sent (I2, I3).
+                if (view_request !== undefined && view_request.replay === undefined && !action_owned) {
                     record_view_step(transform_view_step(
                         view_request.worksheet,
                         view_request.schema,
@@ -7382,6 +7604,7 @@ export function App(): React.JSX.Element {
      */
     const edit_gestures_admitted = useCallback(
         (options?: GestureAdmissionOptions) => history_free(options)
+            && view_action_ref.current === undefined
             && !pending_view_transforms_ref.current.some((pending) => pending !== undefined),
         [history_free],
     );
@@ -7754,9 +7977,18 @@ export function App(): React.JSX.Element {
     const publish_history_menu_state = useCallback(() => {
         const store = history_store_ref.current;
         if (store === null) return;
+        const pending = view_action_ref.current;
         const projection = history_menu_projection(
             store.snapshot(),
             edit_command_target(document.activeElement) === 'text',
+            pending === undefined || pending.action.cancelled
+                ? undefined
+                : transform_view_step(
+                    pending.worksheet,
+                    pending.schema,
+                    pending.action.baseline,
+                    pending.action.requested,
+                )?.label,
         );
         // The helper already answers false for a ref that has never been posted,
         // which is what makes the first publish happen.
@@ -7764,6 +7996,7 @@ export function App(): React.JSX.Element {
         history_menu_state_ref.current = projection;
         host_bridge.postMessage({ type: 'historyMenuStateChanged', state: projection });
     }, []);
+    publish_history_menu_ref.current = publish_history_menu_state;
 
     const publish_retained_saved_append_authorities = useCallback(() => {
         const store = history_store_ref.current;
@@ -7849,6 +8082,7 @@ export function App(): React.JSX.Element {
         publish_history_menu_state();
         publish_retained_saved_append_authorities();
         const unsubscribe = history_store_ref.current!.subscribe(() => {
+            perf_mark('tv:history-changed');
             publish_history_menu_state();
             publish_retained_saved_append_authorities();
             set_redo_available(
@@ -8326,7 +8560,10 @@ export function App(): React.JSX.Element {
                 || pending_width_write_ref.current !== null
                 || (session_id !== undefined
                     && pending_changes_durability.structural_backlog_full(session_id)),
-            view_request_in_flight: pending_view_transforms_ref.current.some((pending) => pending !== undefined),
+            // The view action counts until the host has settled it, which can be
+            // after its install: a press waits for its step (I5).
+            view_request_in_flight: view_action_ref.current !== undefined
+                || pending_view_transforms_ref.current.some((pending) => pending !== undefined),
             session_gesture_pending: pending_edit_request_ref.current !== null
                 || editing_ref.current?.gesture_pending() === true,
             save_in_flight: save_in_flight_ref.current
@@ -8845,6 +9082,7 @@ export function App(): React.JSX.Element {
      * `epoch` it was given when the key was pressed.
      */
     const press_history = useCallback((direction: HistoryDirection, handed_on?: HistoryPress) => {
+        if (handed_on === undefined) perf_mark('tv:press', { direction });
         if (handed_on !== undefined) {
             void run_history_command(handed_on);
             return;
@@ -8855,6 +9093,31 @@ export function App(): React.JSX.Element {
                 held_press_ref.current = null;
                 arm_history_press_timer();
             }
+            return;
+        }
+        // Undo of the person's own view request still in flight cancels it,
+        // back to the rules from before it (I4). The press is used up and makes
+        // no step. Not when a header run is waiting or running: that is newer
+        // than the request, and the press waits for it, as today. Not under the
+        // reopen fence, which refuses the press with its message below.
+        const pending_action = view_action_ref.current;
+        if (
+            direction === 'undo'
+            && pending_action !== undefined
+            && !pending_action.action.cancelled
+            && transform_view_step(
+                pending_action.worksheet,
+                pending_action.schema,
+                pending_action.action.baseline,
+                pending_action.action.requested,
+            ) !== undefined
+            && !reopen_required_ref.current
+            && excel_header_queue_ref.current === null
+            && pending_excel_header_ref.current === null
+            && header_run_ref.current === null
+            && !cancel_blocked_ref.current()
+        ) {
+            cancel_view_action_ref.current(pending_action.action.sheetIndex, 'history');
             return;
         }
         void run_history_command({
@@ -10291,6 +10554,10 @@ export function App(): React.JSX.Element {
                 && pending.replay === undefined
                 && index !== transform_sheet_index
             ))
+            // One view action per window (I1), from its first choice until the
+            // host has settled it, which outlasts its pending record.
+            || (view_action_ref.current !== undefined
+                && view_action_ref.current.action.sheetIndex !== transform_sheet_index)
         ) {
             show_warning(VIEW_GESTURE_WAIT_MESSAGE);
             return false;
@@ -10350,42 +10617,104 @@ export function App(): React.JSX.Element {
             // A request that changes nothing is not a gesture: it folds no
             // open editor and says nothing.
             if (transforms_semantically_equal(current, sanitized)) return false;
-            if (!view_gesture_may_start(active_sheet_index)) return false;
+            // A new choice drops a press waiting behind the view action, silently,
+            // as Cancel does: the press was made for a stack the choice changes
+            // (I5). It is dropped before the checks below, which a waiting press
+            // would otherwise refuse the choice for, and put back if the choice
+            // is refused anyway: a choice that never happened drops nothing. A
+            // change of "Only changed rows" drops it too: kept, the press would
+            // refuse the change.
+            let keep_dropped_press = () => {};
             if (
-                (sanitized.sort.length > 0
+                view_action_ref.current?.action.sheetIndex === active_sheet_index
+                && held_press_ref.current !== null
+                && held_press_ref.current.typing !== true
+            ) {
+                const held = held_press_ref.current;
+                const retry = retry_press_ref.current;
+                drop_history_presses({ keep_typing: true });
+                keep_dropped_press = () => {
+                    held_press_ref.current = held;
+                    retry_press_ref.current = retry;
+                    arm_history_press_timer();
+                };
+            }
+            // A hide, a replay, or a restore in flight on the sheet holds the
+            // choice: replacing its request would leave its answer unmatched.
+            if (view_choice_waits(active_sheet_index)) {
+                keep_dropped_press();
+                show_warning(VIEW_GESTURE_WAIT_MESSAGE);
+                return false;
+            }
+            if (
+                !view_gesture_may_start(active_sheet_index)
+                || ((sanitized.sort.length > 0
                     || sanitized.filters.some((filter) => filter.enabled)
                     || (sanitized.hiddenRows?.length ?? 0) > 0)
-                && inserted_rows_refuse_transform(active_sheet_index)
-            ) return false;
-            request_transform(
+                    && inserted_rows_refuse_transform(active_sheet_index))
+            ) {
+                keep_dropped_press();
+                return false;
+            }
+            if (active_sheet === undefined || schema === undefined) {
+                request_transform(active_sheet_index, sanitized, 'user', origin);
+                return true;
+            }
+            const worksheet: WorksheetTarget = {
+                sheetIndex: active_sheet_index,
+                sheetName: active_sheet.name,
+                ...(active_sheet.worksheetId === undefined
+                    ? {}
+                    : { worksheetId: active_sheet.worksheetId }),
+            };
+            // The choice joins the sheet's action, or begins one from the rules
+            // this window last saw installed (I4). The action records one step,
+            // from that baseline, when the host has settled all it sent.
+            const pending_action = view_action_ref.current?.action.sheetIndex === active_sheet_index
+                ? view_action_ref.current
+                : undefined;
+            // "Only changed rows" on its own is no choice (I1): it has no step, so
+            // it records nothing, names nothing on the Edit menu, and Undo does not
+            // cancel it. It is still carried by an action, which keeps each request
+            // it sends until the host settles it, so a newer toggle that replaces
+            // an older one cannot lose what the older one installed.
+            const action = pending_action?.action ?? begin_view_action(
+                active_sheet_index,
+                schema,
+                state_ref.current.transforms?.[active_sheet_index],
+            );
+            const request_id = request_transform(
                 active_sheet_index,
                 sanitized,
                 'user',
                 origin,
-                // The baseline is the rules this window last saw installed,
-                // never a pending request's target: a request this one
-                // replaces never answers here, and this one's install then
-                // carries both gestures, recorded as one step.
-                active_sheet === undefined || schema === undefined ? undefined : {
-                    worksheet: {
-                        sheetIndex: active_sheet_index,
-                        sheetName: active_sheet.name,
-                        ...(active_sheet.worksheetId === undefined
-                            ? {}
-                            : { worksheetId: active_sheet.worksheetId }),
-                    },
+                {
+                    worksheet,
                     schema,
-                    baseline: state_ref.current.transforms?.[active_sheet_index],
+                    baseline: action.baseline,
                     target: sanitized,
                 },
             );
+            view_action_ref.current = {
+                action: choose_in_view_action(action, sanitized, request_id),
+                worksheet: pending_action?.worksheet ?? worksheet,
+                schema: pending_action?.schema ?? schema,
+                initialBaseline: pending_action?.initialBaseline ?? action.baseline,
+                refused: false,
+                origin,
+            };
+            sync_view_request_pending();
+            publish_history_menu_ref.current();
             return true;
         },
         [
             active_sheet_index,
+            arm_history_press_timer,
+            drop_history_presses,
             inserted_rows_refuse_transform,
             meta,
             request_transform,
+            sync_view_request_pending,
             view_gesture_may_start,
         ],
     );
@@ -10394,6 +10723,8 @@ export function App(): React.JSX.Element {
         if (
             !view_gesture_may_start(active_sheet_index)
             || pending_transforms[active_sheet_index]
+            // The person's sort or filter may have installed and still be settling.
+            || view_action_ref.current !== undefined
             || inserted_rows_refuse_transform(active_sheet_index)
         ) return;
         const request_id = [
@@ -10618,7 +10949,9 @@ export function App(): React.JSX.Element {
             });
             return;
         }
-        const current = state_ref.current.transforms?.[active_sheet_index]
+        // Composed onto the rules asked for, so a sort or filter in flight is kept (I6).
+        const current = pending_transform_states_ref.current[active_sheet_index]
+            ?? state_ref.current.transforms?.[active_sheet_index]
             ?? transforms[active_sheet_index]
             ?? EMPTY_TRANSFORM;
         const { hiddenRows: _hidden_rows, ...next } = current;
@@ -10680,14 +11013,13 @@ export function App(): React.JSX.Element {
         }
         if (
             !view_gesture_may_start(active_sheet_index)
-            || pending_transforms[active_sheet_index]
+            || view_choice_waits(active_sheet_index)
             || inserted_rows_refuse_transform(active_sheet_index)
         ) return;
         set_filter_editor({ column_index, anchor, restore_focus, origin });
     }, [
         active_sheet_index,
         inserted_rows_refuse_transform,
-        pending_transforms,
         view_gesture_may_start,
     ]);
 
@@ -10806,7 +11138,16 @@ export function App(): React.JSX.Element {
 
     const apply_filter_editor = useCallback((entry: FilterEntry) => {
         if (!filter_editor) return;
-        const current = transforms[active_sheet_index] ?? EMPTY_TRANSFORM;
+        // During a restore the editor stays open with its draft: the choice
+        // would otherwise be composed onto rules the restore is still asking for.
+        if (pending_transform_origins_ref.current[active_sheet_index] === 'restore') {
+            show_warning(VIEW_GESTURE_WAIT_MESSAGE);
+            return;
+        }
+        // Composed onto the rules asked for, so a choice in flight is kept (I6).
+        const current = pending_transform_states_ref.current[active_sheet_index]
+            ?? transforms[active_sheet_index]
+            ?? EMPTY_TRANSFORM;
         const requested = handle_transform_change({
             ...current,
             filters: upsert_filter(current.filters, entry),
@@ -10817,12 +11158,19 @@ export function App(): React.JSX.Element {
         close_filter_editor,
         filter_editor,
         handle_transform_change,
+        show_warning,
         transforms,
     ]);
 
     const remove_filter_editor = useCallback(() => {
         if (!filter_editor) return;
-        const current = transforms[active_sheet_index] ?? EMPTY_TRANSFORM;
+        if (pending_transform_origins_ref.current[active_sheet_index] === 'restore') {
+            show_warning(VIEW_GESTURE_WAIT_MESSAGE);
+            return;
+        }
+        const current = pending_transform_states_ref.current[active_sheet_index]
+            ?? transforms[active_sheet_index]
+            ?? EMPTY_TRANSFORM;
         // Remove by column, matching how the popover determines "existing".
         const requested = handle_transform_change({
             ...current,
@@ -10836,8 +11184,57 @@ export function App(): React.JSX.Element {
         close_filter_editor,
         filter_editor,
         handle_transform_change,
+        show_warning,
         transforms,
     ]);
+
+    /**
+     * Cancel the view action on a sheet, back to its baseline (I4): the rules
+     * installed when its first choice was made, or those a refresh from
+     * elsewhere moved it onto, with the compare toggle kept as asked. The cancel
+     * is the action's newest request, so the action ends when the host settles
+     * it, with no step if the baseline is what is installed then. Presses
+     * waiting behind the action are dropped silently, as Cancel drops them.
+     * Answers whether there was an action to cancel.
+     */
+    const cancel_view_action_on_sheet = useCallback((
+        sheet_index: number,
+        origin: TransformOrigin = 'toolbar',
+    ): boolean => {
+        const pending = view_action_ref.current;
+        if (pending === undefined || pending.action.sheetIndex !== sheet_index) return false;
+        // A cancel already out is not sent twice; one the host refused is sent again.
+        if (pending.action.cancelled && !pending.refused) return true;
+        drop_history_presses({ keep_typing: true });
+        // An action with no step asks for nothing but its baseline and a compare
+        // toggle, so the toggle is what its cancel takes back (I4 keeps it
+        // otherwise). That is the net effect: a sort chosen and cleared again,
+        // with the toggle on, has no step either. A cancel sent again already
+        // asks for the toggle the first one chose.
+        const keep_toggle = pending.action.cancelled || transform_view_step(
+            pending.worksheet,
+            pending.schema,
+            pending.action.baseline,
+            pending.action.requested,
+        ) !== undefined;
+        const request_id = request_transform(
+            sheet_index,
+            view_action_cancel_target(pending.action, keep_toggle),
+            'cancel',
+            origin,
+        );
+        view_action_ref.current = {
+            ...pending,
+            action: cancel_view_action(pending.action, request_id, keep_toggle),
+            refused: false,
+            origin,
+        };
+        publish_history_menu_ref.current();
+        return true;
+    }, [drop_history_presses, request_transform]);
+
+    cancel_view_action_ref.current = cancel_view_action_on_sheet;
+    cancel_blocked_ref.current = cancel_blocked;
 
     const handle_cancel_transform = useCallback(() => {
         // A cancel the host would refuse must not displace the request it is
@@ -10850,6 +11247,7 @@ export function App(): React.JSX.Element {
         // would land and stay until the reopen.
         if (refused_for_reopen()) return;
         if (cancel_blocked()) return;
+        if (cancel_view_action_on_sheet(active_sheet_index)) return;
         const previous = transform_rollback_baseline(
             sheet_views[active_sheet_index],
             state_ref.current.transforms?.[active_sheet_index],
@@ -10878,6 +11276,7 @@ export function App(): React.JSX.Element {
     }, [
         active_sheet_index,
         cancel_blocked,
+        cancel_view_action_on_sheet,
         drop_history_presses,
         meta,
         refused_for_reopen,
@@ -13167,14 +13566,18 @@ export function App(): React.JSX.Element {
     // than there. If you are looking for what a permutation still *changes* on screen,
     // `merges` is the answer.
     const transform_active = installed_view?.permuted ?? false;
-    const any_transform_pending = pending_transforms.some(Boolean);
+    // The person's view action is pending until the host settles all it sent,
+    // which can outlast its newest request's answer: a newer request refused
+    // before it took the sheet leaves the older one computing (I3).
+    const view_action_here = view_action_ref.current?.action.sheetIndex === active_sheet_index;
+    const any_transform_pending = pending_transforms.some(Boolean) || view_action_ref.current !== undefined;
     const has_hidden_columns =
         current_column_projection.visible_to_source.length
         < current_sheet.columnCount;
     const merges_flattened =
         current_sheet.merges.length > 0
         && (transform_active || has_hidden_columns || active_layout_changed);
-    const transform_pending = pending_transforms[active_sheet_index] ?? false;
+    const transform_pending = (pending_transforms[active_sheet_index] ?? false) || view_action_here;
     const hidden_row_count = visible_transform.hiddenRows?.length ?? 0;
     const show_formatting = show_formatting_by_sheet[active_sheet_index] ?? true;
     const excel_header = current_sheet.excelFirstRowHeader;
@@ -13204,6 +13607,16 @@ export function App(): React.JSX.Element {
     const pending_transform_target = transform_pending && !preview_mode
         ? pending_transform_states_ref.current[active_sheet_index] ?? visible_transform
         : undefined;
+    // The rules asked for, which every sort and filter control shows and builds
+    // from (I6), and whether those controls wait: only for a hide, a replay, or
+    // a restore on the sheet, never for the person's own request, which a new
+    // choice replaces.
+    const transform_choice_pending = transform_pending && view_choice_waits(active_sheet_index);
+    // A restore's target is not shown before it installs: only the person's own
+    // request is shown as asked for.
+    const requested_transform = transform_choice_pending
+        ? visible_transform
+        : pending_transform_target ?? visible_transform;
     const excel_header_disabled_reason = !excel_header_candidate_available
         && !excel_header?.active
         ? 'This sheet has no first row to use as column names.'
@@ -13707,6 +14120,7 @@ export function App(): React.JSX.Element {
             transform_sections={!transform_ui_blocked}
             transform_waits_for_claim={transform_waits_for_claim}
             transform_pending={transform_pending}
+            transform_choice_pending={transform_choice_pending}
             {...(pending_transform_target === undefined ? {} : { pending_transform_target })}
             on_transform_change={handle_grid_transform_change}
             on_open_filter={open_grid_filter_editor}
@@ -13742,9 +14156,9 @@ export function App(): React.JSX.Element {
                     git_compare.changedColumnNames.some((columns) => columns.length > 0)
                     || git_compare.sheetStatuses.some((status) => status !== 'matched')
                 }
-                only_changed_rows={visible_transform.onlyChangedRows === true}
+                only_changed_rows={requested_transform.onlyChangedRows === true}
                 on_toggle_only_changed_rows={handle_toggle_only_changed_rows}
-                filter_pending={transform_pending}
+                filter_pending={transform_choice_pending}
             />
         )
         : null;
@@ -13791,13 +14205,14 @@ export function App(): React.JSX.Element {
     const sheet_pane = (
         <div className="sheet-pane">
             <StateStrip
-                transform={visible_transform}
+                transform={requested_transform}
                 transform_disabled={transform_ui_blocked}
                 transform_pending={transform_pending}
+                transform_choice_pending={transform_choice_pending}
                 transform_progress={pending_transform_labels[active_sheet_index]}
                 hidden_rows={{
                     count: hidden_row_count,
-                    pending: transform_pending,
+                    pending: transform_choice_pending,
                     // For a promoted header it is a Header Row change, so it
                     // waits like one; see `excel_header_change_pending`.
                     disabled: excel_header_change_pending
@@ -13921,7 +14336,7 @@ export function App(): React.JSX.Element {
                     column_index={filter_editor.column_index}
                     column_name={column_names[filter_editor.column_index]
                         ?? `Column ${filter_editor.column_index + 1}`}
-                    filters={visible_transform.filters}
+                    filters={requested_transform.filters}
                     anchor={filter_editor.anchor}
                     histogram={filter_histogram.key === `${source_generation_ref.current}:${active_sheet_index}:${filter_editor.column_index}`
                         ? filter_histogram.value

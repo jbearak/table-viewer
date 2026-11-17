@@ -936,12 +936,11 @@ describe('ViewerPanelCore', () => {
         }
     });
 
-    it('rejects histogram requests with stale generations or invalid coordinates', async () => {
+    it('rejects histogram requests with a stale source or invalid coordinates', async () => {
         const { panel, posted } = make_panel();
         const src = new StubSource();
         const core = new ViewerPanelCore(panel, src);
         for (const request of [
-            { requestId: 'generation', generation: 0, sourceGeneration: 1, sheetIndex: 0, columnIndex: 0 },
             { requestId: 'source', generation: 1, sourceGeneration: 0, sheetIndex: 0, columnIndex: 0 },
             { requestId: 'sheet', generation: 1, sourceGeneration: 1, sheetIndex: 8, columnIndex: 0 },
             { requestId: 'column', generation: 1, sourceGeneration: 1, sheetIndex: 0, columnIndex: 8 },
@@ -954,14 +953,14 @@ describe('ViewerPanelCore', () => {
                 ...request,
             } as Extract<WebviewMessage, { type: 'requestFilterHistogram' }>);
         }
-        expect(posted).toHaveLength(7);
+        expect(posted).toHaveLength(6);
         expect(posted.every((message) =>
             message.type === 'filterHistogram' && typeof message.error === 'string'))
             .toBe(true);
         expect(src.read_rows_calls).toBe(0);
     });
 
-    it('echoes the request tuple when a delayed histogram request is view-stale', async () => {
+    it('answers a histogram request from before a transform installed, echoing its tuple', async () => {
         const { panel, posted } = make_panel();
         const core = new ViewerPanelCore(panel, new StubSource());
         await core.handle_message({
@@ -977,8 +976,8 @@ describe('ViewerPanelCore', () => {
         expect(posted.at(-1)).toMatchObject({
             type: 'filterHistogram', requestId: 'delayed',
             generation: 1, sourceGeneration: 1,
-            error: 'The view changed before this histogram request arrived.',
         });
+        expect(posted.at(-1).error).toBeUndefined();
     });
 
     it('physical replacement advances both generations and clears cache exactly once', async () => {
@@ -3101,6 +3100,183 @@ describe('ViewerPanelCore', () => {
         });
     });
 
+});
+
+// Every setTransform is settled exactly once, so a window can end a view action
+// only when everything it asked for is accounted for (plan I3).
+describe('transform settlement', () => {
+    const schema = '["Sheet1",2,null]';
+    const sort = (direction: 'asc' | 'desc') => ({
+        sort: [{ colIndex: 0, direction }], filters: [], schema,
+    });
+    const request = (core: ViewerPanelCore, requestId: string, state: any, intent: any = 'user') => ({
+        type: 'setTransform' as const, sheetIndex: 0, requestId,
+        generation: core.generation, sourceGeneration: core.source_generation,
+        intent, state,
+    });
+    const settled = (posted: any[]) => posted.filter((message) => message.type === 'transformSettled');
+
+    it('posts nothing unless the core is asked to settle', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5));
+        await core.handle_message(request(core, 'sort', sort('desc')));
+        core.settle_transform(request(core, 'sort', sort('desc')));
+        expect(settled(posted)).toEqual([]);
+    });
+
+    it('settles an installed request once, with the installed projection and its provenance', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5), {
+            settleTransforms: true,
+            transformCommit: (sheet_index) => (sheet_index === 0
+                ? { requestId: 'sort', rules: { sort: [{ colIndex: 0, direction: 'desc' }], filters: [], schema } }
+                : undefined),
+        });
+        const message = request(core, 'sort', sort('desc'));
+        await core.handle_message(message);
+        expect(settled(posted)).toEqual([]);
+        core.settle_transform(message);
+        core.settle_transform(message);
+        const installed = posted.find((entry) => entry.type === 'transformInstalled');
+        expect(settled(posted)).toEqual([{
+            type: 'transformSettled',
+            sheetIndex: 0,
+            requestId: 'sort',
+            projection: {
+                view: installed.view,
+                rules: installed.rules,
+                rowHeights: installed.rowHeights,
+                mappingGeneration: installed.mappingGeneration,
+            },
+            committedBy: 'sort',
+        }]);
+        expect(posted.at(-1).type).toBe('transformSettled');
+    });
+
+    it('names no request when the recorded commit wrote other rules than those installed', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5), {
+            settleTransforms: true,
+            transformCommit: () => ({ requestId: 'older', rules: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [], schema } }),
+        });
+        const message = request(core, 'sort', sort('desc'));
+        await core.handle_message(message);
+        core.settle_transform(message);
+        expect(settled(posted)[0].committedBy).toBeUndefined();
+        expect(core.snapshot_material().core.transformCommits?.[0]?.requestId).toBe('older');
+    });
+
+    it('settles an older request when a newer one takes its sheet, before the newer one answers', async () => {
+        const { panel, posted } = make_panel();
+        const first_commit_started = deferred();
+        const release_first_commit = deferred();
+        const core = new ViewerPanelCore(panel, new StubSource(5), {
+            settleTransforms: true,
+            onTransformCommit: async (message) => {
+                if (message.requestId === 'A') {
+                    first_commit_started.resolve();
+                    await release_first_commit.promise;
+                }
+            },
+        });
+        const a = core.handle_message(request(core, 'A', sort('asc')));
+        await first_commit_started.promise;
+        const b = core.handle_message(request(core, 'B', sort('desc')));
+        await vi.waitFor(() => expect(settled(posted).map((entry) => entry.requestId)).toEqual(['A']));
+        expect(transform_answers(posted)).toEqual([]);
+        release_first_commit.resolve();
+        await Promise.all([a, b]);
+        core.settle_transform(request(core, 'A', sort('asc')));
+        core.settle_transform(request(core, 'B', sort('desc')));
+        expect(transform_answers(posted).map((entry) => entry.requestId)).toEqual(['B']);
+        expect(settled(posted).map((entry) => entry.requestId)).toEqual(['A', 'B']);
+        // A was settled before B installed, so its projection is the view before B.
+        expect(settled(posted)[0].projection.rules).toBeUndefined();
+    });
+
+    it('settles a request refused before it takes the sheet, and leaves the older one owed', async () => {
+        const { panel, posted } = make_panel();
+        const first_commit_started = deferred();
+        const release_first_commit = deferred();
+        const core = new ViewerPanelCore(panel, new StubSource(5), {
+            settleTransforms: true,
+            onTransformCommit: async (message) => {
+                if (message.requestId === 'A') {
+                    first_commit_started.resolve();
+                    await release_first_commit.promise;
+                }
+            },
+        });
+        const a = core.handle_message(request(core, 'A', sort('asc')));
+        await first_commit_started.promise;
+        await core.handle_message(request(core, 'stale-schema', {
+            sort: [{ colIndex: 0, direction: 'desc' }], filters: [], schema: '["Other",2,null]',
+        }));
+        await core.reject_transform(request(core, 'admission', sort('desc')), 'busy', 'transient');
+        expect(settled(posted).map((entry) => entry.requestId)).toEqual(['stale-schema', 'admission']);
+        release_first_commit.resolve();
+        await a;
+        core.settle_transform(request(core, 'A', sort('asc')));
+        expect(settled(posted).map((entry) => entry.requestId))
+            .toEqual(['stale-schema', 'admission', 'A']);
+        expect(settled(posted).at(-1).projection.rules.sort).toEqual([{ colIndex: 0, direction: 'asc' }]);
+    });
+
+    it('settles a request whose computation throws, once', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5), {
+            settleTransforms: true,
+            onTransformCommit: async () => { throw new Error('disk full'); },
+        });
+        const message = request(core, 'A', sort('asc'));
+        await core.handle_message(message);
+        core.settle_transform(message);
+        core.settle_transform(message);
+        expect(transform_answers(posted).map((entry) => entry.type)).toEqual(['transformRefused']);
+        expect(settled(posted).map((entry) => entry.requestId)).toEqual(['A']);
+    });
+
+    it('settles a cancel back to the rules the host holds, and a no-op restore', async () => {
+        const { panel, posted } = make_panel();
+        const core = new ViewerPanelCore(panel, new StubSource(5), { settleTransforms: true });
+        const sorted = request(core, 'sort', sort('desc'));
+        await core.handle_message(sorted);
+        core.settle_transform(sorted);
+        const generation = core.generation;
+        // Equal to what is installed: the cancel arm, which computes nothing.
+        const cancel = request(core, 'cancel', sort('desc'), 'cancel');
+        await core.handle_message(cancel);
+        expect(core.generation).toBe(generation);
+        core.settle_transform(cancel);
+        core.settle_transform(cancel);
+        await core.handle_message(request(core, 'restore', sort('desc'), 'restore'));
+        expect(settled(posted).map((entry) => entry.requestId)).toEqual(['sort', 'cancel', 'restore']);
+        expect(settled(posted)[1].projection.rules.sort).toEqual([{ colIndex: 0, direction: 'desc' }]);
+    });
+
+    it('drops what is owed, without posting, when the source is replaced', async () => {
+        const { panel, posted } = make_panel();
+        const first_commit_started = deferred();
+        const release_first_commit = deferred();
+        const core = new ViewerPanelCore(panel, new StubSource(5), {
+            settleTransforms: true,
+            onTransformCommit: async () => {
+                first_commit_started.resolve();
+                await release_first_commit.promise;
+            },
+        });
+        const message = request(core, 'A', sort('asc'));
+        const a = core.handle_message(message);
+        await first_commit_started.promise;
+        // The window sees the new source generation, and ends its action on it.
+        core.adopt_source(new StubSource(5));
+        release_first_commit.resolve();
+        await a;
+        core.settle_transform(message);
+        expect(settled(posted)).toEqual([]);
+        expect(transform_answers(posted)).toEqual([]);
+        expect(core.transform_state(0).sort).toEqual([]);
+    });
 });
 
 // The two formula questions the webview asks about Pending Changes (the Save

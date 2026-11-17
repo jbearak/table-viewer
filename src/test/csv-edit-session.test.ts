@@ -2,7 +2,13 @@ import { createHash } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 import type { ExtensionContext } from 'vscode';
-import { attach_viewer, csv_table_profile, plan_csv_save, type ViewerProfile } from '../viewer-controller';
+import {
+    attach_viewer,
+    csv_table_profile,
+    plan_csv_save,
+    transform_commit_record_count_for_tests,
+    type ViewerProfile,
+} from '../viewer-controller';
 import {
     create_authority_store,
     type DurableFileAuthority,
@@ -5149,6 +5155,81 @@ describe('CSV edit sessions', () => {
                 [expect.objectContaining({ raw: 'c' })],
             ],
         }));
+        // Each request is settled once. A at Cancel-B's takeover; Cancel-B only after
+        // the reconciliation, carrying what it installed and that A committed it, so a
+        // window can record A's step without waiting for the snapshot (plan I3).
+        const settled = (panel.__messages as any[]).filter((message) => message.type === 'transformSettled');
+        expect(settled.map((message) => message.requestId)).toEqual(['install-preferred', 'A', 'Cancel-B']);
+        const cancel_settled = settled.at(-1);
+        expect(cancel_settled.projection.rules.sort).toEqual([{ colIndex: 0, direction: 'asc' }]);
+        expect(cancel_settled.committedBy).toBe('A');
+        const messages = panel.__messages as any[];
+        const cancel_refused = messages.filter((message) => (
+            message.type === 'transformRefused' && message.requestId === 'Cancel-B'
+        )).at(-1);
+        expect(messages.indexOf(cancel_settled)).toBeGreaterThan(messages.indexOf(cancel_refused));
+    });
+
+    it('names no request of this panel for rules another panel committed, equal or not', async () => {
+        const file_path = '/tmp/transform-provenance-equal-rules.csv';
+        const shared = state_store();
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\nc\na\nb\n'));
+        vscode_mock.__setStatImplementation(async () => ({ size: 8, mtime: 1 }));
+        const mine = open_csv_table(uri(file_path), shared.store);
+        const theirs = open_csv_table(uri(file_path), shared.store);
+        await mine.__receive({ type: 'ready' });
+        await theirs.__receive({ type: 'ready' });
+        const descending = {
+            sort: [{ colIndex: 0, direction: 'desc' as const }],
+            filters: [],
+            schema: '["Sheet1",1,["h"]]',
+        };
+        const mine_initial = latest_snapshot(mine);
+        await mine.__receive({
+            type: 'setTransform', sheetIndex: 0, requestId: 'mine',
+            generation: mine_initial.generation, sourceGeneration: mine_initial.sourceGeneration,
+            intent: 'user', state: descending,
+        });
+        const settled_mine = (mine.__messages as any[]).filter((message) => (
+            message.type === 'transformSettled' && message.requestId === 'mine'
+        ));
+        expect(settled_mine).toHaveLength(1);
+        expect(settled_mine[0].committedBy).toBe('mine');
+
+        await theirs.__receive({ type: 'ready' });
+        const theirs_snapshot = latest_snapshot(theirs);
+        expect(theirs_snapshot.transformCommits?.[0]).toBeUndefined();
+        await theirs.__receive({
+            type: 'setTransform', sheetIndex: 0, requestId: 'theirs',
+            generation: theirs_snapshot.generation, sourceGeneration: theirs_snapshot.sourceGeneration,
+            intent: 'user', state: descending,
+        });
+        expect((theirs.__messages as any[]).filter((message) => (
+            message.type === 'transformSettled' && message.requestId === 'theirs'
+        )).at(-1)?.committedBy).toBe('theirs');
+
+        await mine.__receive({ type: 'ready' });
+        expect(latest_snapshot(mine).transformCommits?.[0]).toBeUndefined();
+    });
+
+    it('forgets a panel\'s commit records when the panel closes', async () => {
+        const file_path = '/tmp/transform-provenance-dispose.csv';
+        const shared = state_store();
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\nc\na\nb\n'));
+        vscode_mock.__setStatImplementation(async () => ({ size: 8, mtime: 1 }));
+        const before = transform_commit_record_count_for_tests();
+        const first = open_csv_table(uri(file_path), shared.store);
+        await first.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(first);
+        await first.__receive({
+            type: 'setTransform', sheetIndex: 0, requestId: 'first',
+            generation: snapshot.generation, sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user', state: { sort: [{ colIndex: 0, direction: 'desc' }], filters: [], schema: '["Sheet1",1,["h"]]' },
+        });
+        expect(transform_commit_record_count_for_tests()).toBe(before + 1);
+
+        first.dispose();
+        expect(transform_commit_record_count_for_tests()).toBe(before);
     });
 
     it('reconciles a cross-panel durable transform clear before ready completes', async () => {
@@ -7013,6 +7094,96 @@ describe('CSV edit sessions', () => {
             { colIndex: 0, direction: 'asc' },
         ]);
         expect(rehydrated.capabilities.csvEditSessionId).toBeDefined();
+    });
+
+    it('settles a request refused after it took the sheet with what an older request\'s write left durable', async () => {
+        // A's durable write passed its last check and is in flight when B takes the
+        // sheet, settling A. B is then refused before it commits. B is settled last,
+        // after the reconciliation its answer led to, and that reads durable state
+        // through the store's queue, behind A's write: so B's settlement carries A's
+        // rules as installed, committed by A, and no settled view disagrees with
+        // what is durable.
+        const file_path = '/tmp/settle-after-displaced-durable-write.csv';
+        let blob: unknown = {};
+        const write_started = deferred();
+        const write_gate = deferred();
+        let arm = false;
+        const store = create_authority_store({
+            runtime_key: {},
+            read: () => blob,
+            write: async (envelope) => {
+                if (arm && JSON.stringify(envelope).includes('"direction"')) {
+                    arm = false;
+                    write_started.resolve();
+                    await write_gate.promise;
+                }
+                blob = envelope;
+            },
+        });
+        const durable_transform = () => {
+            const entries = (blob as { entries?: Record<string, { state: PerFileState }> })
+                .entries ?? {};
+            return Object.values(entries)[0]?.state.transforms?.[0];
+        };
+        const bytes = enc.encode('h\n3\n1\n2\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const panel = open_csv_table(uri(file_path), store);
+        await panel.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(panel);
+        const sorted = {
+            sort: [{ colIndex: 0, direction: 'asc' as const }],
+            filters: [],
+            schema: '["Sheet1",1,["h"]]',
+        };
+        arm = true;
+        const first = panel.__receive({
+            type: 'setTransform', sheetIndex: 0, requestId: 'A',
+            generation: snapshot.generation, sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user', state: sorted,
+        });
+        await write_started.promise;
+        expect(durable_transform()).toBeUndefined();
+
+        const second = panel.__receive({
+            type: 'setTransform', sheetIndex: 0, requestId: 'B',
+            generation: snapshot.generation, sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [],
+                filters: [{
+                    id: 'invalid', colIndex: 0, operator: 'greaterThan' as const,
+                    value: 'not-a-number', caseSensitive: false, enabled: true,
+                }],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        });
+        const settled = () => (panel.__messages as any[]).filter((message) => message.type === 'transformSettled');
+        // B is refused while A's write is still held, so the race is the one named
+        // above. A was settled when B took the sheet; B is not settled yet, because its
+        // reconciliation reads durable state behind A's write.
+        await wait_for_observable(() => (panel.__messages as any[]).some(
+            (message) => message.type === 'transformRefused' && message.requestId === 'B'));
+        expect(durable_transform()).toBeUndefined();
+        expect(settled().map((message) => message.requestId)).toEqual(['A']);
+
+        write_gate.resolve();
+        await Promise.all([first, second]);
+        await flush_promises();
+
+        const answers = (panel.__messages as any[])
+            .filter((message) => message.type === 'transformInstalled' || message.type === 'transformRefused')
+            .map((message) => [message.type, message.requestId]);
+        // B was refused before its commit, and A, displaced, never installed.
+        expect(answers).toEqual([['transformRefused', 'B']]);
+        expect(durable_transform()).toMatchObject({ sort: sorted.sort });
+        const last = settled().at(-1);
+        expect(last).toMatchObject({
+            requestId: 'B',
+            committedBy: 'A',
+            projection: { rules: { sort: sorted.sort, filters: [] } },
+        });
+        expect(settled().map((message) => message.requestId)).toEqual(['A', 'B']);
     });
 
     // The window one instant narrower than the CAS test above, and the reason that

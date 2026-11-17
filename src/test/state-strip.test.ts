@@ -190,6 +190,26 @@ describe('StateStrip', () => {
             .toBe('true');
     });
 
+    it('keeps its controls enabled for the person\'s own request in flight, and the Cancel', () => {
+        const { container } = render_strip({
+            transform: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [{
+                    id: 'f', colIndex: 1, operator: 'equals', value: '0',
+                    caseSensitive: false, enabled: true,
+                }],
+            },
+            transform_pending: true,
+            transform_choice_pending: false,
+            transform_progress: 'Sorting…',
+        });
+        expect(container.textContent).toContain('Sorting…');
+        expect(get_button('Cancel').disabled).toBe(false);
+        // A new choice replaces the request in flight, so the chips stay live.
+        expect(container.querySelector('.sort-chip')?.getAttribute('aria-disabled')).toBeNull();
+        expect(container.querySelector('.filter-chip-body')?.getAttribute('aria-disabled')).toBeNull();
+    });
+
     it('names itself as the worksheet view state for assistive tech', () => {
         const { container } = render_strip({ merges_flattened: true });
 

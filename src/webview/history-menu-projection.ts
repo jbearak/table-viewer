@@ -23,17 +23,24 @@ import { peek_history, type HistoryStackState } from './history-stack-model';
  * so the item reads plain "Undo": there is nothing further back to reach. The
  * item stays enabled (`desktop/main/history-menu-model.ts`), and a press of it
  * says why (`history_refusal_warning`).
+ *
+ * `pending_view_label` names the person's sort or filter still in flight, which
+ * Undo would cancel: it is what Undo does next, though it is not on the stack
+ * yet. Redo is unchanged, because a Redo press waits for it.
  */
 export function history_menu_projection(
     state: HistoryStackState,
     text_editing: boolean,
+    pending_view_label?: string,
 ): HistoryMenuProjection {
     const undo = peek_history(state, 'undo');
     const redo = peek_history(state, 'redo');
+    const undo_label = pending_view_label
+        ?? (undo.kind === 'available' ? undo.entry.action.label : undefined);
     return Object.freeze({
-        undoAvailable: undo.kind === 'available',
+        undoAvailable: undo_label !== undefined,
         redoAvailable: redo.kind === 'available',
-        ...(undo.kind === 'available' ? { undoLabel: undo.entry.action.label } : {}),
+        ...(undo_label !== undefined ? { undoLabel: undo_label } : {}),
         ...(redo.kind === 'available' ? { redoLabel: redo.entry.action.label } : {}),
         textEditing: text_editing,
     });
