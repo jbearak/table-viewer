@@ -223,7 +223,11 @@ export interface ViewAction {
     readonly requested: SheetTransformState;
     /** Every change the person made in the action, merged; empty after a cancel. */
     readonly delta: ViewActionDelta;
-    /** The newest request is a cancel back to the baseline. */
+    /**
+     * Cancelled back to the baseline, with no choice since, a hide included: a
+     * hide chosen after the cancel clears it though the newest request is
+     * still the cancel (`ViewActionRequest.cancel` says which requests are).
+     */
     readonly cancelled: boolean;
     readonly requests: readonly ViewActionRequest[];
     /** Hides asking which source rows they hide: their ids, and how many display rows each chose. */
