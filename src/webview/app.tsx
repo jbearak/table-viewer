@@ -3284,6 +3284,8 @@ export function App(): React.JSX.Element {
             || pending.action.sheetIndex !== sheet_index
             || !view_action_owns(pending.action, request_id);
     };
+    /** `publish_history_menu_state`, declared further down: the Edit menu names the action. */
+    const publish_history_menu_ref = useRef<() => void>(() => {});
     /** `cancel_view_action_on_sheet` and `cancel_blocked`, which are declared further down. */
     const cancel_view_action_ref = useRef<(sheet_index: number) => boolean>(() => false);
     const cancel_blocked_ref = useRef<() => boolean>(() => true);
@@ -4000,6 +4002,7 @@ export function App(): React.JSX.Element {
         );
         record_view_step(step);
         sync_view_request_pending();
+        publish_history_menu_ref.current();
         if (
             step === undefined
             && !pending.action.cancelled
@@ -4037,6 +4040,7 @@ export function App(): React.JSX.Element {
         const refreshed = refresh_view_action(pending.action, rules, committed_by);
         if (refreshed.action === pending.action) return;
         view_action_ref.current = { ...pending, action: refreshed.action };
+        publish_history_menu_ref.current();
         if (refreshed.resend) send_view_action_again();
     }, [send_view_action_again]);
     const refresh_view_action_ref = useRef(refresh_view_action_after_snapshot);
@@ -6201,7 +6205,10 @@ export function App(): React.JSX.Element {
                         // host still computes it, and only a new source or receiver
                         // stops it (I3, `panel-core.ts` handle_set_transform). The
                         // action decides on this snapshot once it is applied.
-                        if (source_changed) view_action_ref.current = undefined;
+                        if (source_changed && view_action_ref.current !== undefined) {
+                            view_action_ref.current = undefined;
+                            publish_history_menu_ref.current();
+                        }
                         const kept_sheet = view_action_ref.current?.action.sheetIndex;
                         const kept = kept_sheet === undefined ? undefined : {
                             id: pending_transform_request_ids_ref.current[kept_sheet],
@@ -7933,9 +7940,18 @@ export function App(): React.JSX.Element {
     const publish_history_menu_state = useCallback(() => {
         const store = history_store_ref.current;
         if (store === null) return;
+        const pending = view_action_ref.current;
         const projection = history_menu_projection(
             store.snapshot(),
             edit_command_target(document.activeElement) === 'text',
+            pending === undefined || pending.action.cancelled
+                ? undefined
+                : transform_view_step(
+                    pending.worksheet,
+                    pending.schema,
+                    pending.action.baseline,
+                    pending.action.requested,
+                )?.label,
         );
         // The helper already answers false for a ref that has never been posted,
         // which is what makes the first publish happen.
@@ -7943,6 +7959,7 @@ export function App(): React.JSX.Element {
         history_menu_state_ref.current = projection;
         host_bridge.postMessage({ type: 'historyMenuStateChanged', state: projection });
     }, []);
+    publish_history_menu_ref.current = publish_history_menu_state;
 
     const publish_retained_saved_append_authorities = useCallback(() => {
         const store = history_store_ref.current;
@@ -10620,6 +10637,7 @@ export function App(): React.JSX.Element {
                 refused: false,
             };
             sync_view_request_pending();
+            publish_history_menu_ref.current();
             return true;
         },
         [
@@ -11120,6 +11138,7 @@ export function App(): React.JSX.Element {
             action: cancel_view_action(pending.action, request_id),
             refused: false,
         };
+        publish_history_menu_ref.current();
         return true;
     }, [drop_history_presses, request_transform]);
 

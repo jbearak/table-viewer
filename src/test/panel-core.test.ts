@@ -936,12 +936,11 @@ describe('ViewerPanelCore', () => {
         }
     });
 
-    it('rejects histogram requests with stale generations or invalid coordinates', async () => {
+    it('rejects histogram requests with a stale source or invalid coordinates', async () => {
         const { panel, posted } = make_panel();
         const src = new StubSource();
         const core = new ViewerPanelCore(panel, src);
         for (const request of [
-            { requestId: 'generation', generation: 0, sourceGeneration: 1, sheetIndex: 0, columnIndex: 0 },
             { requestId: 'source', generation: 1, sourceGeneration: 0, sheetIndex: 0, columnIndex: 0 },
             { requestId: 'sheet', generation: 1, sourceGeneration: 1, sheetIndex: 8, columnIndex: 0 },
             { requestId: 'column', generation: 1, sourceGeneration: 1, sheetIndex: 0, columnIndex: 8 },
@@ -954,14 +953,14 @@ describe('ViewerPanelCore', () => {
                 ...request,
             } as Extract<WebviewMessage, { type: 'requestFilterHistogram' }>);
         }
-        expect(posted).toHaveLength(7);
+        expect(posted).toHaveLength(6);
         expect(posted.every((message) =>
             message.type === 'filterHistogram' && typeof message.error === 'string'))
             .toBe(true);
         expect(src.read_rows_calls).toBe(0);
     });
 
-    it('echoes the request tuple when a delayed histogram request is view-stale', async () => {
+    it('answers a histogram request from before a transform installed, echoing its tuple', async () => {
         const { panel, posted } = make_panel();
         const core = new ViewerPanelCore(panel, new StubSource());
         await core.handle_message({
@@ -977,8 +976,8 @@ describe('ViewerPanelCore', () => {
         expect(posted.at(-1)).toMatchObject({
             type: 'filterHistogram', requestId: 'delayed',
             generation: 1, sourceGeneration: 1,
-            error: 'The view changed before this histogram request arrived.',
         });
+        expect(posted.at(-1).error).toBeUndefined();
     });
 
     it('physical replacement advances both generations and clears cache exactly once', async () => {

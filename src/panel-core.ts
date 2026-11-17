@@ -1186,9 +1186,11 @@ export class ViewerPanelCore {
             && msg.sheetIndex >= 0
             && msg.sheetIndex < sheets.length;
         const sheet = sheet_index_is_valid ? sheets[msg.sheetIndex] : undefined;
-        const invalid = msg.generation !== this._generation
-            ? 'The view changed before this histogram request arrived.'
-            : msg.sourceGeneration !== this._source_generation
+        // Admitted by the source, not by the view: the value list reads a source
+        // column and is cached by source generation, so a sort or filter that
+        // installs while the filter editor opens leaves it as true as it was. The
+        // filter editor can open while the person's own sort is in flight (plan V1).
+        const invalid = msg.sourceGeneration !== this._source_generation
             ? 'The source changed before this histogram request arrived.'
             : !sheet
             ? `Sheet index ${msg.sheetIndex} is out of range.`

@@ -53,6 +53,18 @@ describe('what the desktop menu is told about this window s history', () => {
         });
     });
 
+    it('names a sort or filter still in flight as what Undo does next, and leaves Redo as it is', () => {
+        expect(history_menu_projection(recorded('Paste'), false, 'Sort')).toMatchObject({
+            undoAvailable: true,
+            undoLabel: 'Sort',
+        });
+        expect(history_menu_projection(empty_history_stack(), false, 'Filter')).toMatchObject({
+            undoAvailable: true,
+            undoLabel: 'Filter',
+            redoAvailable: false,
+        });
+    });
+
     it('names the gesture at the top of each stack', () => {
         const projection = history_menu_projection(recorded('Paste'), false);
         expect(projection.undoAvailable).toBe(true);

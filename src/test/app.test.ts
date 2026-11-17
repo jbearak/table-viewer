@@ -23365,6 +23365,22 @@ describe('view steps in history', () => {
             expect(cells_editable()).toEqual(EDITABLE);
         });
 
+        it('names the request in flight in the Edit menu, and stops naming it when Undo cancels it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const menu = () => posted(post_message, 'historyMenuStateChanged').at(-1)!.state;
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            expect(menu()).toMatchObject({ undoAvailable: true, undoLabel: 'Sort', redoAvailable: false });
+            await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            expect(menu()).toMatchObject({ undoLabel: 'Change view' });
+            await undo();
+            expect(menu()).toMatchObject({ undoAvailable: false });
+            expect(menu().undoLabel).toBeUndefined();
+            await install(latest_transform_request(post_message));
+            expect(undo_labels()).toEqual([]);
+        });
+
         it('keeps a choice made before the cancel is answered in the same action', async () => {
             const { post_message } = await render_app();
             await open(post_message);
