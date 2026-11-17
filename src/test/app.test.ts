@@ -24359,6 +24359,41 @@ describe('view steps in history', () => {
             expect(hide.state).toMatchObject({ sort: [], hiddenRows: [1] });
         });
 
+        it('composes a hide chosen after a cancel onto the cancel\'s rules when the cancel sent again onto another window\'s change is refused', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await click_button('Cancel');
+            const cancel = latest_transform_request(post_message);
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [FILTER], schema: SCHEMA }] },
+            }));
+            const again = latest_transform_request(post_message);
+            expect(again.requestId).not.toBe(cancel.requestId);
+            expect(again.state).toMatchObject({ sort: [], filters: [FILTER] });
+            // The sort had installed onto the filter, and the first cancel was
+            // superseded by the one sent again, which the host then refuses.
+            auto_settle_transforms = false;
+            await install(sort!, { sort: SORT_ASC, filters: [FILTER], schema: SCHEMA });
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: sort!.requestId, committedBy: sort!.requestId,
+            });
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: cancel.requestId, committedBy: sort!.requestId,
+            });
+            await refuse(again);
+            await answer_hide(question!, [1]);
+
+            expect(latest_transform_request(post_message).state)
+                .toMatchObject({ sort: [], filters: [FILTER], hiddenRows: [1] });
+        });
+
         it('ends a hide whose composed request the host refuses, with nothing recorded', async () => {
             const { post_message } = await render_app();
             await open(post_message);

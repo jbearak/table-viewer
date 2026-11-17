@@ -314,8 +314,13 @@ export function cancel_view_action(action: ViewAction, request_id: string, keep_
     };
 }
 
-/** The same request again, onto a moved baseline: it supersedes the one in flight. */
+/**
+ * The same request again, onto a moved baseline: it supersedes the one in
+ * flight, and is a cancel when that one was, though a hide chosen after the
+ * cancel has cleared the action's mark.
+ */
 export function resend_in_view_action(action: ViewAction, request_id: string): ViewAction {
+    const cancel = action.cancelled || action.requests.at(-1)?.cancel === true;
     return {
         ...action,
         requests: [
@@ -326,7 +331,7 @@ export function resend_in_view_action(action: ViewAction, request_id: string): V
                 delta: action.cancelled
                     ? view_action_delta(rules_or_empty(action.baseline), action.requested)
                     : action.delta,
-                ...(action.cancelled ? { cancel: true } : {}),
+                ...(cancel ? { cancel: true } : {}),
                 settled: false,
             },
         ],
