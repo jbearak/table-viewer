@@ -235,10 +235,12 @@ export function choose_in_view_action(
     return {
         ...action,
         requested,
-        delta: merge_view_action_delta(
-            action.cancelled ? EMPTY_DELTA : action.delta,
-            view_action_delta(action.requested, requested),
-        ),
+        // After a cancel the action is back at its baseline, so a choice is
+        // measured from there, as its first one was: from the cancel's target
+        // it would miss what that target kept, the compare toggle.
+        delta: action.cancelled
+            ? view_action_delta(rules_or_empty(action.baseline), requested)
+            : merge_view_action_delta(action.delta, view_action_delta(action.requested, requested)),
         cancelled: false,
         requests: [...action.requests, { requestId: request_id, target: requested, settled: false }],
     };

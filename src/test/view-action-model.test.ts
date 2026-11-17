@@ -191,6 +191,18 @@ describe('a view action', () => {
         });
     });
 
+    it('keeps the compare toggle a cancel kept when a choice replaces the cancel and the sheet changes elsewhere', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, { ...by_a, onlyChangedRows: true }, 'A');
+        action = cancel_view_action(action, 'C');
+        action = choose_in_view_action(action, { ...by_b, onlyChangedRows: true }, 'B');
+        const refreshed = refresh_view_action(action, filtered, undefined);
+        expect(refreshed.resend).toBe(true);
+        expect(refreshed.action.requested).toEqual({
+            ...by_b, filters: filtered.filters, onlyChangedRows: true,
+        });
+    });
+
     it('starts the delta again after a cancel', () => {
         let action = begin_view_action(0, schema, undefined);
         action = choose_in_view_action(action, by_a, 'A');
