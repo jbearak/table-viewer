@@ -26477,8 +26477,17 @@ describe('view steps in history', () => {
             expect(press_held()).toBe(true);
 
             await reload([SORTED]);
+            auto_settle_transforms = true;
 
+            // The sort is recorded, and the Undo waiting runs against it,
+            // after the saved view the reload brought if the window asked for
+            // that first: the order of the two is the order effects run in.
+            expect(undo_labels()).toEqual(['Sort']);
+            const first = latest_transform_request(post_message);
+            if (first.intent === 'restore') await install(first);
+            expect(press_held()).toBe(false);
             const replay = latest_transform_request(post_message);
+            expect(replay.intent).toBe('user');
             expect(replay.state.sort).toEqual([]);
             await install(replay);
             expect(undo_labels()).toEqual([]);
@@ -26525,6 +26534,10 @@ describe('view steps in history', () => {
             await first_installed(post_message);
             await reload([SORTED]);
             auto_settle_transforms = true;
+            // The window installs the saved view the reload brought.
+            const restore = latest_transform_request(post_message);
+            expect(restore.intent).toBe('restore');
+            await install(restore);
 
             await undo();
 
