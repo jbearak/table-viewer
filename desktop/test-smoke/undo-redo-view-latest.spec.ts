@@ -9,6 +9,7 @@ import * as path from 'path';
 import { expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
 import { history_menu_item, type HistoryMenuState } from '../main/history-menu-model';
+import { CHANNEL_WEBVIEW_MESSAGE } from '../shared/ipc';
 import { isolated_user_data } from './smoke-helpers';
 import {
     choose,
@@ -94,6 +95,37 @@ const redo_label = () => menu_label('redo');
  * is the real one, found by its id, and its click routes on the window it is
  * given (`route_edit_command`), so it is given the viewer.
  */
+/**
+ * Keep the page's next sort or filter request from reaching the host until the
+ * page asks which source rows a hide hides. The two then reach the host back to
+ * back, the sort first, so the host answers the hide while the sort computes,
+ * however long the hide took to choose.
+ */
+async function withhold_transform_until_hide(): Promise<void> {
+    await app!.evaluate(({ ipcMain }, channel) => {
+        const listeners = ipcMain.listeners(channel) as ((...args: unknown[]) => void)[];
+        ipcMain.removeAllListeners(channel);
+        let armed = true;
+        let withheld: unknown[] | undefined;
+        ipcMain.on(channel, (...args: unknown[]) => {
+            const message = (args[1] as { message?: { type?: string; intent?: string } })?.message;
+            if (armed && message?.type === 'setTransform' && message.intent === 'user') {
+                armed = false;
+                withheld = args;
+                return;
+            }
+            if (withheld !== undefined && message?.type === 'resolveHiddenRows') {
+                const earlier = withheld;
+                withheld = undefined;
+                (globalThis as typeof globalThis & { __sort_sent_with_hide?: boolean })
+                    .__sort_sent_with_hide = true;
+                for (const listener of listeners) listener(...earlier);
+            }
+            for (const listener of listeners) listener(...args);
+        });
+    }, CHANNEL_WEBVIEW_MESSAGE);
+}
+
 async function click_edit_item(label: string): Promise<void> {
     const direction = label.startsWith('Undo') ? 'undo' : 'redo';
     await expect.poll(() => menu_label(direction)).toBe(label);
@@ -191,9 +223,11 @@ test('Hide rows during a sort keeps both as one step, and one Undo takes both ba
     await expect.poll(() => shown_first_row(page), { timeout: 60_000 }).toBe(natural);
     const hidden_count = page.getByText(/^\d+ hidden rows?$/);
 
-    // A sort, and while it computes, Hide row on the first row as it is shown.
-    // The sort computes for about 2 s; the hide is chosen well within that, and
-    // each step checks the sort is still in flight and the rows still in order.
+    // A sort, and while it is in flight, Hide row on the first row as it is
+    // shown. The sort reaches the host just ahead of the hide's question, so
+    // the host answers the hide while the sort computes (about 2 s) and the
+    // hide composes onto it, however slow the menu is under load.
+    await withhold_transform_until_hide();
     await choose_sort(page, 1, 'ascending');
     await expect(in_flight(page)).toBeVisible();
     const row_menu = await open_row_menu(page, 0);
@@ -201,8 +235,13 @@ test('Hide rows during a sort keeps both as one step, and one Undo takes both ba
     expect(await shown_first_row(page)).toBe(natural);
     // Enabled during the person's own sort, as the sort items are.
     await choose(row_menu, 'Hide row');
+    await expect.poll(() => app!.evaluate(() => (globalThis as typeof globalThis & {
+        __sort_sent_with_hide?: boolean;
+    }).__sort_sent_with_hide === true)).toBe(true);
 
-    // One step for both: the sort, without the hidden row.
+    // One step for both: the sort, without the hidden row. Row 1 is not the
+    // sort's first row (`first_row` starts from it and finds a smaller one), so
+    // the first row shown is the same with it hidden; "1 hidden row" is the hide.
     await expect.poll(undo_label).toBe('Undo Change view');
     await expect.poll(() => shown_first_row(page), { timeout: 60_000 }).toBe(first_row(1, 'ascending'));
     await expect(in_flight(page)).toHaveCount(0, { timeout: 60_000 });

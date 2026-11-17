@@ -783,6 +783,8 @@ interface ExcelHeaderQueue {
 
 /** How long Hide rows waits for the host to say which source rows it hides (V2). */
 const HIDE_RESOLUTION_BOUND_MS = 5_000;
+/** What a hide with no answer in that time says: the structure gestures' wait message, by design. */
+const HIDE_RESOLUTION_TIMEOUT_MESSAGE = STRUCTURE_BUSY_MESSAGE;
 /** How long a header change waits for the host to acknowledge the session's publications. */
 const HEADER_ACK_WAIT_MS = 15_000;
 /** After this long without a result, the person is told to reload. */
@@ -4063,7 +4065,7 @@ export function App(): React.JSX.Element {
 
     /**
      * The host settled one of the view action's requests. When it has settled
-     * every one, the action records one step, from its baseline to what is
+     * every one and no hide is resolving, the action records one step, from its baseline to what is
      * installed (I2), and a press waiting behind it is decided as today: dropped
      * with a message when the person's choice came to nothing because it was
      * refused or another window's change took its place, and let run otherwise.
@@ -4087,7 +4089,6 @@ export function App(): React.JSX.Element {
     }, [end_view_action, send_view_action_again]);
     const settle_view_action_ref = useRef(settle_view_action_answer);
     settle_view_action_ref.current = settle_view_action_answer;
-
 
     /**
      * A snapshot on the same source was applied while the view action is
@@ -10996,7 +10997,7 @@ export function App(): React.JSX.Element {
             resolution_timers_ref.current.delete(request_id);
             const still = view_action_ref.current;
             if (still === undefined || take_resolution(still.action, request_id) === undefined) return;
-            show_warning(STRUCTURE_BUSY_MESSAGE);
+            show_warning(HIDE_RESOLUTION_TIMEOUT_MESSAGE);
             end_resolution(request_id);
         }, HIDE_RESOLUTION_BOUND_MS));
         sync_view_request_pending();

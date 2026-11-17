@@ -23953,7 +23953,8 @@ describe('view steps in history', () => {
             expect(hide).toMatchObject({ intent: 'user', state: { sort: SORT_ASC, filters: [], hiddenRows: [0] } });
             await install(hide!);
             expect(undo_labels()).toEqual(['Change view']);
-            expect(first).toBeDefined();
+            // A new request, composed onto the older one's rules.
+            expect(hide!.requestId).not.toBe(first!.requestId);
         });
 
         it('keeps a sort when Hide rows is chosen while it computes, and records both as one step', async () => {
@@ -23971,7 +23972,7 @@ describe('view steps in history', () => {
             await install(both);
 
             expect(undo_labels()).toEqual(['Change view']);
-            expect(sort).toBeDefined();
+            expect(both.requestId).not.toBe(sort!.requestId);
             await undo();
             const undone = latest_transform_request(post_message);
             expect(undone.state).toMatchObject({ sort: [] });
@@ -24262,6 +24263,52 @@ describe('view steps in history', () => {
             expect(question).toBeDefined();
             expect(press_held()).toBe(false);
             expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('refuses edits and Save while a hide resolves, and admits them once it ends', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await acquire_editing_session(post_message);
+            seed_mounted_store({ '1:0': { value: 'Alicia', base: 'Alice' } });
+
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            expect(cells_editable()).toEqual(HELD);
+            expect(props().gestures_admitted?.()).toBe(false);
+            const said = warnings(post_message).length;
+            await act(async () => { props().on_save_request?.(); });
+            expect(posted(post_message, 'saveCsv')).toEqual([]);
+            expect(warnings(post_message).slice(said)).toEqual(['Wait for the table view to finish updating.']);
+
+            await answer_hide(question!, 'The view changed before this table view request arrived.');
+            expect(props().gestures_admitted?.()).toBe(true);
+            await act(async () => { props().on_save_request?.(); });
+            expect(posted(post_message, 'saveCsv')).toHaveLength(1);
+        });
+
+        it('takes Unhide all chosen while a Redo waits behind a hide still resolving, dropping the Redo', async () => {
+            const { post_message } = await render_app();
+            await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [], hiddenRows: [0], schema: SCHEMA }] },
+            }));
+            // The saved view is installed on open.
+            await install(latest_transform_request(post_message));
+            await change_view(post_message, { sort: [], filters: [FILTER], hiddenRows: [0] });
+            await undo();
+            await install(latest_transform_request(post_message));
+            expect(redo_labels()).toEqual(['Filter']);
+
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await redo();
+            expect(press_held()).toBe(true);
+            await click_button('Unhide all');
+
+            const unhide = latest_transform_request(post_message);
+            expect(unhide.state.hiddenRows ?? []).toEqual([]);
+            expect(press_held()).toBe(false);
+            expect(warnings(post_message)).toEqual([]);
+            await answer_hide(question!, [1]);
+            expect(latest_transform_request(post_message).requestId).toBe(unhide.requestId);
         });
 
         it('drops a Redo waiting behind an action whose hide came to nothing, though the rest installed no step', async () => {
@@ -25674,6 +25721,18 @@ describe('view steps in history', () => {
 
             expect(undo_labels()).toEqual([]);
             expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('records a sort over rows already hidden, which it does not hide again', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await install((await hide_rows(post_message, [{ start: 1, end: 2 }]))!);
+            expect(undo_labels()).toEqual(['Hide 2 rows']);
+            await ask(post_message, { sort: SORT_ASC, filters: [], hiddenRows: [1, 2] });
+
+            await reload([{ sort: SORT_ASC, filters: [], hiddenRows: [1, 2], schema: SCHEMA }]);
+
+            expect(undo_labels()).toEqual(['Hide 2 rows', 'Sort']);
         });
 
         it('moves a replay it overtook when the reload shows the replay\'s target', async () => {
