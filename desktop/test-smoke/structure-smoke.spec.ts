@@ -1464,12 +1464,19 @@ async function open_cell_hide_menu(page: Page): Promise<Locator> {
 }
 
 /**
- * Wait for the window's sort or filter change to have ended: the host has
- * answered and settled everything it asked for. The chips alone do not say
- * so, since they show the rules asked for from the moment they are asked for.
+ * Wait for the window's sort or filter change to have ended and its view to be
+ * on screen: the host has answered and settled everything it asked for, and
+ * the rows the menus below open on have loaded. The chips alone do not say so,
+ * since they show the rules asked for from the moment they are asked for, and
+ * a settled view still loads its rows afterwards; a menu's "Hyperlink…" waits
+ * on its row.
  */
 async function view_change_ended(page: Page): Promise<void> {
     await expect(page.locator('.toolbar-progress')).toHaveCount(0);
+    // The first data column (ids count the row markers as column 0).
+    for (const row of [0, 1]) {
+        await expect.poll(() => page.locator(`#glide-cell-1-${row}`).textContent()).not.toBe('');
+    }
 }
 
 /** Sort ascending by the column of the cell clicked, and wait for the sort to land. */
@@ -1592,7 +1599,11 @@ async function expect_menu_steady_through_cancel(page: Page, options: {
     await expect_host_message_held('transformInstalled');
     const menu = await open();
     await watch_menu_items(page);
-    if (!live_in_flight) await expect(menu_item(menu, item)).toHaveAttribute('aria-disabled', 'true');
+    if (live_in_flight) {
+        await expect(menu_item(menu, item)).not.toHaveAttribute('aria-disabled', 'true');
+    } else {
+        await expect(menu_item(menu, item)).toHaveAttribute('aria-disabled', 'true');
+    }
     await release_host_messages();
     await view_change_ended(page);
     await expect(menu_item(menu, item)).not.toHaveAttribute('aria-disabled', 'true');
