@@ -12,8 +12,14 @@
  * baseline and `requested`: a change made elsewhere can equal one of the
  * person's, and the difference would then lose it.
  *
- * It ends when the host has settled every request it sent (I3), and its step
- * runs from the baseline to what is then installed (I2). An install written by
+ * A Hide rows in the action first asks the host which source rows it hides
+ * (V2). Until the answer, the hide is resolving: it is part of the action and
+ * no request of it, and the action does not end. The answer joins the action
+ * as a choice; a refusal, or no answer, drops it.
+ *
+ * It ends when the host has settled every request it sent and no hide is
+ * resolving (I3), and its step runs from the baseline to what is then
+ * installed (I2). An install written by
  * another panel moves the baseline instead, so it is never recorded as this
  * action's.
  */
@@ -196,6 +202,8 @@ export interface ViewActionRequest {
     readonly requestId: string;
     readonly target: SheetTransformState;
     readonly settled: boolean;
+    /** The host refused it: its target is not asked for again (I3). */
+    readonly refused?: boolean;
 }
 
 export interface ViewAction {
@@ -208,6 +216,13 @@ export interface ViewAction {
     /** The newest request is a cancel back to the baseline. */
     readonly cancelled: boolean;
     readonly requests: readonly ViewActionRequest[];
+    /** Hides asking which source rows they hide: their ids, and how many display rows each chose. */
+    readonly resolving: readonly ViewActionResolution[];
+}
+
+export interface ViewActionResolution {
+    readonly requestId: string;
+    readonly rows: number;
 }
 
 export function begin_view_action(
@@ -223,6 +238,7 @@ export function begin_view_action(
         delta: EMPTY_DELTA,
         cancelled: false,
         requests: [],
+        resolving: [],
     };
 }
 
@@ -276,6 +292,7 @@ export function cancel_view_action(action: ViewAction, request_id: string, keep_
         requested: target,
         delta: EMPTY_DELTA,
         cancelled: true,
+        resolving: [],
         requests: [...action.requests, { requestId: request_id, target, settled: false }],
     };
 }
@@ -293,6 +310,84 @@ export function resend_in_view_action(action: ViewAction, request_id: string): V
 
 export function view_action_owns(action: ViewAction, request_id: string): boolean {
     return action.requests.some((request) => request.requestId === request_id);
+}
+
+/**
+ * The host refused the action's newest request, a choice. A person's refused
+ * choice is not asked for again (I3), so what the action asks for becomes what
+ * is still live: the target of an older request still out, or else what is
+ * installed. A hide answered later composes onto that. A refused cancel keeps
+ * its rules, since Cancel sends it again.
+ */
+export function refuse_in_view_action(
+    action: ViewAction,
+    request_id: string,
+    installed: SheetTransformState | undefined,
+): ViewAction {
+    if (!view_action_owns(action, request_id)) return action;
+    // What the action asks for now: the newest request still out and not refused.
+    const live_before = live_request(action);
+    const marked: ViewAction = {
+        ...action,
+        requests: action.requests.map((request) => (
+            request.requestId === request_id ? { ...request, refused: true } : request
+        )),
+    };
+    // A refused cancel keeps its rules, since Cancel sends it again; a refusal
+    // of a request that is not what the action asks for changes nothing more.
+    if (action.cancelled) return marked;
+    const newest = action.requests.at(-1)!;
+    if (newest.requestId !== request_id && live_before?.requestId !== request_id) return marked;
+    // Falls back to what is still live: the newest request out and not
+    // refused, which may itself be refused later, or else what is installed.
+    const live = live_request(marked)?.target ?? rules_or_empty(installed);
+    return {
+        ...marked,
+        requested: live,
+        delta: view_action_delta(rules_or_empty(action.baseline), live),
+    };
+}
+
+/** The newest request of the action still out and not refused. */
+function live_request(action: ViewAction): ViewActionRequest | undefined {
+    return [...action.requests].reverse().find((request) => !request.settled && !request.refused);
+}
+
+/** A Hide rows asks which source rows it hides: a choice of the action, after a cancel too. */
+export function resolve_in_view_action(action: ViewAction, request_id: string, rows: number): ViewAction {
+    return {
+        ...action,
+        cancelled: false,
+        resolving: [...action.resolving, { requestId: request_id, rows }],
+    };
+}
+
+/**
+ * Take a resolving hide out of the action: its answer, its refusal, or no
+ * answer in time. Undefined when the action no longer holds it, after a
+ * cancel or Unhide all, and its answer is then ignored.
+ */
+export function take_resolution(action: ViewAction, request_id: string): ViewAction | undefined {
+    if (!action.resolving.some((resolution) => resolution.requestId === request_id)) return undefined;
+    return {
+        ...action,
+        resolving: action.resolving.filter((resolution) => resolution.requestId !== request_id),
+    };
+}
+
+/** Unhide all ends every hide still resolving on its sheet. */
+export function drop_resolutions(action: ViewAction): ViewAction {
+    return action.resolving.length === 0 ? action : { ...action, resolving: [] };
+}
+
+/** Nothing of the action is out: every request settled, no hide resolving. It ends. */
+export function view_action_idle(action: ViewAction): boolean {
+    return action.resolving.length === 0 && action.requests.every((request) => request.settled);
+}
+
+/** The display rows the action's resolving hides chose. */
+export function view_action_resolving_rows(action: ViewAction): number {
+    return action.resolving.reduce((total, resolution) => total + resolution.rows, 0);
 }
 
 /** The newest request is still out: the host has not settled it. */
@@ -320,10 +415,12 @@ function adopt_from_elsewhere(
 ): { readonly action: ViewAction; readonly resend: boolean } {
     if (transform_states_equal(rules ?? NO_RULES, action.baseline ?? NO_RULES)) return { action, resend: false };
     const moved: ViewAction = { ...action, baseline: rules };
-    if (!view_action_in_flight(action)) return { action: moved, resend: false };
+    // Recomposed whether or not a request is out: a hide still resolving
+    // composes its answer onto these later (V2).
     const requested = action.cancelled
         ? view_action_cancel_target(moved)
         : apply_view_action_delta(action.delta, rules, action.schema);
+    if (!view_action_in_flight(action)) return { action: { ...moved, requested }, resend: false };
     const newest = action.requests.at(-1)!;
     return {
         action: { ...moved, requested },
@@ -378,7 +475,7 @@ export function settle_view_action(
     const adopted = committed_by_action(marked, committed_by)
         ? { action: marked, resend: false }
         : adopt_from_elsewhere(marked, rules);
-    if (adopted.resend || marked.requests.some((request) => !request.settled)) {
+    if (adopted.resend || !view_action_idle(adopted.action)) {
         return { kind: 'pending', action: adopted.action, resend: adopted.resend };
     }
     return {
