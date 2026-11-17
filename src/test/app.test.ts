@@ -26310,9 +26310,12 @@ describe('view steps in history', () => {
 
             await reload([SORTED]);
 
+            // The new step leaves Redo nothing, and the press ends quietly:
+            // no message, and no replay.
             expect(undo_labels()).toEqual(['Sort']);
+            expect(redo_labels()).toEqual([]);
             expect(press_held()).toBe(false);
-            expect(warnings(post_message).length - said).toBeLessThanOrEqual(1);
+            expect(warnings(post_message).slice(said)).toEqual([]);
             expect(replays(post_message)).toEqual([]);
         });
 
@@ -26346,7 +26349,7 @@ describe('view steps in history', () => {
             expect(replays(post_message)).not.toEqual([]);
         });
 
-        it('records the newest request that installed and was not settled, and nothing more for its late answers', async () => {
+        it('records the newest request that installed and was not settled, and nothing more for its late settlement', async () => {
             const { post_message } = await render_app();
             await open(post_message);
             const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
@@ -26481,7 +26484,9 @@ describe('view steps in history', () => {
 
             // The sort is recorded, and the Undo waiting runs against it,
             // after the saved view the reload brought if the window asked for
-            // that first: the order of the two is the order effects run in.
+            // that first. Which goes first follows state left by earlier tests
+            // in this file (V2's Unhide all tests make it the restore); both
+            // end the same.
             expect(undo_labels()).toEqual(['Sort']);
             const first = latest_transform_request(post_message);
             if (first.intent === 'restore') await install(first);
@@ -26621,15 +26626,41 @@ describe('view steps in history', () => {
             expect(undo_labels()).toEqual(['Sort']);
         });
 
-        it('records nothing when the reload brings other columns', async () => {
+        it('records nothing when the reload brings other columns, though it carries the sort', async () => {
             const { post_message } = await render_app();
             await open(post_message);
             await first_installed(post_message);
             const renamed = table_meta();
             renamed.sheets[0].columnNames = ['Name', 'Amount', 'Notes'];
 
-            await reload([undefined], renamed);
+            await reload([{ sort: SORT_ASC, filters: [], schema: '["Sheet1",3,["Name","Amount","Notes"]]' }], renamed);
 
+            expect(undo_labels()).toEqual([]);
+        });
+
+        it('records no step holding another window\'s filter when it composed onto the installed sort', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await first_installed(post_message);
+            // Another window adds a filter onto the saved sort. By the strict
+            // comparison (I3) the action's baseline moves to the sort and the
+            // filter, so the sort is no longer this action's to record.
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: SORT_ASC, filters: [FILTER], schema: SCHEMA }] },
+            }));
+            auto_settle_transforms = true;
+            const restore = latest_transform_request(post_message);
+            if (restore.intent === 'restore') await install(restore);
+            auto_settle_transforms = false;
+
+            await reload([{ sort: SORT_ASC, filters: [FILTER], schema: SCHEMA }]);
+
+            // Measured from where the record was composed, the step would
+            // hold the other window's filter, and Undo would take it away.
             expect(undo_labels()).toEqual([]);
         });
     });
@@ -26681,6 +26712,23 @@ describe('view steps in history', () => {
             expect(undo_labels()).toEqual(['Sort']);
             const change = history().undoStack[0].action.changes[0];
             expect(change.kind === 'view' && change.delta.worksheet).toMatchObject({ sheetIndex: 1, worksheetId: 'ws-a' });
+        });
+
+        it('records nothing for a sort that installed when only the sheet now at the old index holds it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {}, workbook(['a', 'b']));
+            const first = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await ask(post_message, { sort: [{ colIndex: 1, direction: 'desc' }], filters: [] });
+            auto_settle_transforms = false;
+            await install(first!);
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: first!.requestId, committedBy: first!.requestId,
+            });
+
+            // Alpha is gone; Beta, now at its index, is sorted the same way.
+            await reload([{ sort: SORT_ASC, filters: [], schema: BETA_SCHEMA }], workbook(['b']));
+
+            expect(undo_labels()).toEqual([]);
         });
 
         it('records nothing when only the sheet now at the old index holds the sort', async () => {

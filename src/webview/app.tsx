@@ -2365,6 +2365,11 @@ export function App(): React.JSX.Element {
      *  - A sort or filter gesture landed only if the adopted rules equal its
      *    target in every slice it changed; its step is then that difference
      *    and nothing else the refresh carried.
+     *  - Else what its view action had installed under the old source, when
+     *    the record carries it, is judged the same way: it was saved, and
+     *    the reload may show it. The window adds a record for that when the
+     *    action had none left; such a record never drops a waiting press,
+     *    since with no record nothing was decided.
      *  - A gesture that hides rows names source rows, which a reload can
      *    number anew, so the rows it would hide are left out; the rest of
      *    the request is judged as above.
@@ -6412,7 +6417,8 @@ export function App(): React.JSX.Element {
                                     };
                                 } else if (record === undefined && moved) {
                                     pending_view_transforms_ref.current[sheet_index] = {
-                                        requestId: outgoing.action.requests.at(-1)?.requestId ?? '',
+                                        // A request is out, so there is one.
+                                        requestId: outgoing.action.requests.at(-1)!.requestId,
                                         worksheet: outgoing.worksheet,
                                         schema: outgoing.schema,
                                         baseline,
