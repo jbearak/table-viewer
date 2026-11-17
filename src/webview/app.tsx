@@ -14002,15 +14002,25 @@ export function App(): React.JSX.Element {
         ? view_action_ref.current.action
         : undefined;
     // Whether a request of the sheet is still computing: the newest one in
-    // flight, or one of the action not yet on screen, still computing after a
-    // newer one was refused, whose label went with the newer one. A request
-    // installed and not yet settled computes nothing more.
+    // flight, or an older request of the action still computing after a newer
+    // one was refused; its label went with the newer request, so it is named
+    // from what the action asks for. A request installed and not yet settled
+    // computes nothing more: its rules are on screen. That test reads the
+    // hidden rows by count only, as it runs at every render and a label needs
+    // no more.
     const installed_on_screen = installed_rules_on_screen(active_sheet_index);
+    const on_screen = (rules: SheetTransformState | undefined): boolean => {
+        if (sheet_action === undefined) return true;
+        const { hiddenRows: shown_hidden, ...shown } = rules ?? EMPTY_TRANSFORM;
+        const { hiddenRows: asked_hidden, ...asked } = sheet_action.requested;
+        return (shown_hidden?.length ?? 0) === (asked_hidden?.length ?? 0)
+            && transforms_semantically_equal(shown, asked);
+    };
     const sheet_request_computing = pending_transform_request_ids_ref.current[active_sheet_index] !== undefined
         || (sheet_action !== undefined
             && !sheet_action.cancelled
             && sheet_action.requests.some((request) => !request.settled)
-            && !transforms_semantically_equal(installed_on_screen, sheet_action.requested));
+            && !on_screen(installed_on_screen));
     // Nothing of the sheet's action computes but hides asking for their rows.
     const hiding_rows_only = sheet_action !== undefined
         && sheet_action.resolving.length > 0
