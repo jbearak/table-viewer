@@ -3558,6 +3558,14 @@ export function save_lifecycle_correlation(
 }
 
 /** Messages from extension host to webview. */
+/** The installed sheet a `transformSettled` reports; the fields of `transformInstalled`. */
+export interface TransformSettledProjection {
+    readonly view: SheetViewRecord;
+    readonly rules: SheetTransformState | undefined;
+    readonly rowHeights: Readonly<Record<number, number>>;
+    readonly mappingGeneration: number;
+}
+
 export type HostMessage =
     | { type: 'fontChanged'; fontFamily: string | null; fontSize: number | null }
     /**
@@ -3774,6 +3782,18 @@ export type HostMessage =
     // the optimistic layer away. Same fact `WorkbookSnapshot.mappingGenerations` carries,
     // delivered on the one message that reports an install.
     | { type: 'transformInstalled'; sheetIndex: number; requestId: string; intent: TransformIntent; view: SheetViewRecord; rules: SheetTransformState | undefined; rowHeights: Readonly<Record<number, number>>; mappingGeneration: number }
+    /**
+     * The host will say nothing more about this `setTransform`, and nothing it did
+     * for it is still to come: posted once per request, after its answer and after
+     * any durable reconciliation that answer led to, or at once for a request a
+     * newer one on the sheet stopped. `projection` is the sheet as installed when
+     * this was posted, read in one tick as `transformInstalled` reads it, so a
+     * window can end a view action on it without waiting for a snapshot. Absent
+     * when the sheet does not exist. `committedBy` names the request of this
+     * receiver whose durable commit wrote the rules installed, and is absent when
+     * none did: rules equal to a request's are no proof it wrote them.
+     */
+    | { type: 'transformSettled'; sheetIndex: number; requestId: string; projection?: TransformSettledProjection; committedBy?: string }
     /**
      * The host changed nothing. It deliberately carries no `view`, no `state`, no
      * `rowCount` and no `generation`: six review rounds of this feature were each a

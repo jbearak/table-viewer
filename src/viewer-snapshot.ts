@@ -18,6 +18,7 @@ import {
     type ExcelHeaderChange,
     type PerFileState,
     type ScrollPosition,
+    type SheetTransformState,
     type StoredPerFileState,
     type WorksheetIdentityInput,
 } from './types';
@@ -373,6 +374,18 @@ export interface WorkbookSnapshot {
      * would have avoided this field is unsound.
      */
     readonly mappingGenerations: readonly number[];
+    /**
+     * Per sheet, this panel's last durable transform commit in this process, with
+     * the durable rules it wrote, or undefined when another panel committed last.
+     * A window with a view action pending tells its own work from a change made
+     * elsewhere by this: the snapshot's durable rules are its own only when they
+     * equal these, and equal rules alone are no proof, because another window can
+     * write the same. Absent from a host that does not track it.
+     */
+    readonly transformCommits?: readonly ({
+        readonly requestId: string;
+        readonly rules: SheetTransformState | undefined;
+    } | undefined)[];
     readonly state: NormalizedPerFileState;
     readonly configuration: WorkbookSnapshotConfiguration;
     readonly capabilities: WorkbookSnapshotCapabilities;
@@ -406,6 +419,8 @@ export interface WorkbookSnapshotCoreMaterial<Meta extends WorkbookMeta = Workbo
      * the same reason. See `WorkbookSnapshot.mappingGenerations`.
      */
     readonly mappingGenerations: readonly number[];
+    /** See `WorkbookSnapshot.transformCommits`. */
+    readonly transformCommits?: WorkbookSnapshot['transformCommits'];
 }
 
 export interface WorkbookSnapshotDiagnostics {
@@ -484,6 +499,9 @@ export function build_workbook_snapshot<Meta extends WorkbookMeta>(
         meta: input.core.meta,
         hiddenEditedCellKeys: input.core.hiddenEditedCellKeys,
         mappingGenerations: input.core.mappingGenerations,
+        ...(input.core.transformCommits === undefined
+            ? {}
+            : { transformCommits: input.core.transformCommits }),
         state: normalize_workbook_snapshot_state(
             state_snapshot.state,
             input.core.meta,

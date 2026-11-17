@@ -5149,6 +5149,61 @@ describe('CSV edit sessions', () => {
                 [expect.objectContaining({ raw: 'c' })],
             ],
         }));
+        // Each request is settled once. A at Cancel-B's takeover; Cancel-B only after
+        // the reconciliation, carrying what it installed and that A committed it, so a
+        // window can record A's step without waiting for the snapshot (plan I3).
+        const settled = (panel.__messages as any[]).filter((message) => message.type === 'transformSettled');
+        expect(settled.map((message) => message.requestId)).toEqual(['install-preferred', 'A', 'Cancel-B']);
+        const cancel_settled = settled.at(-1);
+        expect(cancel_settled.projection.rules.sort).toEqual([{ colIndex: 0, direction: 'asc' }]);
+        expect(cancel_settled.committedBy).toBe('A');
+        const messages = panel.__messages as any[];
+        const cancel_refused = messages.filter((message) => (
+            message.type === 'transformRefused' && message.requestId === 'Cancel-B'
+        )).at(-1);
+        expect(messages.indexOf(cancel_settled)).toBeGreaterThan(messages.indexOf(cancel_refused));
+    });
+
+    it('names no request of this panel for rules another panel committed, equal or not', async () => {
+        const file_path = '/tmp/transform-provenance-equal-rules.csv';
+        const shared = state_store();
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\nc\na\nb\n'));
+        vscode_mock.__setStatImplementation(async () => ({ size: 8, mtime: 1 }));
+        const mine = open_csv_table(uri(file_path), shared.store);
+        const theirs = open_csv_table(uri(file_path), shared.store);
+        await mine.__receive({ type: 'ready' });
+        await theirs.__receive({ type: 'ready' });
+        const descending = {
+            sort: [{ colIndex: 0, direction: 'desc' as const }],
+            filters: [],
+            schema: '["Sheet1",1,["h"]]',
+        };
+        const mine_initial = latest_snapshot(mine);
+        await mine.__receive({
+            type: 'setTransform', sheetIndex: 0, requestId: 'mine',
+            generation: mine_initial.generation, sourceGeneration: mine_initial.sourceGeneration,
+            intent: 'user', state: descending,
+        });
+        const settled_mine = (mine.__messages as any[]).filter((message) => (
+            message.type === 'transformSettled' && message.requestId === 'mine'
+        ));
+        expect(settled_mine).toHaveLength(1);
+        expect(settled_mine[0].committedBy).toBe('mine');
+
+        await theirs.__receive({ type: 'ready' });
+        const theirs_snapshot = latest_snapshot(theirs);
+        expect(theirs_snapshot.transformCommits?.[0]).toBeUndefined();
+        await theirs.__receive({
+            type: 'setTransform', sheetIndex: 0, requestId: 'theirs',
+            generation: theirs_snapshot.generation, sourceGeneration: theirs_snapshot.sourceGeneration,
+            intent: 'user', state: descending,
+        });
+        expect((theirs.__messages as any[]).filter((message) => (
+            message.type === 'transformSettled' && message.requestId === 'theirs'
+        )).at(-1)?.committedBy).toBe('theirs');
+
+        await mine.__receive({ type: 'ready' });
+        expect(latest_snapshot(mine).transformCommits?.[0]).toBeUndefined();
     });
 
     it('reconciles a cross-panel durable transform clear before ready completes', async () => {

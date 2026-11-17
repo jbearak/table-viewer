@@ -192,6 +192,18 @@ type DurableRowHeightsProvider = (sheet_names: readonly string[]) => {
  */
 type TransformAnswered = (sheet_index: number, request_id: string) => void;
 
+/**
+ * The request of this core's panel whose durable commit is the last in this
+ * process for a sheet, and the durable rules it wrote, or undefined when another
+ * panel committed last. Rules another process writes differ from these, so a
+ * reader compares: equal rules name the request, any others name none.
+ */
+export interface TransformCommitRecord {
+    readonly requestId: string;
+    readonly rules: SheetTransformState | undefined;
+}
+export type TransformCommitLookup = (sheet_index: number) => TransformCommitRecord | undefined;
+
 type RowWindowServed = (
     msg: Extract<WebviewMessage, { type: 'requestRows' }>,
     window: Pick<TransformedRowWindow, 'startRow' | 'sourceRows'>,
@@ -458,6 +470,15 @@ export class ViewerPanelCore {
     private readonly durable_row_heights?: DurableRowHeightsProvider;
     private readonly on_row_window_served?: RowWindowServed;
     private readonly on_transform_answered?: TransformAnswered;
+    private readonly settles_transforms: boolean;
+    private readonly transform_commit?: TransformCommitLookup;
+    /**
+     * Per sheet, the request that took the sheet and is not settled yet. One per
+     * sheet because only one request holds a sheet: a newer one settles it when
+     * it takes over. Cleared without a post when the source or the receiver
+     * changes, because the window that asked is then gone or knows.
+     */
+    private readonly unsettled_transforms = new Map<number, string>();
     /**
      * The last computed display-keyed projection, with the facts it is a function of.
      * See `row_height_projection_by_sheet` for why each is needed and why a memo is
@@ -527,6 +548,14 @@ export class ViewerPanelCore {
              */
             onRowWindowServed?: RowWindowServed;
             onTransformAnswered?: TransformAnswered;
+            /**
+             * Post `transformSettled` for every `setTransform`. The core settles a
+             * request it refuses before the request takes its sheet, and an older
+             * request a newer one takes the sheet from; the caller settles the rest
+             * with `settle_transform` once its own work after the answer is done.
+             */
+            settleTransforms?: boolean;
+            transformCommit?: TransformCommitLookup;
         },
     ) {
         this.max_cached_pages = opts?.maxCachedPages ?? DEFAULT_MAX_CACHED_PAGES;
@@ -543,6 +572,8 @@ export class ViewerPanelCore {
         this.durable_row_heights = opts?.durableRowHeights;
         this.on_row_window_served = opts?.onRowWindowServed;
         this.on_transform_answered = opts?.onTransformAnswered;
+        this.settles_transforms = opts?.settleTransforms === true;
+        this.transform_commit = opts?.transformCommit;
     }
 
     get generation(): number {
@@ -762,6 +793,8 @@ export class ViewerPanelCore {
     begin_receiver_epoch(receiver_epoch: number): void {
         if (this.disposed || this.receiver_epoch === receiver_epoch) return;
         this.receiver_epoch = receiver_epoch;
+        // A new receiver is a new window, which asked for none of these.
+        this.unsettled_transforms.clear();
     }
 
     /**
@@ -789,6 +822,8 @@ export class ViewerPanelCore {
         this.transform_states.clear();
         this.transform_operations.clear();
         this.transforms_in_flight.clear();
+        // The window sees the new source generation and ends its actions on it.
+        this.unsettled_transforms.clear();
         this.histogram_cache.clear();
         this.histogram_operations.clear();
         this.column_analysis_cache.clear();
@@ -824,6 +859,7 @@ export class ViewerPanelCore {
         this.source_epoch += 1;
         this.transform_operations.clear();
         this.transforms_in_flight.clear();
+        this.unsettled_transforms.clear();
         this.histogram_operations.clear();
     }
 
@@ -861,6 +897,11 @@ export class ViewerPanelCore {
                 // very install that invalidated it. See `mapping_generations_by_sheet`
                 // for why the host has to send it at all.
                 mappingGenerations: this.mapping_generations_by_sheet(),
+                ...(this.transform_commit === undefined ? {} : {
+                    transformCommits: this.source.meta().sheets.map((_sheet, index) => (
+                        this.transform_commit!(index)
+                    )),
+                }),
             },
             diagnostics: {
                 truncationMessage: this.source.truncationMessage ?? null,
@@ -1797,6 +1838,7 @@ export class ViewerPanelCore {
                 'terminal',
                 receiver_epoch,
             );
+            this.settle_unadmitted_transform(msg, receiver_epoch);
             return;
         }
         if (msg.sourceGeneration !== this._source_generation) {
@@ -1806,6 +1848,7 @@ export class ViewerPanelCore {
                 'terminal',
                 receiver_epoch,
             );
+            this.settle_unadmitted_transform(msg, receiver_epoch);
             return;
         }
         if (
@@ -1818,6 +1861,7 @@ export class ViewerPanelCore {
                 'terminal',
                 receiver_epoch,
             );
+            this.settle_unadmitted_transform(msg, receiver_epoch);
             return;
         }
 
@@ -1833,6 +1877,7 @@ export class ViewerPanelCore {
                 this.transform_installed_ack(msg, sheet),
                 receiver_epoch,
             );
+            this.settle_unadmitted_transform(msg, receiver_epoch);
             return;
         }
         if (
@@ -1841,6 +1886,7 @@ export class ViewerPanelCore {
             && transform_states_equal(installed_state, msg.state)
         ) {
             const operation_token = allocate_transform_operation_token();
+            this.take_transform_sheet(msg);
             this.transform_operations.set(msg.sheetIndex, operation_token);
             const source_epoch = this.source_epoch;
             this.transforms_in_flight.set(msg.sheetIndex, operation_token);
@@ -1884,6 +1930,7 @@ export class ViewerPanelCore {
         }
 
         const operation_token = allocate_transform_operation_token();
+        this.take_transform_sheet(msg);
         this.transform_operations.set(msg.sheetIndex, operation_token);
         const source_epoch = this.source_epoch;
         this.transforms_in_flight.set(msg.sheetIndex, operation_token);
@@ -2029,12 +2076,81 @@ export class ViewerPanelCore {
         error: string,
         disposition: TransformRefusalDisposition,
     ): Promise<boolean> {
+        // Refused before it could take the sheet, so it settles itself here and
+        // leaves whichever request holds the sheet owed.
+        const receiver_epoch = this.receiver_epoch;
         return this.post_transform_refusal(
             msg,
             error,
             disposition,
-            this.receiver_epoch,
-        );
+            receiver_epoch,
+        ).then((posted) => {
+            this.settle_unadmitted_transform(msg, receiver_epoch);
+            return posted;
+        });
+    }
+
+    /**
+     * Settle a request that holds its sheet, once: the caller's work after the
+     * answer is done. A request a newer one took the sheet from was settled then,
+     * and one refused before it took the sheet settled itself, so for those this
+     * does nothing.
+     */
+    settle_transform(msg: SetTransformMessage): void {
+        if (!this.settles_transforms) return;
+        if (this.unsettled_transforms.get(msg.sheetIndex) !== msg.requestId) return;
+        this.unsettled_transforms.delete(msg.sheetIndex);
+        void this.post_transform_settled(msg.sheetIndex, msg.requestId, this.receiver_epoch);
+    }
+
+    /** A request that never held its sheet. */
+    private settle_unadmitted_transform(msg: SetTransformMessage, receiver_epoch: number): void {
+        if (!this.settles_transforms) return;
+        void this.post_transform_settled(msg.sheetIndex, msg.requestId, receiver_epoch);
+    }
+
+    /** `msg` takes its sheet: the request that held it is settled now, before it can do more. */
+    private take_transform_sheet(msg: SetTransformMessage): void {
+        if (!this.settles_transforms) return;
+        const prior = this.unsettled_transforms.get(msg.sheetIndex);
+        this.unsettled_transforms.set(msg.sheetIndex, msg.requestId);
+        if (prior !== undefined && prior !== msg.requestId) {
+            void this.post_transform_settled(msg.sheetIndex, prior, this.receiver_epoch);
+        }
+    }
+
+    /**
+     * Read in one tick, like `transform_installed_ack`, so the projection names one
+     * permutation.
+     */
+    private post_transform_settled(
+        sheet_index: number,
+        request_id: string,
+        receiver_epoch: number,
+    ): Promise<boolean> {
+        const sheet = this.source.meta().sheets[sheet_index];
+        const rules = this.transform_states.get(sheet_index);
+        const installed = transform_has_entries(rules) ? clone_transform(rules!) : undefined;
+        const record = this.transform_commit?.(sheet_index);
+        const { onlyChangedRows: _session_only, ...installed_durable } = installed ?? EMPTY_TRANSFORM;
+        const committed_by = record !== undefined
+            && transform_states_equal(installed_durable, record.rules ?? EMPTY_TRANSFORM)
+            ? record.requestId
+            : undefined;
+        return this.post({
+            type: 'transformSettled',
+            sheetIndex: sheet_index,
+            requestId: request_id,
+            ...(sheet === undefined ? {} : {
+                projection: {
+                    view: this.installed_view(sheet_index, sheet),
+                    rules: installed,
+                    rowHeights: this.row_height_projection(sheet_index) ?? {},
+                    mappingGeneration: this.mapping_generation(sheet_index),
+                },
+            }),
+            ...(committed_by === undefined ? {} : { committedBy: committed_by }),
+        }, receiver_epoch);
     }
 
     /**
@@ -2230,6 +2346,8 @@ export function adopt_source_into_core(
         durableRowHeights?: DurableRowHeightsProvider;
         onRowWindowServed?: RowWindowServed;
         onTransformAnswered?: TransformAnswered;
+        settleTransforms?: boolean;
+        transformCommit?: TransformCommitLookup;
     },
     on_installed?: (installed: ViewerPanelCore) => void,
 ): AdoptSourceIntoCoreResult {
