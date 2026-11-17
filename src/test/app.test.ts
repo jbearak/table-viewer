@@ -26138,6 +26138,27 @@ describe('view steps in history', () => {
             expect(undo_labels()).toEqual(['Sort']);
         });
 
+        it('records an Unhide all that installed beside a hide when a reload overtakes the hide\'s composed request', async () => {
+            const { post_message } = await render_app();
+            await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [], hiddenRows: [1], schema: SCHEMA }] },
+            }));
+            await install(latest_transform_request(post_message));
+
+            await click_button('Unhide all');
+            const unhide = latest_transform_request(post_message);
+            const question = await hide_rows_unanswered(post_message, [{ start: 2, end: 2 }]);
+            await install(unhide);
+            await answer_hide(question!, [2]);
+            expect(latest_transform_request(post_message).state.hiddenRows).toEqual([2]);
+
+            // The Unhide all was saved; the hide's request had not been.
+            await reload([undefined]);
+
+            expect(undo_labels()).toEqual(['Unhide rows']);
+        });
+
         it('moves a replay it overtook when the reload shows the replay\'s target', async () => {
             const { post_message } = await render_app();
             await open(post_message);

@@ -2405,17 +2405,15 @@ export function App(): React.JSX.Element {
             }
             // Rows it would hide are left out: a new source can renumber them,
             // so a reload cannot vouch for them. The rest of the request, a sort
-            // a hide was composed onto included, is recorded if the reload
-            // shows it.
+            // a hide was composed onto or rows it shows included, is recorded if
+            // the reload shows it.
             const baseline_hidden = new Set(pending.baseline?.hiddenRows ?? []);
             const hides_rows = pending.target !== undefined
                 && (pending.target.hiddenRows ?? []).some((row) => !baseline_hidden.has(row));
+            const kept_hidden = (pending.target?.hiddenRows ?? []).filter((row) => baseline_hidden.has(row));
             const { hiddenRows: _target_hidden, ...target_rest } = pending.target ?? EMPTY_TRANSFORM;
             const target = hides_rows
-                ? {
-                    ...target_rest,
-                    ...(pending.baseline?.hiddenRows === undefined ? {} : { hiddenRows: pending.baseline.hiddenRows }),
-                }
+                ? { ...target_rest, ...(kept_hidden.length === 0 ? {} : { hiddenRows: kept_hidden }) }
                 : pending.target;
             const step = sheet === undefined
                 || index === undefined
