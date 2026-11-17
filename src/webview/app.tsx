@@ -1,4 +1,5 @@
 import { cell_key, parse_cell_key } from '../cell-key';
+import { transforms_semantically_equal } from './view-action-model';
 import React, {
     useState,
     useEffect,
@@ -1001,60 +1002,7 @@ function transform_rollback_baseline(
     return { sort: [], filters: [], schema };
 }
 
-export function transforms_semantically_equal(
-    left: SheetTransformState | undefined,
-    right: SheetTransformState | undefined,
-): boolean {
-    if (!transform_has_entries(left) && !transform_has_entries(right)) return true;
-    if (!left || !right) return false;
-    // Session state, but a semantic difference like any other: without this a
-    // toggle of "only changed rows" over an existing sort compared equal to the
-    // sort alone, and handle_transform_change dropped the request as a no-op.
-    if ((left.onlyChangedRows === true) !== (right.onlyChangedRows === true)) return false;
-    if (JSON.stringify(left.sort) !== JSON.stringify(right.sort)) return false;
-    const left_hidden = [...(left.hiddenRows ?? [])].sort((a, b) => a - b);
-    const right_hidden = [...(right.hiddenRows ?? [])].sort((a, b) => a - b);
-    if (JSON.stringify(left_hidden) !== JSON.stringify(right_hidden)) return false;
-    const semantic_filters = (filters: readonly FilterEntry[]) => filters
-        .map((entry) => {
-            const base = {
-                colIndex: entry.colIndex,
-                operator: entry.operator,
-                enabled: entry.enabled,
-            };
-            if (entry.operator === 'isEmpty' || entry.operator === 'isNotEmpty') {
-                return base;
-            }
-            if (entry.operator === 'isOneOf') {
-                return {
-                    ...base,
-                    // Total order with null first and code-unit string compare, so
-                    // equal exclusion sets always serialize identically (locale
-                    // collation can tie distinct strings, e.g. '' vs null or
-                    // composed vs decomposed Unicode).
-                    excludedValues: [...(entry.excludedValues ?? [])].sort(
-                        (a, b) => {
-                            if (a === b) return 0;
-                            if (a === null) return -1;
-                            if (b === null) return 1;
-                            return a < b ? -1 : 1;
-                        },
-                    ),
-                };
-            }
-            return {
-                ...base,
-                value: entry.value ?? '',
-                secondValue: is_range_filter_operator(entry.operator)
-                    ? entry.secondValue ?? ''
-                    : undefined,
-                caseSensitive: entry.caseSensitive,
-            };
-        })
-        .sort((a, b) => a.colIndex - b.colIndex);
-    return JSON.stringify(semantic_filters(left.filters))
-        === JSON.stringify(semantic_filters(right.filters));
-}
+export { transforms_semantically_equal };
 
 /**
  * The durable rules to reconcile against, with the compare window's session
