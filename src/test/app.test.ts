@@ -23907,6 +23907,22 @@ describe('view steps in history', () => {
             expect(again.state).toMatchObject({ sort: [], onlyChangedRows: true });
         });
 
+        it('keeps "Only changed rows" taken back when a refused cancel of it alone is sent again', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await ask(post_message, { sort: [], filters: [], onlyChangedRows: true });
+            await click_button('Cancel');
+            const cancel = latest_transform_request(post_message);
+            expect(cancel.state.onlyChangedRows).toBeUndefined();
+            await refuse(cancel, 'The file is being saved.');
+            await click_button('Cancel');
+            const again = latest_transform_request(post_message);
+            expect(again.requestId).not.toBe(cancel.requestId);
+            expect(again.intent).toBe('cancel');
+            expect(again.state.onlyChangedRows).toBeUndefined();
+        });
+
         it('builds a toolbar choice made during a request from the rules asked for', async () => {
             const { post_message } = await render_app();
             await open(post_message);
