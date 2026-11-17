@@ -24266,8 +24266,8 @@ describe('view steps in history', () => {
             const again = sent.filter((request) => request.intent === 'user').at(-1)!;
             expect(again.requestId).not.toBe(sort!.requestId);
             expect(again.state).toMatchObject({ sort: SORT_ASC, filters: [FILTER] });
-            const restore = sent.filter((request) => request.intent === 'restore').at(-1);
-            if (restore !== undefined) await install(restore);
+            // The action sends its sort again onto the filter, and nothing else.
+            expect(sent.filter((request) => request.intent === 'restore')).toEqual([]);
             // Refused before it took the sheet: the first sort is still out.
             await refuse(again);
             await answer_hide(question!, [1]);
@@ -24292,6 +24292,8 @@ describe('view steps in history', () => {
                 capabilities: CSV,
                 state: { transforms: [{ sort: [], filters: [], schema: SCHEMA }] },
             }));
+            // Refused, and then settled with no projection: both the refusal's
+            // fallback and the settlement read what is installed.
             await refuse(sort!);
             await answer_hide(question!, [1]);
 
