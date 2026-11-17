@@ -9,6 +9,7 @@ import {
     refresh_view_action,
     refuse_in_view_action,
     resend_in_view_action,
+    view_action_resend_is_cancel,
     resolve_in_view_action,
     settle_view_action,
     take_resolution,
@@ -4030,12 +4031,14 @@ export function App(): React.JSX.Element {
         const pending = view_action_ref.current;
         if (pending === undefined) return;
         const { action } = pending;
+        // A cancel stays one, though a hide chosen after it cleared the mark.
+        const cancel = view_action_resend_is_cancel(action);
         const request_id = request_transform(
             action.sheetIndex,
             action.requested,
-            action.cancelled ? 'cancel' : 'user',
+            cancel ? 'cancel' : 'user',
             pending.origin,
-            action.cancelled ? undefined : {
+            cancel ? undefined : {
                 worksheet: pending.worksheet,
                 schema: pending.schema,
                 baseline: action.baseline,

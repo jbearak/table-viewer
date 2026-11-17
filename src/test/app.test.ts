@@ -24376,7 +24376,9 @@ describe('view steps in history', () => {
             }));
             const again = latest_transform_request(post_message);
             expect(again.requestId).not.toBe(cancel.requestId);
-            expect(again.state).toMatchObject({ sort: [], filters: [FILTER] });
+            // Still a cancel on the wire, which the host can commit without
+            // computing when its rules are installed already.
+            expect(again).toMatchObject({ intent: 'cancel', state: { sort: [], filters: [FILTER] } });
             // The sort had installed onto the filter, and the first cancel was
             // superseded by the one sent again, which the host then refuses.
             auto_settle_transforms = false;

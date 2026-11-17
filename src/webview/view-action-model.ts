@@ -318,13 +318,18 @@ export function cancel_view_action(action: ViewAction, request_id: string, keep_
     };
 }
 
+/** Whether the request sent again is a cancel: the one it replaces was. */
+export function view_action_resend_is_cancel(action: ViewAction): boolean {
+    return action.cancelled || action.requests.at(-1)?.cancel === true;
+}
+
 /**
  * The same request again, onto a moved baseline: it supersedes the one in
  * flight, and is a cancel when that one was, though a hide chosen after the
  * cancel has cleared the action's mark.
  */
 export function resend_in_view_action(action: ViewAction, request_id: string): ViewAction {
-    const cancel = action.cancelled || action.requests.at(-1)?.cancel === true;
+    const cancel = view_action_resend_is_cancel(action);
     return {
         ...action,
         requests: [
