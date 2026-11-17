@@ -195,6 +195,16 @@ describe('a view action', () => {
         }));
     });
 
+    it('takes rules only meaning the same as its baseline, written elsewhere, for a change made elsewhere', () => {
+        // Its sort fails; another window wrote f1's meaning under another id.
+        let action = begin_view_action(0, schema, filtered);
+        action = choose_in_view_action(action, { ...by_a, filters: filtered.filters }, 'A');
+        const foreign = rules({ filters: [filter('f9', 2, 'x')] });
+        expect(settle_view_action(action, 'A', foreign, undefined)).toEqual({
+            kind: 'ended', baseline: foreign, installed: foreign,
+        });
+    });
+
     it('does not move for a refresh showing its own commit', () => {
         let action = begin_view_action(0, schema, undefined);
         action = choose_in_view_action(action, by_a, 'A');

@@ -3277,14 +3277,21 @@ export function App(): React.JSX.Element {
      */
     const view_action_ref = useRef<PendingViewAction | undefined>(undefined);
     /**
+     * Per sheet, the request a change of "Only changed rows" alone sent with no
+     * action pending. It is the person's own choice, though no action (I1), so
+     * a new choice replaces it as it would the action's request.
+     */
+    const toggle_request_ids_ref = useRef<(string | undefined)[]>([]);
+    /**
      * Whether a sort or filter choice on a sheet waits: a request is pending
-     * there that is not the person's own view action's, that is a hide, a
-     * replay, or a restore. The action's own request does not hold a choice,
-     * because a new choice replaces it.
+     * there that is not the person's own, that is a hide, a replay, or a
+     * restore. The person's own request, the action's or a toggle's, does not
+     * hold a choice, because a new choice replaces it.
      */
     const view_choice_waits = (sheet_index: number): boolean => {
         const request_id = pending_transform_request_ids_ref.current[sheet_index];
         if (request_id === undefined) return false;
+        if (toggle_request_ids_ref.current[sheet_index] === request_id) return false;
         const pending = view_action_ref.current;
         return pending === undefined
             || pending.action.sheetIndex !== sheet_index
@@ -10666,12 +10673,18 @@ export function App(): React.JSX.Element {
                     sanitized,
                 ) === undefined
             ) {
-                request_transform(active_sheet_index, sanitized, 'user', origin, {
-                    worksheet,
-                    schema,
-                    baseline: state_ref.current.transforms?.[active_sheet_index],
-                    target: sanitized,
-                });
+                toggle_request_ids_ref.current[active_sheet_index] = request_transform(
+                    active_sheet_index,
+                    sanitized,
+                    'user',
+                    origin,
+                    {
+                        worksheet,
+                        schema,
+                        baseline: state_ref.current.transforms?.[active_sheet_index],
+                        target: sanitized,
+                    },
+                );
                 return true;
             }
             const action = pending_action?.action ?? begin_view_action(

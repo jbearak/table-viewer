@@ -23450,6 +23450,37 @@ describe('view steps in history', () => {
             expect(cells_editable()).toEqual(EDITABLE);
         });
 
+        it('records nothing, and keeps Redo, when its sort fails and another window rewrote its filter under another id', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await install((await ask(post_message, { sort: [], filters: [FILTER] }))!);
+            await install((await ask(post_message, { sort: SORT_ASC, filters: [FILTER] }))!);
+            await undo();
+            const replay = latest_transform_request(post_message);
+            await install(replay);
+            expect(undo_labels()).toEqual(['Filter']);
+            expect(redo_labels()).toEqual(['Sort']);
+
+            const sort = await ask(post_message, { sort: [{ colIndex: 2, direction: 'desc' }], filters: [FILTER] });
+            auto_settle_transforms = false;
+            await refuse(sort!);
+            const foreign = { sort: [], filters: [{ ...FILTER, id: 'theirs' }], schema: SCHEMA };
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: sort!.requestId,
+                projection: {
+                    view: { basis: { generation: view_generation + 1, sourceGeneration: 1, schema: SCHEMA }, permuted: true, rowCount: 6, rules: foreign, hiddenEditedCellKeys: [] },
+                    rules: foreign,
+                    rowHeights: {},
+                    mappingGeneration: view_generation + 1,
+                },
+            } as HostMessage);
+
+            expect(props().transform_pending).toBe(false);
+            expect(undo_labels()).toEqual(['Filter']);
+            expect(redo_labels()).toEqual(['Sort']);
+        });
+
         it('records what an earlier request installed when the cancel is refused (I4)', async () => {
             const { post_message } = await render_app();
             await open(post_message);
@@ -23575,6 +23606,39 @@ describe('view steps in history', () => {
             const replay = latest_transform_request(post_message);
             expect(replay.state.filters).toEqual([]);
             expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('keeps choices open during "Only changed rows" alone, built from the toggle asked for', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const toggle = await ask(post_message, { sort: [], filters: [], onlyChangedRows: true });
+            expect(props().transform_choice_pending).toBe(false);
+            expect(props().pending_transform_target?.onlyChangedRows).toBe(true);
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [], onlyChangedRows: true });
+            expect(sort).toMatchObject({ intent: 'user', state: { sort: SORT_ASC, onlyChangedRows: true } });
+            expect(sort!.requestId).not.toBe(toggle!.requestId);
+            expect(warnings(post_message)).toEqual([]);
+            await install(sort!);
+
+            expect(undo_labels()).toEqual(['Sort']);
+        });
+
+        it('sends "Only changed rows" off again while it is still going on, with no step', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await ask(post_message, { sort: [], filters: [FILTER] }).then((request) => install(request!));
+            const on = await ask(post_message, { sort: [], filters: [FILTER], onlyChangedRows: true });
+            const off = await ask(post_message, { sort: [], filters: [FILTER], onlyChangedRows: false });
+            expect(off).toMatchObject({ intent: 'user', state: { filters: [FILTER] } });
+            expect(off!.state.onlyChangedRows ?? false).toBe(false);
+            expect(off!.requestId).not.toBe(on!.requestId);
+            expect(warnings(post_message)).toEqual([]);
+            await install(off!);
+
+            expect(undo_labels()).toEqual(['Filter']);
+            expect(props().transform_pending).toBe(false);
         });
 
         it('records "Only changed rows" chosen during a sort with the sort, as the sort\'s step alone', async () => {

@@ -25,6 +25,7 @@ import {
     type SheetTransformState,
     type SortKey,
 } from '../types';
+import { transform_states_equal } from '../transform-state-equality';
 import { upsert_filter } from './transform-ui-model';
 
 export function transforms_semantically_equal(
@@ -289,16 +290,23 @@ export function view_action_in_flight(action: ViewAction): boolean {
     return newest !== undefined && !newest.settled;
 }
 
+const NO_RULES: SheetTransformState = { sort: [], filters: [], schema: '' };
+
 /**
  * Rules installed by someone else (I3): when they differ from the baseline, the
  * baseline moves to them and, while the newest request is out, the request is
  * composed again onto them. Returns the action and whether to send again.
+ *
+ * "Differ" is the host's strict comparison, filter ids included: rules another
+ * window wrote that only mean the same as the baseline are still its change,
+ * and the step this action records must not include it. Whether to send again
+ * is semantic, since the host would compute the same view.
  */
 function adopt_from_elsewhere(
     action: ViewAction,
     rules: SheetTransformState | undefined,
 ): { readonly action: ViewAction; readonly resend: boolean } {
-    if (transforms_semantically_equal(rules, action.baseline)) return { action, resend: false };
+    if (transform_states_equal(rules ?? NO_RULES, action.baseline ?? NO_RULES)) return { action, resend: false };
     const moved: ViewAction = { ...action, baseline: rules };
     if (!view_action_in_flight(action)) return { action: moved, resend: false };
     const requested = action.cancelled
