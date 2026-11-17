@@ -524,8 +524,8 @@ interface PendingViewTransform {
     readonly schema: string;
     /**
      * The rules this window held for the sheet when the request was composed.
-     * When a new source overtakes the request of a view action, it becomes the
-     * action's baseline as it is then, which another window may have moved.
+     * When a new source overtakes the request of a view action, the action's
+     * current baseline replaces this value; another window may have moved it.
      */
     readonly baseline: SheetTransformState | undefined;
     /** The rules requested. Absent for Hide rows: only the host knows its source rows. */

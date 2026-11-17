@@ -529,7 +529,7 @@ So when the reload carries neither A nor B, the press is dropped if B was still 
 
 **Not changed:** a refresh on the same source, V2's branch for an action that has only hides left, replays, column and width writes, and how a step is judged against the snapshot.
 
-**Size.** About 40 lines in `app.tsx` by the estimate: two fields on `PendingViewTransform` (`installed`, and `added` for a record the window added), the hand-off in the new-source branch, and the second try in `settle_overtaken_view_requests`. As built it adds 75 lines and deletes 26, most of them from moving V2's trimming of hidden rows into one helper that both tries use.
+**Size.** About 40 lines in `app.tsx` by the estimate: two fields on `PendingViewTransform` (`installed`, and `added` for a record the window added), the hand-off in the new-source branch, and the second try in `settle_overtaken_view_requests`. As built it adds about 80 lines and deletes about 30, many of them comments and the move of V2's trimming of hidden rows into one helper that both tries use; the PR states the final counts.
 
 **Tests first, all in `src/test/app.test.ts`:**
 - the reload carrying A, B, or neither, pinning the order of the tries;
