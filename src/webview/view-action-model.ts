@@ -155,12 +155,15 @@ export function merge_view_action_delta(
         )),
         ...next.removals,
     ];
+    // Sets: an action can hide up to `MAX_PERSISTED_HIDDEN_ROWS` rows.
+    const next_hidden = new Set(next.hidden);
+    const next_shown = new Set(next.shown);
     const hidden = [
-        ...earlier.hidden.filter((row) => !next.shown.includes(row) && !next.hidden.includes(row)),
+        ...earlier.hidden.filter((row) => !next_shown.has(row) && !next_hidden.has(row)),
         ...next.hidden,
     ];
     const shown = [
-        ...earlier.shown.filter((row) => !next.hidden.includes(row) && !next.shown.includes(row)),
+        ...earlier.shown.filter((row) => !next_hidden.has(row) && !next_shown.has(row)),
         ...next.shown,
     ];
     const sort = next.sort ?? earlier.sort;

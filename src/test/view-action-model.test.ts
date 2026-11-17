@@ -83,6 +83,30 @@ describe('merging deltas', () => {
             hiddenRows: [2, 3],
         }));
     });
+
+    // Up to the persisted limit of hidden rows in one action: linear, not a
+    // scan of one list per row of the other, which would not finish here.
+    const ROWS = 300_000;
+    const range = (start: number, length: number) => Array.from({ length }, (_row, index) => start + index);
+
+    it('composes two large hides', () => {
+        const first = range(0, ROWS);
+        const second = range(ROWS, ROWS);
+        const earlier = view_action_delta(rules({}), rules({ hiddenRows: first }));
+        const next = view_action_delta(rules({ hiddenRows: first }), rules({ hiddenRows: [...first, ...second] }));
+        const merged = merge_view_action_delta(earlier, next);
+        expect(merged.hidden).toHaveLength(2 * ROWS);
+        expect(merged.shown).toEqual([]);
+    });
+
+    it('clears a large hide with Unhide all', () => {
+        const rows = range(0, ROWS);
+        const earlier = view_action_delta(rules({}), rules({ hiddenRows: rows }));
+        const next = view_action_delta(rules({ hiddenRows: rows }), rules({}));
+        const merged = merge_view_action_delta(earlier, next);
+        expect(merged.hidden).toEqual([]);
+        expect(apply_view_action_delta(merged, rules({}), schema)).toEqual(rules({}));
+    });
 });
 
 describe('a view action', () => {
