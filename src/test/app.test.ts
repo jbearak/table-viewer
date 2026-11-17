@@ -23687,7 +23687,7 @@ describe('view steps in history', () => {
 
             // The first still computes: the indicator, Cancel, and the held cells stay.
             expect(props().transform_pending).toBe(true);
-            expect(document.querySelector('.toolbar-progress')).not.toBeNull();
+            expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Applying sort & filters…');
             expect(cells_editable()).toEqual(HELD);
             await install(first!);
 
@@ -23709,6 +23709,39 @@ describe('view steps in history', () => {
             await install(request!);
 
             expect(undo_labels()).toEqual(['Sort']);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('sends no Hide rows while an older request of the action still computes', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const first = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const second = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            await refuse(second!);
+            await act(async () => props().on_hide_rows?.([{ start: 0, end: 0 }]));
+
+            expect(post_message.mock.calls.some(([message]) => message?.type === 'hideRows')).toBe(false);
+            await install(first!);
+            expect(undo_labels()).toEqual(['Sort']);
+        });
+
+        it('sends a cancel the host refused again when Cancel is pressed again', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await click_button('Cancel');
+            const cancel = latest_transform_request(post_message);
+            expect(cancel.intent).toBe('cancel');
+            await refuse(cancel, 'The file is being saved.');
+            await click_button('Cancel');
+            const again = latest_transform_request(post_message);
+            expect(again).toMatchObject({ intent: 'cancel', state: { sort: [], filters: [] } });
+            expect(again.requestId).not.toBe(cancel.requestId);
+            await install(again);
+
+            expect(undo_labels()).toEqual([]);
             expect(cells_editable()).toEqual(EDITABLE);
         });
 

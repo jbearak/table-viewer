@@ -215,8 +215,11 @@ async function undo_cell_edit(page: Page, row: number, round: number): Promise<n
 
 /**
  * One-character keys in an open editor: for each, how many frames began from
- * the key to the frame after its input, so 1 is the next frame. Answers those
- * counts and how many keys reached the editor.
+ * the key to the frame callback after its input. The counter re-registers
+ * itself at each frame, before a key's task can register the input's callback,
+ * so it runs first: 1 is the first frame after the key, the one that can show
+ * it, and 2 the frame after that. Answers those counts and how many keys
+ * reached the editor.
  */
 async function type_keys(page: Page): Promise<{ frames: number[]; typed: number }> {
     await page.evaluate(() => {
@@ -280,8 +283,8 @@ test('idle Undo of a cell edit and typing, against the baseline build', async ()
         }
     }
     const paired = undo.stage.map((value, index) => value - undo.baseline[index]);
-    // The frame after the input's frame: at most two frame starts after the key.
-    const within_next_frame = (keys: { frames: readonly number[] }) => keys.frames.filter((frames) => frames <= 2).length;
+    // The plan's "same or next frame": the first frame that can show the key, or the next.
+    const within_two_frames = (keys: { frames: readonly number[] }) => keys.frames.filter((frames) => frames <= 2).length;
     record({
         kind: 'paired',
         undo_stage_ms: undo.stage.map(Math.round),
@@ -289,16 +292,16 @@ test('idle Undo of a cell edit and typing, against the baseline build', async ()
         undo_paired_difference_median_ms: Math.round(median(paired) * 10) / 10,
         typing_stage_keys: typing.stage.typed,
         typing_baseline_keys: typing.baseline.typed,
-        typing_stage_within_next_frame: within_next_frame(typing.stage),
-        typing_baseline_within_next_frame: within_next_frame(typing.baseline),
+        typing_stage_within_two_frames: within_two_frames(typing.stage),
+        typing_baseline_within_two_frames: within_two_frames(typing.baseline),
     });
     expect(Math.abs(median(paired))).toBeLessThanOrEqual(10);
     // Both builds saw every key (8 editors, 9 keys each), and this one shows at least
-    // 98 % as many by the next frame.
+    // 98 % as many within two frames as the baseline does: at most one key fewer.
     expect(typing.stage.typed).toBe(72);
     expect(typing.baseline.typed).toBe(72);
-    expect(within_next_frame(typing.stage))
-        .toBeGreaterThanOrEqual(Math.ceil(within_next_frame(typing.baseline) * 0.98));
+    expect(within_two_frames(typing.stage))
+        .toBeGreaterThanOrEqual(Math.ceil(within_two_frames(typing.baseline) * 0.98));
 });
 
 // ---------------------------------------------------------------- this build, by its marks

@@ -528,6 +528,8 @@ interface PendingViewAction {
     readonly initialBaseline: SheetTransformState | undefined;
     /** The newest request was refused. */
     readonly refused: boolean;
+    /** Where the newest choice or cancel came from: a resend returns focus there. */
+    readonly origin: TransformOrigin;
 }
 
 /** The one column visibility write awaiting `columnVisibilityChanged`. */
@@ -3968,7 +3970,7 @@ export function App(): React.JSX.Element {
             action.sheetIndex,
             action.requested,
             action.cancelled ? 'cancel' : 'user',
-            pending_transform_origins_ref.current[action.sheetIndex] ?? 'history',
+            pending.origin,
             action.cancelled ? undefined : {
                 worksheet: pending.worksheet,
                 schema: pending.schema,
@@ -10695,6 +10697,7 @@ export function App(): React.JSX.Element {
                 schema: pending_action?.schema ?? schema,
                 initialBaseline: pending_action?.initialBaseline ?? action.baseline,
                 refused: false,
+                origin,
             };
             sync_view_request_pending();
             publish_history_menu_ref.current();
@@ -10716,6 +10719,8 @@ export function App(): React.JSX.Element {
         if (
             !view_gesture_may_start(active_sheet_index)
             || pending_transforms[active_sheet_index]
+            // The person's sort or filter may have installed and still be settling.
+            || view_action_ref.current !== undefined
             || inserted_rows_refuse_transform(active_sheet_index)
         ) return;
         const request_id = [
@@ -11193,7 +11198,8 @@ export function App(): React.JSX.Element {
     ): boolean => {
         const pending = view_action_ref.current;
         if (pending === undefined || pending.action.sheetIndex !== sheet_index) return false;
-        if (pending.action.cancelled) return true;
+        // A cancel already out is not sent twice; one the host refused is sent again.
+        if (pending.action.cancelled && !pending.refused) return true;
         drop_history_presses({ keep_typing: true });
         const request_id = request_transform(
             sheet_index,
@@ -11205,6 +11211,7 @@ export function App(): React.JSX.Element {
             ...pending,
             action: cancel_view_action(pending.action, request_id),
             refused: false,
+            origin,
         };
         publish_history_menu_ref.current();
         return true;

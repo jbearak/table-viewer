@@ -127,7 +127,7 @@ export function StateStrip(props: StateStripProps): React.JSX.Element | null {
             {props.transform_pending && (
                 <>
                 <span className="toolbar-progress" role="status" aria-live="polite">
-                    {props.transform_progress ?? 'Applying sort & filters…'}
+                    {props.transform_progress || 'Applying sort & filters…'}
                 </span>
                 <button
                     type="button"

@@ -2,7 +2,13 @@ import { createHash } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 import type { ExtensionContext } from 'vscode';
-import { attach_viewer, csv_table_profile, plan_csv_save, type ViewerProfile } from '../viewer-controller';
+import {
+    attach_viewer,
+    csv_table_profile,
+    plan_csv_save,
+    transform_commit_record_count_for_tests,
+    type ViewerProfile,
+} from '../viewer-controller';
 import {
     create_authority_store,
     type DurableFileAuthority,
@@ -5204,6 +5210,26 @@ describe('CSV edit sessions', () => {
 
         await mine.__receive({ type: 'ready' });
         expect(latest_snapshot(mine).transformCommits?.[0]).toBeUndefined();
+    });
+
+    it('forgets a panel\'s commit records when the panel closes', async () => {
+        const file_path = '/tmp/transform-provenance-dispose.csv';
+        const shared = state_store();
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\nc\na\nb\n'));
+        vscode_mock.__setStatImplementation(async () => ({ size: 8, mtime: 1 }));
+        const before = transform_commit_record_count_for_tests();
+        const first = open_csv_table(uri(file_path), shared.store);
+        await first.__receive({ type: 'ready' });
+        const snapshot = latest_snapshot(first);
+        await first.__receive({
+            type: 'setTransform', sheetIndex: 0, requestId: 'first',
+            generation: snapshot.generation, sourceGeneration: snapshot.sourceGeneration,
+            intent: 'user', state: { sort: [{ colIndex: 0, direction: 'desc' }], filters: [], schema: '["Sheet1",1,["h"]]' },
+        });
+        expect(transform_commit_record_count_for_tests()).toBe(before + 1);
+
+        first.dispose();
+        expect(transform_commit_record_count_for_tests()).toBe(before);
     });
 
     it('reconciles a cross-panel durable transform clear before ready completes', async () => {

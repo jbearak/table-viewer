@@ -734,6 +734,12 @@ export function simulate_process_restart_for_tests(): void {
     csv_edit_file_states.clear();
     transform_commit_provenance.clear();
 }
+/** Test seam: how many commit records this process keeps, across files and sheets. */
+export function transform_commit_record_count_for_tests(): number {
+    let count = 0;
+    for (const sheets of transform_commit_provenance.values()) count += sheets.size;
+    return count;
+}
 let next_edit_session_host_epoch = 0;
 
 function allocate_edit_session_id(file_key: string): string {

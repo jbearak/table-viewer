@@ -2366,5 +2366,5 @@ export function adopt_source_into_core(
     return { type: 'adopted', core: installed };
 }
 
-/** Compare transform descriptors by their ordered semantic fields. */
+/** Kept here for the callers that import it from panel-core; it lives in transform-state-equality.ts. */
 export { transform_states_equal } from './transform-state-equality';
