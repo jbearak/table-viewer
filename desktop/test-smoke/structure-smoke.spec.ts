@@ -1555,6 +1555,8 @@ async function withhold_next_transform_request(): Promise<void> {
         main.__transform_withholder = true;
         const listeners = ipcMain.listeners(channel) as ((...args: unknown[]) => void)[];
         ipcMain.removeAllListeners(channel);
+        // Held until the cancel; a test that fails in between leaves it set, but
+        // each test launches its own app, so it goes with that app.
         let withheld: unknown[] | undefined;
         ipcMain.on(channel, (...args: unknown[]) => {
             const message = (args[1] as { message?: { type?: string; intent?: string } })?.message;
