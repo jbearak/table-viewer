@@ -11206,8 +11206,9 @@ export function App(): React.JSX.Element {
         if (pending.action.cancelled && !pending.refused) return true;
         drop_history_presses({ keep_typing: true });
         // An action with no step has changed nothing but the compare toggle, so
-        // that is what its cancel takes back (I4 keeps the toggle otherwise).
-        const keep_toggle = transform_view_step(
+        // that is what its cancel takes back (I4 keeps the toggle otherwise). A
+        // cancel sent again already asks for the toggle the first one chose.
+        const keep_toggle = pending.action.cancelled || transform_view_step(
             pending.worksheet,
             pending.schema,
             pending.action.baseline,
