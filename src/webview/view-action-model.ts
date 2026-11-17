@@ -13,8 +13,8 @@
  * person's, and the difference would then lose it.
  *
  * A Hide rows in the action first asks the host which source rows it hides.
- * Until the answer, the hide is resolving: it is part of the action and
- * no request of it, and the action does not end. The answer joins the action
+ * Until the answer, the hide is resolving: it is part of the action, though
+ * not yet a request of it, and the action does not end. The answer joins the action
  * as a choice; a refusal, or no answer, drops it.
  *
  * It ends when the host has settled every request it sent and no hide is
@@ -209,6 +209,8 @@ export interface ViewActionRequest {
      * change may have moved since it was sent (I3).
      */
     readonly delta: ViewActionDelta;
+    /** A cancel back to the baseline: refused, it keeps its rules (I4). */
+    readonly cancel?: boolean;
     readonly settled: boolean;
     /** The host refused it: its target is not asked for again (I3). */
     readonly refused?: boolean;
@@ -306,6 +308,7 @@ export function cancel_view_action(action: ViewAction, request_id: string, keep_
             requestId: request_id,
             target,
             delta: view_action_delta(rules_or_empty(action.baseline), target),
+            cancel: true,
             settled: false,
         }],
     };
@@ -323,6 +326,7 @@ export function resend_in_view_action(action: ViewAction, request_id: string): V
                 delta: action.cancelled
                     ? view_action_delta(rules_or_empty(action.baseline), action.requested)
                     : action.delta,
+                ...(action.cancelled ? { cancel: true } : {}),
                 settled: false,
             },
         ],
@@ -339,9 +343,9 @@ export function view_action_owns(action: ViewAction, request_id: string): boolea
  * to, what the action asks for becomes what is still live, since a person's
  * refused choice is not asked for again (I3): the choices of the newest
  * request still out and not refused, applied onto the baseline as it is now,
- * or else what is installed. A hide answered later
- * composes onto that. A refused cancel keeps its rules, since Cancel sends it
- * again.
+ * or else what is installed. A hide answered later composes onto that. A
+ * refused cancel keeps its rules, since Cancel sends it again, and so does one
+ * a hide was chosen after: the hide composes onto what the cancel asked for.
  */
 export function refuse_in_view_action(
     action: ViewAction,
@@ -362,6 +366,16 @@ export function refuse_in_view_action(
     if (action.cancelled) return marked;
     const newest = action.requests.at(-1)!;
     if (newest.requestId !== request_id && live_before?.requestId !== request_id) return marked;
+    // A refused cancel that a hide chose after keeps its rules too: the hide
+    // composes onto the baseline it asked for, not onto what it cancelled.
+    const refused = action.requests.find((request) => request.requestId === request_id)!;
+    if (refused.cancel === true) {
+        return {
+            ...marked,
+            requested: apply_view_action_delta(refused.delta, action.baseline, action.schema),
+            delta: refused.delta,
+        };
+    }
     // Falls back to what is still live: the choices of the newest request out
     // and not refused, which may itself be refused later, onto the baseline as
     // it is now, or else what is installed.

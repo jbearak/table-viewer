@@ -319,6 +319,20 @@ describe('a view action', () => {
 });
 
 describe('a hide resolving in a view action', () => {
+    it('keeps a refused cancel\'s rules when a hide was chosen after it, the cancelled sort still out', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'R1');
+        action = cancel_view_action(action, 'R2');
+        action = resolve_in_view_action(action, 'H', 1);
+        // Refused before it took the sheet: R1 is still out.
+        action = refuse_in_view_action(action, 'R2', undefined);
+
+        // The hide composes onto the baseline the cancel asked for, not onto
+        // the sort it cancelled.
+        expect(action.requested.sort).toEqual([]);
+        expect(action.delta.sort).toBeUndefined();
+    });
+
     it('keeps another window\'s change when the request sent again onto it is refused', () => {
         let action = begin_view_action(0, schema, undefined);
         action = choose_in_view_action(action, by_a, 'A');

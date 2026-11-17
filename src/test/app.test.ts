@@ -24341,6 +24341,24 @@ describe('view steps in history', () => {
                 .toMatchObject({ sort: [], hiddenRows: [1], onlyChangedRows: true });
         });
 
+        it('composes a hide chosen after a cancel onto the baseline when the cancel is refused, the sort still out', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await click_button('Cancel');
+            const cancel = latest_transform_request(post_message);
+            expect(cancel.intent).toBe('cancel');
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            // Refused before it took the sheet: the sort is still out.
+            await refuse(cancel);
+            await answer_hide(question!, [1]);
+
+            const hide = latest_transform_request(post_message);
+            expect(hide.intent).toBe('user');
+            expect(hide.state).toMatchObject({ sort: [], hiddenRows: [1] });
+        });
+
         it('ends a hide whose composed request the host refuses, with nothing recorded', async () => {
             const { post_message } = await render_app();
             await open(post_message);
@@ -24411,7 +24429,7 @@ describe('view steps in history', () => {
             expect(press_held()).toBe(true);
             const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
 
-            expect(question).toBeDefined();
+            expect(question).toMatchObject({ sheetIndex: 0, displayRows: [{ start: 1, end: 1 }] });
             expect(press_held()).toBe(false);
             expect(warnings(post_message)).toEqual([]);
         });

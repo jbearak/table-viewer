@@ -11610,14 +11610,15 @@ export function App(): React.JSX.Element {
         // asks for the toggle the first one chose.
         // A hide still resolving is a choice too, which the cancel takes back
         // while keeping the toggle (I4).
-        const keep_toggle = pending.action.cancelled
-            || pending.action.resolving.length > 0
-            || transform_view_step(
+        const has_step = transform_view_step(
             pending.worksheet,
             pending.schema,
             pending.action.baseline,
             pending.action.requested,
         ) !== undefined;
+        const keep_toggle = pending.action.cancelled
+            || pending.action.resolving.length > 0
+            || has_step;
         const request_id = request_transform(
             sheet_index,
             view_action_cancel_target(pending.action, keep_toggle),
