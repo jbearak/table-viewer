@@ -491,6 +491,36 @@ This is the stage plan, written against V1 as built (#395); its line numbers are
   - in the window: hide during a sort; a sort during resolution; hide after hide; Unhide all before and after the answer; hide, then sort, then Undo or Cancel, then the late answer; a sort's install before the host resolves the hide: the hide is refused, with the menu's label before and after; an install that moves no display row before it: the hide composes (on the host, where the mapping generation is checked); a choice on another sheet while a hide resolves: refused; each refusal of a resolution ending only the hide; a resolution with no answer; an edit and a Save refused while a hide resolves (the session wait cannot be held by it, since a resolution keeps no pending request id); Unhide all with a promoted Header Row during a sort and during a resolution; a replaced document;
   - the new smoke spec: Hide rows during a sort.
 
+### A fix after V2: an install a reload overtakes
+
+Written against main at a83ac382 (V2 merged, #396); line numbers are at that commit.
+
+**The bug.** Sort A installs, and the host settles it, while a newer sort B of the same view action is still out. A source reload then overtakes B. A was installed and saved, and the reload carries it, but A gets no Undo step. Main has had this since V1. The window test "records a sort that installed before a newer sort a reload overtakes" fails on main.
+
+**Why.** A's pending record leaves `pending_view_transforms_ref` when A installs (`app.tsx:4009`), so only the view action remembers that A installed. At a new source the window drops an action that still has a request out (`app.tsx:6377`, the `else` of V2's hides-only branch). B's record is settled by `settle_overtaken_view_requests` (`app.tsx:2375`), which records B's step from the baseline only if the snapshot shows B's own target (`overtaken_transform_step`). It doesn't, so nothing is recorded, and a press waiting behind B is dropped.
+
+**The rule.** At a new source, an action that still has a request out hands what it had installed under the old source to the overtaken settlement. That applies when what was installed differs from its baseline by a step (`transform_view_step`, which ignores the compare toggle). `state_ref` still holds the old source's rules there, as V2's hides-only branch uses. The installed rules ride on the action's newest record as `installed`. When the action has no record (its newest request installed and is not settled, or its newest request is a cancel, which keeps none), a record of its own is added: the action's baseline, with `installed` as its target. The settlement then tries, in order:
+1. the request's own target, from the baseline, as today: one step for the whole action when the snapshot shows it;
+2. else what was installed, from the baseline, when the snapshot shows it.
+
+Each is judged by the rule overtaken requests already follow: a step is recorded only if the snapshot shows it, and rows a request would hide are left out (V2). If neither records, the press waiting behind the action is dropped, as today.
+
+**The cases, and what each records:**
+- The reload carries A: A's step.
+- The reload carries B, which had landed: one step from the baseline to B, as today.
+- The reload carries neither: nothing, and the press is dropped, as today.
+- Only "Only changed rows" was installed: no step, since the step ignores the toggle; as today.
+- A cancel is out. If the cancel never landed, the reload carries A, and A's step is recorded, since A is what the person sees and Undo can then take it back. If the cancel landed, the reload carries the baseline, and nothing is recorded.
+- A press waiting behind the action: a recorded step decides it as any recorded overtaken step does today; nothing recorded drops it.
+
+**Not changed:** a refresh on the same source, V2's branch for an action that has only hides left, replays, column and width writes, and how a step is judged against the snapshot.
+
+**Size.** About 40 lines in `app.tsx`: a field on `PendingViewTransform`, the hand-off in the new-source branch, and the fallback in `settle_overtaken_view_requests`.
+
+**Tests first, all in `src/test/app.test.ts`:** each case above, plus a sort beside a hide still composing (V2's case, which already records), and a toggle-only action with a press waiting.
+
+**Proof:** the typecheck and the full unit suite; CI's unfocused smoke list; the undo and redo smoke set, 3 runs; the stress runs under load.
+
 ## Later stages
 
 Each of these gets its own plan, reviewed by both reviewers under the same rules, just before it is built. The text here is the direction and the exit test, not the design. The full drafts reviewed through round 10 are in commit `6768ac2a` (this file, "Design: the queue", "Other sheets", "Choices made during other work", and "Stages"). Findings deferred from review are listed in the ledger for each stage.
