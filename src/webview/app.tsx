@@ -3292,9 +3292,9 @@ export function App(): React.JSX.Element {
      * a window: a choice on another sheet is refused while it is pending. Its
      * Hide rows choices are part of it while the host resolves them (V2). It
      * ends when the host has settled every request it sent and no hide is
-     * resolving, which can be after the install, so until then it counts as a view request in flight: an edit
-     * recorded between the install and the settlement would enter history ahead
-     * of the step the person made first.
+     * resolving, which can be after the install, so until then it counts as a
+     * view request in flight: an edit recorded between the install and the
+     * settlement would enter history ahead of the step the person made first.
      */
     const view_action_ref = useRef<PendingViewAction | undefined>(undefined);
     /**
@@ -4072,10 +4072,11 @@ export function App(): React.JSX.Element {
 
     /**
      * The host settled one of the view action's requests. When it has settled
-     * every one and no hide is resolving, the action records one step, from its baseline to what is
-     * installed (I2), and a press waiting behind it is decided as today: dropped
-     * with a message when the person's choice came to nothing because it was
-     * refused or another window's change took its place, and let run otherwise.
+     * every one and no hide is resolving, the action records one step, from its
+     * baseline to what is installed (I2), and a press waiting behind it is
+     * decided as today: dropped with a message when the person's choice came to
+     * nothing because it was refused or another window's change took its place,
+     * and let run otherwise.
      */
     const settle_view_action_answer = useCallback((
         msg: Extract<HostMessage, { type: 'transformSettled' }>,
@@ -10936,6 +10937,24 @@ export function App(): React.JSX.Element {
                 pending.schema,
                 sheet.sourceRowCount,
             )) ?? { ...taken.requested, hiddenRows: hidden, schema: pending.schema };
+        // Rows the action already asks to hide: nothing to send, as a choice
+        // equal to what is asked for is skipped. Only the hide ends, refused by
+        // nobody.
+        if (transforms_semantically_equal(taken.requested, requested)) {
+            if (view_action_idle(taken)) {
+                end_view_action(
+                    { ...pending, action: taken },
+                    taken.baseline,
+                    state_ref.current.transforms?.[sheet_index],
+                    msg.requestId,
+                );
+            } else {
+                view_action_ref.current = { ...pending, action: taken };
+                set_view_action_tick((tick) => tick + 1);
+                publish_history_menu_ref.current();
+            }
+            return;
+        }
         const request_id = request_transform(sheet_index, requested, 'user', pending.origin, {
             worksheet: pending.worksheet,
             schema: pending.schema,
@@ -10955,6 +10974,7 @@ export function App(): React.JSX.Element {
     }, [
         continuation_request_blocked,
         end_resolution,
+        end_view_action,
         inserted_rows_refuse_transform,
         refused_for_reopen,
         request_transform,
@@ -11023,6 +11043,8 @@ export function App(): React.JSX.Element {
             show_warning(HIDE_RESOLUTION_TIMEOUT_MESSAGE);
             end_resolution_ref.current(request_id);
         }, HIDE_RESOLUTION_BOUND_MS));
+        // The progress text reads the action's hides at render.
+        set_view_action_tick((tick) => tick + 1);
         sync_view_request_pending();
         publish_history_menu_ref.current();
         host_bridge.postMessage({
@@ -11030,6 +11052,8 @@ export function App(): React.JSX.Element {
             sheetIndex: sheet_index,
             displayRows: display_rows,
             requestId: request_id,
+            // Every snapshot carries each sheet's mapping generation, so the
+            // fallback is not read; a wrong one is refused as a moved view.
             mappingGeneration: mapping_generations_ref.current[sheet_index] ?? generation_ref.current,
             sourceGeneration: source_generation_ref.current,
         });
@@ -11239,6 +11263,7 @@ export function App(): React.JSX.Element {
             }
             const dropped = drop_resolutions(pending.action);
             view_action_ref.current = { ...pending, action: dropped };
+            set_view_action_tick((tick) => tick + 1);
             publish_history_menu_ref.current();
         }
         // Composed onto the rules asked for, so a sort or filter in flight is kept (I6).

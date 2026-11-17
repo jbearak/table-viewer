@@ -19,9 +19,8 @@
  *
  * It ends when the host has settled every request it sent and no hide is
  * resolving (I3), and its step runs from the baseline to what is then
- * installed (I2). An install written by
- * another panel moves the baseline instead, so it is never recorded as this
- * action's.
+ * installed (I2). An install written by another panel moves the baseline
+ * instead, so it is never recorded as this action's.
  */
 
 import {

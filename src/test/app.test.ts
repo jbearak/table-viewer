@@ -23995,6 +23995,21 @@ describe('view steps in history', () => {
             expect(undo_labels()).toEqual(['Change view']);
         });
 
+        it('sends nothing for a second hide of rows the first already asks to hide', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const first = await hide_rows(post_message, [{ start: 1, end: 1 }]);
+            // The grid still shows the old rows, so the same row is offered again.
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await answer_hide(question!, [1]);
+
+            expect(latest_transform_request(post_message).requestId).toBe(first!.requestId);
+            expect(warnings(post_message)).toEqual([]);
+            await install(first!);
+            expect(undo_labels()).toEqual(['Hide row']);
+        });
+
         it('composes two hides that resolve together', async () => {
             const { post_message } = await render_app();
             await open(post_message);
@@ -24029,12 +24044,16 @@ describe('view steps in history', () => {
             expect(posted(post_message, 'setTransform')).toEqual([]);
         });
 
-        it('cancels a sort and the hide resolving with it on Undo, and ignores the late answer', async () => {
+        it.each([
+            ['a sort, then a hide', true],
+            ['a hide, then a sort', false],
+        ])('cancels %s on Undo, and ignores the hide\'s late answer', async (_name, sort_first) => {
             const { post_message } = await render_app();
             await open(post_message);
 
-            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            if (sort_first) await ask(post_message, { sort: SORT_ASC, filters: [] });
             const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            if (!sort_first) await ask(post_message, { sort: SORT_ASC, filters: [] });
             await undo();
             const cancel = latest_transform_request(post_message);
             expect(cancel).toMatchObject({ intent: 'cancel', state: { sort: [] } });
@@ -24430,6 +24449,18 @@ describe('view steps in history', () => {
             expect(posted(post_message, 'historyMenuStateChanged').at(-1)?.state.undoLabel).toBe('Hide row');
         });
 
+        it('says it is hiding rows for a hide chosen between a sort\'s install and its settlement', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            auto_settle_transforms = false;
+            await install(sort!);
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+
+            expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Hiding rows…');
+        });
+
         it('says it is hiding rows once the sort beside the hide has installed', async () => {
             const { post_message } = await render_app();
             await open(post_message);
@@ -24439,6 +24470,18 @@ describe('view steps in history', () => {
             expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Sorting…');
             await install(sort!);
 
+            expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Hiding rows…');
+        });
+
+        it('says it is hiding rows while the hide\'s answer is computed', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Hiding rows…');
+            await answer_hide(question!, [1]);
+
+            expect(latest_transform_request(post_message).state.hiddenRows).toEqual([1]);
             expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Hiding rows…');
         });
 
@@ -24512,12 +24555,16 @@ describe('view steps in history', () => {
             expect(undo_labels()).toEqual([]);
         });
 
-        it('cancels a sort and the hide beside it on Cancel, and ignores the hide\'s late answer', async () => {
+        it.each([
+            ['a sort, then a hide', true],
+            ['a hide, then a sort', false],
+        ])('cancels %s on Cancel, and ignores the hide\'s late answer', async (_name, sort_first) => {
             const { post_message } = await render_app();
             await open(post_message);
 
-            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            if (sort_first) await ask(post_message, { sort: SORT_ASC, filters: [] });
             const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            if (!sort_first) await ask(post_message, { sort: SORT_ASC, filters: [] });
             await click_button('Cancel');
             const cancel = latest_transform_request(post_message);
             expect(cancel).toMatchObject({ intent: 'cancel', state: { sort: [] } });

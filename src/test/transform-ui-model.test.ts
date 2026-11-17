@@ -221,6 +221,11 @@ describe('transform UI model', () => {
         expect(transform_progress_label(sorted, { ...sorted, filters: filtered.filters }, 'user'))
             .toBe('Filtering…');
         expect(transform_progress_label(empty, sorted, 'restore')).toBe('Applying saved…');
+        // A hide's request: only the hidden rows grow.
+        expect(transform_progress_label({ ...sorted, hiddenRows: [1] }, { ...sorted, hiddenRows: [1, 4] }, 'user'))
+            .toBe('Hiding rows…');
+        // Unhide all is not a hide.
+        expect(transform_progress_label({ ...sorted, hiddenRows: [1] }, sorted, 'user')).toBe('Sorting…');
     });
 
     it('maps the complete Shift+Alt shortcut namespace', () => {
