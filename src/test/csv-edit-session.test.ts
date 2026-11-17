@@ -7096,29 +7096,6 @@ describe('CSV edit sessions', () => {
         expect(rehydrated.capabilities.csvEditSessionId).toBeDefined();
     });
 
-    // The window one instant narrower than the CAS test above, and the reason that
-    // test's name says "inside the commit CAS" rather than "inside the durable write".
-    // `compare_and_set` in state.ts calls `validate` and *then* awaits the medium's
-    // write (`await persist(all)`), so every evaluation of the admission guard —
-    // pre-read, mutator, and the `validate` the CAS itself calls — happens before the
-    // bytes land. A rehydration inside that gap would leave the rules durable with the
-    // guard having passed, and nothing after the fact re-asks.
-    //
-    // What closes it is not another check but the store's own serialization: every
-    // operation `create_authority_store` exposes — reads and touches included — runs
-    // on one queue per medium, and the durable write happens *inside* the queued
-    // operation. So while a transform's write is in flight no panel can read durable
-    // state, and every free → owned transition is synchronously downstream of such a
-    // read (`read_file_state` → `project_state_for_panel` → `try_claim_edit_session`,
-    // with no await between the read resolving and the claim). The phase therefore
-    // flips either before `validate` — where the round-7 guard refuses, as the two
-    // tests above pin — or after the write has landed, where the session begins over
-    // rules that were already durable. There is no third interleaving to guard.
-    //
-    // This test pins that property, because the argument depends on it: it parks the
-    // transform inside the medium's write, proves the reopening panel cannot even read
-    // durable state there, and then proves the order it does get is the harmless one —
-    // the rules arrive *with* the session's first view, never as a change to it.
     it('settles a request refused after it took the sheet with what an older request\'s write left durable', async () => {
         // A's durable write passed its last check and is in flight when B takes the
         // sheet, settling A. B is then refused before it commits. B is settled last,
@@ -7181,10 +7158,13 @@ describe('CSV edit sessions', () => {
                 schema: '["Sheet1",1,["h"]]',
             },
         });
-        await flush_promises();
         const settled = () => (panel.__messages as any[]).filter((message) => message.type === 'transformSettled');
-        // A was settled when B took the sheet; B is refused but not yet settled.
-        // A was settled when B took the sheet.
+        // B is refused while A's write is still held, so the race is the one named
+        // above. A was settled when B took the sheet; B is not settled yet, because its
+        // reconciliation reads durable state behind A's write.
+        await wait_for_observable(() => (panel.__messages as any[]).some(
+            (message) => message.type === 'transformRefused' && message.requestId === 'B'));
+        expect(durable_transform()).toBeUndefined();
         expect(settled().map((message) => message.requestId)).toEqual(['A']);
 
         write_gate.resolve();
@@ -7206,6 +7186,29 @@ describe('CSV edit sessions', () => {
         expect(settled().map((message) => message.requestId)).toEqual(['A', 'B']);
     });
 
+    // The window one instant narrower than the CAS test above, and the reason that
+    // test's name says "inside the commit CAS" rather than "inside the durable write".
+    // `compare_and_set` in state.ts calls `validate` and *then* awaits the medium's
+    // write (`await persist(all)`), so every evaluation of the admission guard —
+    // pre-read, mutator, and the `validate` the CAS itself calls — happens before the
+    // bytes land. A rehydration inside that gap would leave the rules durable with the
+    // guard having passed, and nothing after the fact re-asks.
+    //
+    // What closes it is not another check but the store's own serialization: every
+    // operation `create_authority_store` exposes — reads and touches included — runs
+    // on one queue per medium, and the durable write happens *inside* the queued
+    // operation. So while a transform's write is in flight no panel can read durable
+    // state, and every free → owned transition is synchronously downstream of such a
+    // read (`read_file_state` → `project_state_for_panel` → `try_claim_edit_session`,
+    // with no await between the read resolving and the claim). The phase therefore
+    // flips either before `validate` — where the round-7 guard refuses, as the two
+    // tests above pin — or after the write has landed, where the session begins over
+    // rules that were already durable. There is no third interleaving to guard.
+    //
+    // This test pins that property, because the argument depends on it: it parks the
+    // transform inside the medium's write, proves the reopening panel cannot even read
+    // durable state there, and then proves the order it does get is the harmless one —
+    // the rules arrive *with* the session's first view, never as a change to it.
     it('rehydrates over a transform whose durable write is still in flight, never under it', async () => {
         const file_path = '/tmp/sibling-transform-write-after-rehydrate.csv';
         let blob: unknown = {};

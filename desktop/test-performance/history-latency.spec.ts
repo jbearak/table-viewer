@@ -40,6 +40,9 @@ test.beforeEach(() => {
 });
 
 test.afterEach(async () => {
+    // A step that failed while the host's messages were held would leave them held,
+    // and quitting buffers the window's last flush behind them: release first.
+    if (app) await release_host_messages().catch(() => {});
     if (app) await quit(app);
     app = undefined;
     fs.rmSync(root, { recursive: true, force: true });
