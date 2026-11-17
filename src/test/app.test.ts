@@ -24045,7 +24045,10 @@ describe('view steps in history', () => {
             expect(undo_labels()).toEqual([]);
         });
 
-        it('cancels again a hide made after a cancel', async () => {
+        it.each([
+            ['Undo', () => undo()],
+            ['Cancel', () => click_button('Cancel')],
+        ])('cancels again on %s a hide made after a cancel', async (_name, cancel_again) => {
             const { post_message } = await render_app();
             await open(post_message);
 
@@ -24053,7 +24056,7 @@ describe('view steps in history', () => {
             await undo();
             const first_cancel = latest_transform_request(post_message);
             const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
-            await undo();
+            await cancel_again();
             const second_cancel = latest_transform_request(post_message);
             expect(second_cancel).toMatchObject({ intent: 'cancel' });
             expect(second_cancel.requestId).not.toBe(first_cancel.requestId);
@@ -24368,6 +24371,22 @@ describe('view steps in history', () => {
 
             // The action still asks for its sort, onto the other window's filter.
             expect(props().pending_transform_target).toMatchObject({ sort: SORT_ASC, filters: [FILTER] });
+        });
+
+        it('builds the controls from what is live once an older sort is refused after a newer one, while a hide resolves', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+
+            const older = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            const newer = await ask(post_message, { sort: [{ colIndex: 1, direction: 'desc' }], filters: [FILTER] });
+            await refuse(newer!);
+            expect(props().pending_transform_target).toMatchObject({ sort: SORT_ASC, filters: [FILTER] });
+            await refuse(older!);
+
+            // Neither refused sort is offered as what is asked for.
+            expect(props().pending_transform_target).toMatchObject({ sort: [], filters: [FILTER] });
         });
 
         it('names what is left on the Edit menu when a sort chosen during a hide is refused', async () => {

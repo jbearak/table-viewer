@@ -557,7 +557,7 @@ describe('the setRowHeights host handler', () => {
     });
 
     it('persists a resize in preview mode, like every other layout field', async () => {
-        // Preview refuses `hideRows` because that is a *view transform*: it changes which
+        // Preview refuses Hide rows because that is a *view transform*: it changes which
         // rows the view contains, which is a claim about the document a read-only preview
         // has no business making. A height changes nothing about row identity — it is
         // layout, in the same class as `columnWidths` and `scrollPosition`, which preview

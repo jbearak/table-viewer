@@ -313,11 +313,13 @@ export function view_action_owns(action: ViewAction, request_id: string): boolea
 }
 
 /**
- * The host refused the action's newest request, a choice. A person's refused
- * choice is not asked for again (I3), so what the action asks for becomes what
- * is still live: the target of an older request still out, or else what is
- * installed. A hide answered later composes onto that. A refused cancel keeps
- * its rules, since Cancel sends it again.
+ * The host refused one of the action's requests. It is marked, and when it was
+ * what the action asks for, its newest request or the older one it fell back
+ * to, what the action asks for becomes what is still live, since a person's
+ * refused choice is not asked for again (I3): the target of the newest request
+ * still out and not refused, or else what is installed. A hide answered later
+ * composes onto that. A refused cancel keeps its rules, since Cancel sends it
+ * again.
  */
 export function refuse_in_view_action(
     action: ViewAction,

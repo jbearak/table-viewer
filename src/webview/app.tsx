@@ -3289,9 +3289,10 @@ export function App(): React.JSX.Element {
     /**
      * The person's sort, filter, and Unhide all choices on one sheet since its
      * last install, and every request sent for them (plan I1-I4). At most one in
-     * a window: a choice on another sheet is refused while it is pending. It ends
-     * when the host has settled every request it sent, which can be after the
-     * install, so until then it counts as a view request in flight: an edit
+     * a window: a choice on another sheet is refused while it is pending. Its
+     * Hide rows choices are part of it while the host resolves them (V2). It
+     * ends when the host has settled every request it sent and no hide is
+     * resolving, which can be after the install, so until then it counts as a view request in flight: an edit
      * recorded between the install and the settlement would enter history ahead
      * of the step the person made first.
      */
@@ -3359,6 +3360,12 @@ export function App(): React.JSX.Element {
         }
         return false;
     }, []);
+    /**
+     * Renders what the view action asks for after a change to it that sets no
+     * other state: an older request refused, a request settled or a hide ended
+     * with the action still open. The controls read the action at render.
+     */
+    const [, set_view_action_tick] = useState(0);
     const sync_view_request_pending = useCallback(() => {
         set_view_request_pending(view_request_is_pending());
         // A request that settled renders only when the boolean changes; a
@@ -4081,6 +4088,7 @@ export function App(): React.JSX.Element {
         const settlement = settle_view_action(pending.action, msg.requestId, installed, msg.committedBy);
         if (settlement.kind === 'pending') {
             view_action_ref.current = { ...pending, action: settlement.action };
+            set_view_action_tick((tick) => tick + 1);
             // Not for a choice the host refused: it is not asked for again.
             if (settlement.resend && !pending.refused) send_view_action_again();
             return;
@@ -6851,6 +6859,7 @@ export function App(): React.JSX.Element {
                                 state_ref.current.transforms?.[msg.sheetIndex],
                             ),
                         };
+                        set_view_action_tick((tick) => tick + 1);
                         publish_history_menu_ref.current();
                     }
                     return;
@@ -10858,6 +10867,7 @@ export function App(): React.JSX.Element {
         // later choice decides it, as after a refused sort.
         if (!view_action_idle(taken)) {
             view_action_ref.current = { ...pending, action: taken, hide_refused: true };
+            set_view_action_tick((tick) => tick + 1);
             publish_history_menu_ref.current();
             return;
         }
