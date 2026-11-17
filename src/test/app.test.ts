@@ -24216,10 +24216,20 @@ describe('view steps in history', () => {
 
         it('refuses a hide whose rows, with those hidden, are more than can be saved', async () => {
             const { post_message } = await render_app();
-            await open(post_message);
+            // A sheet with every row but the last few hidden already, up to the limit.
+            const meta = table_meta();
+            meta.sheets[0].sourceRowCount = MAX_PERSISTED_HIDDEN_ROWS + 5;
+            const hidden = Array.from({ length: MAX_PERSISTED_HIDDEN_ROWS }, (_row, index) => index);
+            await dispatch_host_message(initial_snapshot_message(meta, {
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [], hiddenRows: hidden, schema: SCHEMA }] },
+            }));
+            await install(latest_transform_request(post_message));
+            post_message.mockClear();
 
+            // One more row, a valid one, is one past the limit once composed.
             const question = await hide_rows_unanswered(post_message, [{ start: 0, end: 0 }]);
-            await answer_hide(question!, Array.from({ length: MAX_PERSISTED_HIDDEN_ROWS + 1 }, (_row, index) => index));
+            await answer_hide(question!, [MAX_PERSISTED_HIDDEN_ROWS]);
 
             expect(warnings(post_message)).toEqual(['Too many hidden rows to persist.']);
             expect(posted(post_message, 'setTransform').filter((sent) => sent.intent === 'user')).toEqual([]);
@@ -24387,6 +24397,25 @@ describe('view steps in history', () => {
 
             // Neither refused sort is offered as what is asked for.
             expect(props().pending_transform_target).toMatchObject({ sort: [], filters: [FILTER] });
+        });
+
+        it('names the hide alone on the Edit menu when another window committed the sort it installed beside it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const menu = () => posted(post_message, 'historyMenuStateChanged').at(-1)!.state;
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            auto_settle_transforms = false;
+            await install(sort!);
+            expect(menu().undoLabel).toBe('Change view');
+            // Another window committed the same rules first: the baseline moves
+            // onto them, and only the hide is left of the action.
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: sort!.requestId, committedBy: 'other-panel',
+            });
+
+            expect(menu().undoLabel).toBe('Hide row');
         });
 
         it('names what is left on the Edit menu when a sort chosen during a hide is refused', async () => {

@@ -325,7 +325,7 @@ The ADR's decision for the view rests on these. V1 builds them, and V2 keeps the
 - **I1. One view action per window.**
   - A **sheet action** is the person's choices on one sheet since that sheet's last install: sort, filter, Hide rows (from V2), and Unhide all.
   - A choice on another sheet while an action is pending stays refused, as today (`view_gesture_may_start`, `app.tsx:10289-10293`). So does a choice during a replay (`history_free`, `7375`). So a window has at most one pending action.
-  - A restore and the compare strip's "Only changed rows" are not choices: they have no step, no label, and are not undone. A restore makes no action. "Only changed rows" rides along in the requested rules of a pending action; on its own it is carried by an action with no step, so the window keeps each request it sends until the host settles it, and the action, like any, holds Hide rows and edits until then. It records nothing, and Undo does not cancel it.
+  - A restore and the compare strip's "Only changed rows" are not choices: they have no step, no label, and are not undone. A restore makes no action. "Only changed rows" rides along in the requested rules of a pending action; on its own it is carried by an action with no step, so the window keeps each request it sends until the host settles it, and the action, like any, holds edits until then. It records nothing, and Undo does not cancel it.
 - **I2. A step records when its view installs.**
   - An action records at most one step, when it ends (I3), on top of the stack, through `record_view_step` as today. The step comes from what is installed then, whichever message installed it.
   - The step runs from the action's baseline to what is then installed. It records nothing if the two are equal.

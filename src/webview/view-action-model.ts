@@ -408,8 +408,10 @@ const NO_RULES: SheetTransformState = { sort: [], filters: [], schema: '' };
 
 /**
  * Rules installed by someone else (I3): when they differ from the baseline, the
- * baseline moves to them and, while the newest request is out, the request is
- * composed again onto them. Returns the action and whether to send again.
+ * baseline moves to them and what the action asks for is composed again onto
+ * them, whether or not a request is out, so a hide still resolving composes
+ * onto them (V2). It is sent again only while the newest request is out.
+ * Returns the action and whether to send again.
  *
  * "Differ" is the host's strict comparison, filter ids included: rules another
  * window wrote that only mean the same as the baseline are still its change,
@@ -461,7 +463,7 @@ export type ViewActionSettlement =
 /**
  * The host settled one of the action's requests, and the sheet now has `rules`
  * installed, committed by `committed_by`. The action ends when every request it
- * sent is settled and nothing is to be sent again.
+ * sent is settled, no hide is resolving, and nothing is to be sent again.
  */
 export function settle_view_action(
     action: ViewAction,

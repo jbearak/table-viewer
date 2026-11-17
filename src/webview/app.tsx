@@ -4089,6 +4089,8 @@ export function App(): React.JSX.Element {
         if (settlement.kind === 'pending') {
             view_action_ref.current = { ...pending, action: settlement.action };
             set_view_action_tick((tick) => tick + 1);
+            // A settlement can move the baseline, and so what the menu names.
+            publish_history_menu_ref.current();
             // Not for a choice the host refused: it is not asked for again.
             if (settlement.resend && !pending.refused) send_view_action_again();
             return;
