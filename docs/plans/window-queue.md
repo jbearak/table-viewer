@@ -495,7 +495,7 @@ This is the stage plan, written against V1 as built (#395); its line numbers are
 
 Written against main at a83ac382 (V2 merged, #396); line numbers are at that commit.
 
-**The bug.** Sort A installs, and the host settles it, while a newer sort B of the same view action is still out. A source reload then overtakes B. A was installed and saved, and the reload carries it, but A gets no Undo step. Main has had this since V1. The window test "records a sort that installed before a newer sort a reload overtakes" fails on main.
+**The bug.** Sort A installs, and the host settles it, while a newer sort B of the same view action is still out. A source reload then overtakes B. A was installed and saved, and the reload carries it, but A gets no Undo step. Main has had this since V1; the build's first test reproduces it.
 
 **Why.** The sheet keeps one pending record, `pending_view_transforms_ref`, which describes its newest request. Sending B replaced A's record (`app.tsx:4009`), so only the view action remembers that A installed. The record also goes when the newest request installs (`app.tsx:7177`) or is refused (`app.tsx:6983`). At a new source the window drops an action that still has a request out (`app.tsx:6377`, the `else` of V2's hides-only branch). B's record is settled by `settle_overtaken_view_requests` (`app.tsx:2375`), which records B's step only if the snapshot shows B's own target (`overtaken_transform_step`). It doesn't, so nothing is recorded, and the press waiting behind B is dropped (`app.tsx:2443`).
 
@@ -508,10 +508,14 @@ For each record, the settlement makes both tries in one pass:
 1. the request's own target, from the action's current baseline. When the snapshot shows it, that is one step for the whole action, since the target holds everything the action asked for (I6);
 2. otherwise what was installed, from the same baseline (as `end_view_action` uses), when the snapshot shows it. What was installed may be no rules at all, after a Clear sort, which is a step too.
 
-Each try is judged by the rule overtaken requests already follow: a step is recorded only if the snapshot shows it, and rows a request would hide are left out (V2). At most one step is recorded. The press is decided once, after both tries:
+Each try is judged by the rule overtaken requests already follow: a step is recorded only if the snapshot shows it, and rows a request would hide are left out (V2). One helper does that for both tries, so what was installed is trimmed of its new hides as a target is. At most one step is recorded. The press is decided once, after both tries, from one flag:
 - a recorded step decides it as any recorded overtaken step does today;
-- a record that exists today and records nothing drops it, as today;
-- a record the window added and that records nothing leaves it alone, as today, when no record was settled at all. A cancel that landed therefore keeps the press waiting behind it, as `end_view_action` does for a cancelled action.
+- a record the action already had that records nothing drops it, as today;
+- a record the window added never drops it, as today, when there was no record at all. A cancel that landed therefore keeps the press waiting behind it, as `end_view_action` does for a cancelled action.
+
+The `added` flag is set only on a record the window adds, and nothing reads it but this decision.
+
+So when the reload carries neither A nor B, the press is dropped if B was still out (the action had a record), and left alone if B had installed and was not settled (the window added one). Both are what happens today.
 
 **The cases, and what each records:**
 - The reload carries A: A's step.
@@ -536,7 +540,12 @@ Each try is judged by the rule overtaken requests already follow: a step is reco
 - the newest refused, with the older request installed;
 - a toggle-only action;
 - another window's change before the reload, with no resend (B's target already held it), and Undo keeping that change;
-- a reload that reorders sheets, and one that changes the columns, with A carried;
+- a reload that reorders sheets, one that changes the columns, and one that removes the sheet, with A carried;
+- the reload carrying neither, with B still out and with B installed and not settled, each with a press waiting;
+- a cancel that never landed, with an Undo press waiting, which then undoes A;
+- a hide still resolving beside A installed and B out;
+- a refresh on the same source with A installed and B out, which records nothing yet and keeps the action;
+- Undo after A's step, back to the baseline;
 - what was installed holding a sort and newly hidden rows: one sort step, without the rows;
 - a sort beside a hide still composing (V2's case, which already records).
 
