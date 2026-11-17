@@ -507,6 +507,12 @@ let auto_settle_transforms = true;
 const settled_transform_ids = new Set<string>();
 /** Every setTransform the window posted, kept through `mockClear`. */
 const sent_transform_requests: Extract<WebviewMessage, { type: 'setTransform' }>[] = [];
+/**
+ * Per sheet, the request whose install the host last committed for this panel:
+ * what the host's provenance record names when it settles a request with the
+ * rules that request installed.
+ */
+const last_committed_transform = new Map<number, string>();
 let save_lifecycle_revision = 0;
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -623,9 +629,15 @@ async function dispatch_host_message(input: HostMessage | Record<string, unknown
         for (const older of requests.slice(0, Math.max(position, 0))) {
             if (settled_transform_ids.has(older.requestId)) continue;
             settled_transform_ids.add(older.requestId);
+            const committed_by = last_committed_transform.get(older.sheetIndex);
             await act(async () => {
                 window.dispatchEvent(new MessageEvent('message', {
-                    data: { type: 'transformSettled', sheetIndex: older.sheetIndex, requestId: older.requestId },
+                    data: {
+                        type: 'transformSettled',
+                        sheetIndex: older.sheetIndex,
+                        requestId: older.requestId,
+                        ...(committed_by === undefined ? {} : { committedBy: committed_by }),
+                    },
                 }));
             });
         }
@@ -633,8 +645,20 @@ async function dispatch_host_message(input: HostMessage | Record<string, unknown
     await act(async () => {
         window.dispatchEvent(new MessageEvent('message', { data: msg }));
     });
+    if (msg.type === 'transformSettled' && typeof msg.requestId === 'string') {
+        settled_transform_ids.add(msg.requestId);
+        if (typeof msg.committedBy === 'string') {
+            last_committed_transform.set(msg.sheetIndex as number, msg.committedBy);
+        }
+    }
     if (answer !== undefined) {
         settled_transform_ids.add(answer.requestId);
+        if (answer.type === 'transformInstalled' && answer.intent !== 'restore') {
+            last_committed_transform.set(answer.sheetIndex, answer.requestId);
+        } else if (answer.type === 'transformInstalled') {
+            last_committed_transform.delete(answer.sheetIndex);
+        }
+        const refused_committed_by = last_committed_transform.get(answer.sheetIndex);
         const settled = answer.type === 'transformInstalled'
             ? {
                 type: 'transformSettled',
@@ -648,7 +672,12 @@ async function dispatch_host_message(input: HostMessage | Record<string, unknown
                 },
                 ...(answer.intent === 'restore' ? {} : { committedBy: answer.requestId }),
             }
-            : { type: 'transformSettled', sheetIndex: answer.sheetIndex, requestId: answer.requestId };
+            : {
+                type: 'transformSettled',
+                sheetIndex: answer.sheetIndex,
+                requestId: answer.requestId,
+                ...(refused_committed_by === undefined ? {} : { committedBy: refused_committed_by }),
+            };
         await act(async () => {
             window.dispatchEvent(new MessageEvent('message', { data: settled }));
         });
@@ -1218,6 +1247,7 @@ function cleanup() {
     auto_settle_transforms = true;
     settled_transform_ids.clear();
     sent_transform_requests.length = 0;
+    last_committed_transform.clear();
     save_lifecycle_revision = 0;
     document.body.innerHTML = '';
     document.documentElement.style.removeProperty('--table-viewer-font-family');
@@ -14799,6 +14829,49 @@ describe('sorting and filtering', () => {
         expect(restore_after_cancel).toHaveBeenCalledOnce();
     });
 
+    it('refuses a filter editor Apply while a restore is in flight, and keeps the editor and its draft', async () => {
+        const { post_message } = await render_app();
+        const schema = '["Sheet1",1,null]';
+        const filter = {
+            id: 'f', colIndex: 0, operator: 'contains' as const,
+            value: 'old', caseSensitive: false, enabled: true,
+        };
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            state: { transforms: [{ sort: [], filters: [filter], schema }] },
+        }));
+        await dispatch_host_message(
+            transform_installed_message(latest_transform_request(post_message), { generation: 2 }),
+        );
+        const chip = document.querySelector('.filter-chip-body') as HTMLButtonElement;
+        await act(async () => chip.click());
+        const input = document.querySelector('[aria-label="Filter value"]') as HTMLInputElement;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!
+                .set!.call(input, 'new');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        // Another window changed the saved view: this window restores it.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1']), {
+            generation: 3,
+            sourceGeneration: 1,
+            reason: 'other',
+            state: { transforms: [{ sort: [{ colIndex: 0, direction: 'asc' }], filters: [filter], schema }] },
+        }));
+        expect(latest_transform_request(post_message).intent).toBe('restore');
+        post_message.mockClear();
+
+        await click_button('Apply');
+
+        expect(post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setTransform')).toEqual([]);
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: 'Wait for the table view to finish updating.',
+        });
+        expect(document.querySelector('.filter-popover')).not.toBeNull();
+        expect((document.querySelector('[aria-label="Filter value"]') as HTMLInputElement).value).toBe('new');
+    });
+
     it('keeps a keyboard filter opener focused while Apply is pending and after ack', async () => {
         const { post_message } = await render_app();
         const schema = '["Sheet1",1,null]';
@@ -23482,6 +23555,124 @@ describe('view steps in history', () => {
             expect(undo_labels()).toEqual([]);
             expect(redo_labels()).toEqual(['Filter']);
             expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('makes no action of "Only changed rows" alone: Undo waits for it, then undoes the step under it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+            post_message.mockClear();
+
+            const toggle = await ask(post_message, { sort: [], filters: [FILTER], onlyChangedRows: true });
+            await undo();
+            expect(posted(post_message, 'setTransform').filter((request) => request.intent === 'cancel')).toEqual([]);
+            expect(press_held()).toBe(true);
+            expect(posted(post_message, 'historyMenuStateChanged').at(-1)?.state.undoLabel ?? 'Filter').toBe('Filter');
+            await install(toggle!);
+
+            const replay = latest_transform_request(post_message);
+            expect(replay.state.filters).toEqual([]);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('records "Only changed rows" chosen during a sort with the sort, as the sort\'s step alone', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const joined = await ask(post_message, { sort: SORT_ASC, filters: [], onlyChangedRows: true });
+            await install(joined!);
+
+            expect(undo_labels()).toEqual(['Sort']);
+        });
+
+        it('does not ask again for a refused choice when another window changes the sheet before the refusal is settled', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const request = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            auto_settle_transforms = false;
+            await refuse(request!);
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [FILTER], schema: SCHEMA }] },
+            }));
+            // The other window's rules are restored, as today; the sort is not asked for again.
+            const choices = () => posted(post_message, 'setTransform').filter((sent) => sent.intent !== 'restore');
+            expect(choices()).toHaveLength(1);
+            await dispatch_host_message({ type: 'transformSettled', sheetIndex: 0, requestId: request!.requestId });
+
+            expect(choices()).toHaveLength(1);
+            expect(undo_labels()).toEqual([]);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('cancels back to the rules from before the action after a replaced request installed, from Undo and from Cancel', async () => {
+            for (const how of ['undo', 'cancel'] as const) {
+                const { post_message } = await render_app();
+                await open(post_message);
+                const first = await ask(post_message, { sort: SORT_ASC, filters: [] });
+                await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+                auto_settle_transforms = false;
+                await install(first!);
+                await dispatch_host_message({ type: 'transformSettled', sheetIndex: 0, requestId: first!.requestId, committedBy: first!.requestId });
+                auto_settle_transforms = true;
+                post_message.mockClear();
+                if (how === 'undo') await undo();
+                else await click_button('Cancel');
+                const cancel = latest_transform_request(post_message);
+                expect(cancel).toMatchObject({ intent: 'cancel', state: { sort: [], filters: [] } });
+                await install(cancel);
+
+                expect(undo_labels()).toEqual([]);
+                expect(cells_editable()).toEqual(EDITABLE);
+                cleanup();
+            }
+        });
+
+        it('cancels on Undo while an editing session is held', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await acquire_editing_session(post_message);
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            post_message.mockClear();
+
+            await undo();
+
+            expect(latest_transform_request(post_message).intent).toBe('cancel');
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('drops the action when another document replaces this one', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+
+            await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                capabilities: CSV,
+                identity: { authority: { fileId: 'file:other', revision: 1 } },
+            }));
+
+            expect(cells_editable()).toEqual(EDITABLE);
+            expect(posted(post_message, 'historyMenuStateChanged').at(-1)!.state).toMatchObject({ undoAvailable: false });
+            expect(undo_labels()).toEqual([]);
+        });
+
+        it('ends the action with a new source as before: the request is decided by what the reload shows', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                capabilities: CSV,
+                state: { transforms: [{ sort: SORT_ASC, filters: [], schema: SCHEMA }] },
+            }));
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(cells_editable()).toEqual(EDITABLE);
         });
 
         it('keeps a choice made before the cancel is answered in the same action', async () => {

@@ -3236,14 +3236,22 @@ describe('transform settlement', () => {
         expect(settled(posted).map((entry) => entry.requestId)).toEqual(['A']);
     });
 
-    it('settles a cancel the host already holds, and a no-op restore', async () => {
+    it('settles a cancel back to the rules the host holds, and a no-op restore', async () => {
         const { panel, posted } = make_panel();
         const core = new ViewerPanelCore(panel, new StubSource(5), { settleTransforms: true });
-        const cancel = request(core, 'cancel', { sort: [], filters: [], schema }, 'cancel');
+        const sorted = request(core, 'sort', sort('desc'));
+        await core.handle_message(sorted);
+        core.settle_transform(sorted);
+        const generation = core.generation;
+        // Equal to what is installed: the cancel arm, which computes nothing.
+        const cancel = request(core, 'cancel', sort('desc'), 'cancel');
         await core.handle_message(cancel);
+        expect(core.generation).toBe(generation);
         core.settle_transform(cancel);
-        await core.handle_message(request(core, 'restore', { sort: [], filters: [], schema }, 'restore'));
-        expect(settled(posted).map((entry) => entry.requestId)).toEqual(['cancel', 'restore']);
+        core.settle_transform(cancel);
+        await core.handle_message(request(core, 'restore', sort('desc'), 'restore'));
+        expect(settled(posted).map((entry) => entry.requestId)).toEqual(['sort', 'cancel', 'restore']);
+        expect(settled(posted)[1].projection.rules.sort).toEqual([{ colIndex: 0, direction: 'desc' }]);
     });
 
     it('drops what is owed, without posting, when the source is replaced', async () => {

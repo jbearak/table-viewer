@@ -4,11 +4,11 @@ import {
     begin_view_action,
     cancel_view_action,
     choose_in_view_action,
-    install_in_view_action,
     refresh_view_action,
     resend_in_view_action,
     settle_view_action,
     transforms_semantically_equal,
+    view_action_cancel_target,
     view_action_owns,
     type ViewAction,
 } from './view-action-model';
@@ -3290,7 +3290,9 @@ export function App(): React.JSX.Element {
     /** `publish_history_menu_state`, declared further down: the Edit menu names the action. */
     const publish_history_menu_ref = useRef<() => void>(() => {});
     /** `cancel_view_action_on_sheet` and `cancel_blocked`, which are declared further down. */
-    const cancel_view_action_ref = useRef<(sheet_index: number) => boolean>(() => false);
+    const cancel_view_action_ref = useRef<
+        (sheet_index: number, origin?: TransformOrigin) => boolean
+    >(() => false);
     const cancel_blocked_ref = useRef<() => boolean>(() => true);
     const pending_column_write_ref = useRef<PendingColumnWrite | null>(null);
     const pending_width_write_ref = useRef<PendingWidthWrite | null>(null);
@@ -3964,7 +3966,7 @@ export function App(): React.JSX.Element {
             action.sheetIndex,
             action.requested,
             action.cancelled ? 'cancel' : 'user',
-            'history',
+            pending_transform_origins_ref.current[action.sheetIndex] ?? 'history',
             action.cancelled ? undefined : {
                 worksheet: pending.worksheet,
                 schema: pending.schema,
@@ -3972,7 +3974,11 @@ export function App(): React.JSX.Element {
                 target: action.requested,
             },
         );
-        view_action_ref.current = { ...pending, action: resend_in_view_action(action, request_id) };
+        view_action_ref.current = {
+            ...pending,
+            action: resend_in_view_action(action, request_id),
+            refused: false,
+        };
     }, [request_transform]);
 
     /**
@@ -3993,7 +3999,8 @@ export function App(): React.JSX.Element {
         const settlement = settle_view_action(pending.action, msg.requestId, installed, msg.committedBy);
         if (settlement.kind === 'pending') {
             view_action_ref.current = { ...pending, action: settlement.action };
-            if (settlement.resend) send_view_action_again();
+            // Not for a choice the host refused: it is not asked for again.
+            if (settlement.resend && !pending.refused) send_view_action_again();
             return;
         }
         view_action_ref.current = undefined;
@@ -4045,7 +4052,10 @@ export function App(): React.JSX.Element {
         if (refreshed.action === pending.action) return;
         view_action_ref.current = { ...pending, action: refreshed.action };
         publish_history_menu_ref.current();
-        if (refreshed.resend) send_view_action_again();
+        // A choice the host refused is not asked for again, even onto a change
+        // made elsewhere (`app.tsx` transformRefused): the baseline moves, and
+        // the action ends when the refusal is settled.
+        if (refreshed.resend && !pending.refused) send_view_action_again();
     }, [send_view_action_again]);
     const refresh_view_action_ref = useRef(refresh_view_action_after_snapshot);
     refresh_view_action_ref.current = refresh_view_action_after_snapshot;
@@ -5486,14 +5496,18 @@ export function App(): React.JSX.Element {
                         // surviving action would be the previous workbook's
                         // edits, waiting to be replayed through whatever
                         // worksheet identity happened to match here.
+                        // The action goes first, so the menu the cleared history
+                        // publishes does not name it.
+                        view_action_ref.current = undefined;
                         history_store_ref.current!.clear();
+                        // An empty history does not notify, so the menu is told here.
+                        publish_history_menu_ref.current();
                         history_document_ref.current += 1;
                         // Every view request of the outgoing document is
                         // abandoned outright: nothing is compared, nothing is
                         // recorded into the new document's history, and a late
                         // answer finds no pending request.
                         pending_view_transforms_ref.current = [];
-                        view_action_ref.current = undefined;
                         pending_column_write_ref.current = null;
                         pending_width_write_ref.current = null;
                         overtaken_view_requests_ref.current = { views: [], column: null, width: null };
@@ -6928,12 +6942,6 @@ export function App(): React.JSX.Element {
                     && pending_action.action.sheetIndex === msg.sheetIndex
                     && view_action_owns(pending_action.action, msg.requestId);
                 if (!answers_newest && !action_owned) return;
-                if (action_owned) {
-                    view_action_ref.current = {
-                        ...pending_action,
-                        action: install_in_view_action(pending_action.action, msg.requestId, msg.rules),
-                    };
-                }
                 if (!answers_newest && msg.view.basis.generation <= generation_ref.current) return;
                 const view = msg.view;
                 const mapping_changed =
@@ -9073,13 +9081,19 @@ export function App(): React.JSX.Element {
             direction === 'undo'
             && pending_action !== undefined
             && !pending_action.action.cancelled
+            && transform_view_step(
+                pending_action.worksheet,
+                pending_action.schema,
+                pending_action.action.baseline,
+                pending_action.action.requested,
+            ) !== undefined
             && !reopen_required_ref.current
             && excel_header_queue_ref.current === null
             && pending_excel_header_ref.current === null
             && header_run_ref.current === null
             && !cancel_blocked_ref.current()
         ) {
-            cancel_view_action_ref.current(pending_action.action.sheetIndex);
+            cancel_view_action_ref.current(pending_action.action.sheetIndex, 'history');
             return;
         }
         void run_history_command({
@@ -10580,28 +10594,42 @@ export function App(): React.JSX.Element {
             // open editor and says nothing.
             if (transforms_semantically_equal(current, sanitized)) return false;
             // A new choice drops a press waiting behind the view action, silently,
-            // as Cancel does: the press was made for a stack the choice changes,
-            // and would otherwise hold the choice off (I5).
+            // as Cancel does: the press was made for a stack the choice changes
+            // (I5). It is dropped before the checks below, which a waiting press
+            // would otherwise refuse the choice for, and put back if the choice
+            // is refused anyway: a choice that never happened drops nothing.
+            let keep_dropped_press = () => {};
             if (
                 view_action_ref.current?.action.sheetIndex === active_sheet_index
                 && held_press_ref.current !== null
                 && held_press_ref.current.typing !== true
             ) {
+                const held = held_press_ref.current;
+                const retry = retry_press_ref.current;
                 drop_history_presses({ keep_typing: true });
+                keep_dropped_press = () => {
+                    held_press_ref.current = held;
+                    retry_press_ref.current = retry;
+                    arm_history_press_timer();
+                };
             }
             // A hide, a replay, or a restore in flight on the sheet holds the
             // choice: replacing its request would leave its answer unmatched.
             if (view_choice_waits(active_sheet_index)) {
+                keep_dropped_press();
                 show_warning(VIEW_GESTURE_WAIT_MESSAGE);
                 return false;
             }
-            if (!view_gesture_may_start(active_sheet_index)) return false;
             if (
-                (sanitized.sort.length > 0
+                !view_gesture_may_start(active_sheet_index)
+                || ((sanitized.sort.length > 0
                     || sanitized.filters.some((filter) => filter.enabled)
                     || (sanitized.hiddenRows?.length ?? 0) > 0)
-                && inserted_rows_refuse_transform(active_sheet_index)
-            ) return false;
+                    && inserted_rows_refuse_transform(active_sheet_index))
+            ) {
+                keep_dropped_press();
+                return false;
+            }
             if (active_sheet === undefined || schema === undefined) {
                 request_transform(active_sheet_index, sanitized, 'user', origin);
                 return true;
@@ -10619,6 +10647,26 @@ export function App(): React.JSX.Element {
             const pending_action = view_action_ref.current?.action.sheetIndex === active_sheet_index
                 ? view_action_ref.current
                 : undefined;
+            // "Only changed rows" on its own is no choice (I1): it makes no action,
+            // has no label, and is not undone. It is sent as before; with an action
+            // pending, it rides along in that action's request.
+            if (
+                pending_action === undefined
+                && transform_view_step(
+                    worksheet,
+                    schema,
+                    state_ref.current.transforms?.[active_sheet_index],
+                    sanitized,
+                ) === undefined
+            ) {
+                request_transform(active_sheet_index, sanitized, 'user', origin, {
+                    worksheet,
+                    schema,
+                    baseline: state_ref.current.transforms?.[active_sheet_index],
+                    target: sanitized,
+                });
+                return true;
+            }
             const action = pending_action?.action ?? begin_view_action(
                 active_sheet_index,
                 schema,
@@ -10649,6 +10697,7 @@ export function App(): React.JSX.Element {
         },
         [
             active_sheet_index,
+            arm_history_press_timer,
             drop_history_presses,
             inserted_rows_refuse_transform,
             meta,
@@ -11133,13 +11182,20 @@ export function App(): React.JSX.Element {
      * then. Presses waiting behind the action are dropped silently, as Cancel
      * drops them. Answers whether there was an action to cancel.
      */
-    const cancel_view_action_on_sheet = useCallback((sheet_index: number): boolean => {
+    const cancel_view_action_on_sheet = useCallback((
+        sheet_index: number,
+        origin: TransformOrigin = 'toolbar',
+    ): boolean => {
         const pending = view_action_ref.current;
         if (pending === undefined || pending.action.sheetIndex !== sheet_index) return false;
         if (pending.action.cancelled) return true;
         drop_history_presses({ keep_typing: true });
-        const cancelled = cancel_view_action(pending.action, '');
-        const request_id = request_transform(sheet_index, cancelled.requested, 'cancel');
+        const request_id = request_transform(
+            sheet_index,
+            view_action_cancel_target(pending.action),
+            'cancel',
+            origin,
+        );
         view_action_ref.current = {
             ...pending,
             action: cancel_view_action(pending.action, request_id),
@@ -13523,8 +13579,12 @@ export function App(): React.JSX.Element {
     // from (I6), and whether those controls wait: only for a hide, a replay, or
     // a restore on the sheet, never for the person's own request, which a new
     // choice replaces.
-    const requested_transform = pending_transform_target ?? visible_transform;
     const transform_choice_pending = transform_pending && view_choice_waits(active_sheet_index);
+    // A restore's target is not shown before it installs: only the person's own
+    // request is shown as asked for.
+    const requested_transform = transform_choice_pending
+        ? visible_transform
+        : pending_transform_target ?? visible_transform;
     const excel_header_disabled_reason = !excel_header_candidate_available
         && !excel_header?.active
         ? 'This sheet has no first row to use as column names.'

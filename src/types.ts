@@ -3557,7 +3557,6 @@ export function save_lifecycle_correlation(
         : undefined;
 }
 
-/** Messages from extension host to webview. */
 /** The installed sheet a `transformSettled` reports; the fields of `transformInstalled`. */
 export interface TransformSettledProjection {
     readonly view: SheetViewRecord;
@@ -3566,6 +3565,7 @@ export interface TransformSettledProjection {
     readonly mappingGeneration: number;
 }
 
+/** Messages from extension host to webview. */
 export type HostMessage =
     | { type: 'fontChanged'; fontFamily: string | null; fontSize: number | null }
     /**

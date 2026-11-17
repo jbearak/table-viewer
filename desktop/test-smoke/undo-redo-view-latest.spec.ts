@@ -9,7 +9,7 @@ import * as path from 'path';
 import { expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
 import { history_menu_item, type HistoryMenuState } from '../main/history-menu-model';
-import { isolated_user_data } from './smoke-helpers';
+import { click_menu_item, isolated_user_data } from './smoke-helpers';
 import {
     exit_app,
     install_dialog_capture,
@@ -73,12 +73,14 @@ async function shown_first_row(page: Page): Promise<string> {
         .map((cell) => cell.textContent ?? '').join('|'));
 }
 
-async function undo_label(): Promise<string> {
+async function menu_label(direction: 'undo' | 'redo'): Promise<string> {
     const menu = await app!.evaluate(() => (globalThis as typeof globalThis & {
         __tableViewerSmokeHistory?: unknown;
     }).__tableViewerSmokeHistory) as HistoryMenuState | undefined;
-    return history_menu_item('undo', menu).label;
+    return history_menu_item(direction, menu).label;
 }
+const undo_label = () => menu_label('undo');
+const redo_label = () => menu_label('redo');
 
 async function choose_sort(page: Page, column: number, direction: 'ascending' | 'descending'): Promise<void> {
     const menu = await open_column_menu(page, column);
@@ -116,18 +118,33 @@ test('a second sort during the first replaces it as one step, and Undo during a 
     await expect(in_flight(page)).toHaveCount(0);
     await expect.poll(undo_label).toBe('Undo Sort');
 
-    // One step: one Undo is back at the natural order.
-    await page.evaluate(() => window.postMessage({ type: 'editCommand', command: 'undo' }, '*'));
+    // One step: one Undo, from the Edit menu, is back at the natural order.
+    await click_menu_item(app, 'Edit', 'Undo Sort');
     await expect.poll(() => shown_first_row(page), { timeout: 60_000 }).toBe(natural);
     await expect(in_flight(page)).toHaveCount(0);
     await expect.poll(undo_label).toBe('Undo');
+    await expect.poll(redo_label).toBe('Redo Sort');
+    await click_menu_item(app, 'Edit', 'Redo Sort');
+    await expect.poll(() => shown_first_row(page), { timeout: 60_000 })
+        .toBe(first_row(2, 'descending'));
+    await click_menu_item(app, 'Edit', 'Undo Sort');
+    await expect.poll(() => shown_first_row(page), { timeout: 60_000 }).toBe(natural);
+    await expect(in_flight(page)).toHaveCount(0);
 
-    // A sort, and Undo while it computes: it is cancelled, and no step is made.
+    // A sort, and Undo from the Edit menu while it computes: it is cancelled, and
+    // no step is made. Redo is left as it was, so it redoes the earlier sort of
+    // the second column; had the sort installed and been undone, it would redo
+    // the sort of the first column.
     await choose_sort(page, 1, 'ascending');
     await expect(in_flight(page)).toBeVisible();
-    await page.evaluate(() => window.postMessage({ type: 'editCommand', command: 'undo' }, '*'));
+    await expect.poll(undo_label).toBe('Undo Sort');
+    await click_menu_item(app, 'Edit', 'Undo Sort');
     await expect(in_flight(page)).toHaveCount(0, { timeout: 60_000 });
     await expect.poll(() => shown_first_row(page), { timeout: 60_000 }).toBe(natural);
     await expect.poll(undo_label).toBe('Undo');
+    await expect.poll(redo_label).toBe('Redo Sort');
+    await click_menu_item(app, 'Edit', 'Redo Sort');
+    await expect.poll(() => shown_first_row(page), { timeout: 60_000 })
+        .toBe(first_row(2, 'descending'));
     expect((await take_dialogs(app)).map((dialog) => dialog.message)).toEqual([]);
 });

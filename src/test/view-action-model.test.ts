@@ -5,7 +5,6 @@ import {
     begin_view_action,
     cancel_view_action,
     choose_in_view_action,
-    install_in_view_action,
     refresh_view_action,
     resend_in_view_action,
     settle_view_action,
@@ -64,7 +63,6 @@ describe('a view action', () => {
         let action = begin_view_action(0, schema, undefined);
         action = choose_in_view_action(action, by_a, 'A');
         expect(view_action_in_flight(action)).toBe(true);
-        action = install_in_view_action(action, 'A', by_a);
         expect(settle_view_action(action, 'A', by_a, 'A')).toEqual({
             kind: 'ended', baseline: undefined, installed: by_a,
         });
@@ -82,7 +80,7 @@ describe('a view action', () => {
         });
     });
 
-    it('records what an earlier request installed when the newer one is refused (I4)', () => {
+    it('records what an earlier request installed when the newer one is refused', () => {
         let action = begin_view_action(0, schema, undefined);
         action = choose_in_view_action(action, by_a, 'A');
         action = choose_in_view_action(action, by_b, 'B');
@@ -113,7 +111,7 @@ describe('a view action', () => {
         expect(action.requested).toEqual({ ...by_a, onlyChangedRows: true });
     });
 
-    it('composes again onto rules another window installed, and sends again (I3)', () => {
+    it('composes again onto rules another window installed, and sends again', () => {
         let action = begin_view_action(0, schema, undefined);
         action = choose_in_view_action(action, by_a, 'A');
         const refreshed = refresh_view_action(action, filtered, undefined);
@@ -146,7 +144,7 @@ describe('a view action', () => {
         expect(refresh_view_action(action, by_a, 'A')).toEqual({ action, resend: false });
     });
 
-    it('takes rules equal to its target, written by another window, for theirs (L13-1)', () => {
+    it('takes rules equal to its target, written by another window, for theirs', () => {
         // From O, A is asked for, B supersedes it before A commits; another window
         // writes rules equal to A; B fails and the reconciliation installs them.
         let action = begin_view_action(0, schema, undefined);
@@ -158,7 +156,7 @@ describe('a view action', () => {
         expect(outcome).toEqual({ kind: 'ended', baseline: by_a, installed: by_a });
     });
 
-    it('records its own request reconciled after a failed cancel (L12-2)', () => {
+    it('records its own request reconciled after a failed cancel', () => {
         let action = begin_view_action(0, schema, undefined);
         action = choose_in_view_action(action, by_a, 'A');
         action = cancel_view_action(action, 'C');
@@ -183,6 +181,5 @@ describe('a view action', () => {
         expect(settle_view_action(action, 'restore', by_b, undefined)).toEqual({
             kind: 'pending', action, resend: false,
         });
-        expect(install_in_view_action(action, 'restore', by_b)).toBe(action);
     });
 });

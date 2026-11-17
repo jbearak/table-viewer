@@ -18571,6 +18571,14 @@ export function attach_viewer(
             if (disposed) return;
             disposed = true;
             renderer_ready = false;
+            // This panel's commit records go with it: nothing can name them again.
+            const provenance = transform_commit_provenance.get(file_key);
+            if (provenance !== undefined) {
+                for (const [sheet, record] of provenance) {
+                    if (record.panel === transform_provenance_panel) provenance.delete(sheet);
+                }
+                if (provenance.size === 0) transform_commit_provenance.delete(file_key);
+            }
             for (const request of pending_sheet_selections) {
                 request.reject(new Error(
                     'Viewer controller was disposed before the worksheet could be selected.',

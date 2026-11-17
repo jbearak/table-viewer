@@ -167,8 +167,6 @@ export interface ViewAction {
     /** The newest request is a cancel back to the baseline. */
     readonly cancelled: boolean;
     readonly requests: readonly ViewActionRequest[];
-    /** What the host last said is installed on the sheet. */
-    readonly installed: SheetTransformState | undefined;
 }
 
 export function begin_view_action(
@@ -183,7 +181,6 @@ export function begin_view_action(
         requested: rules_or_empty(installed),
         cancelled: false,
         requests: [],
-        installed,
     };
 }
 
@@ -246,15 +243,6 @@ export function view_action_in_flight(action: ViewAction): boolean {
     return newest !== undefined && !newest.settled;
 }
 
-/** An install answer for one of the action's requests: the sheet now shows `rules`. */
-export function install_in_view_action(
-    action: ViewAction,
-    request_id: string,
-    rules: SheetTransformState | undefined,
-): ViewAction {
-    return view_action_owns(action, request_id) ? { ...action, installed: rules } : action;
-}
-
 /**
  * Rules installed by someone else (I3): when they differ from the baseline, the
  * baseline moves to them and, while the newest request is out, the request is
@@ -266,7 +254,7 @@ function adopt_from_elsewhere(
 ): { readonly action: ViewAction; readonly resend: boolean } {
     if (transforms_semantically_equal(rules, action.baseline)) return { action, resend: false };
     const delta = view_action_delta(action.baseline, action.requested);
-    const moved: ViewAction = { ...action, baseline: rules, installed: rules };
+    const moved: ViewAction = { ...action, baseline: rules };
     if (!view_action_in_flight(action)) return { action: moved, resend: false };
     const requested = action.cancelled
         ? view_action_cancel_target(moved)
@@ -314,7 +302,6 @@ export function settle_view_action(
     if (!view_action_owns(action, request_id)) return { kind: 'pending', action, resend: false };
     const marked: ViewAction = {
         ...action,
-        installed: rules,
         requests: action.requests.map((request) => (
             request.requestId === request_id ? { ...request, settled: true } : request
         )),

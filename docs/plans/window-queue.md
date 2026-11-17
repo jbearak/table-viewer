@@ -381,7 +381,7 @@ The ADR's decision for the view rests on these. V1 builds them, and V2 keeps the
 
 ### The filter value list
 
-The value list reads a source column. From V1, the host admits it by source generation and the sheet's columns (schema), not by the view generation. V1 is what lets the filter editor open during a sort, so a sort that installs between opening the editor and the host's admission must not refuse it.
+The value list reads a source column. From V1, the host admits it by source generation, sheet, and column, not by the view generation. A change of the sheet's columns is a change of source generation. V1 is what lets the filter editor open during a sort, so a sort that installs between opening the editor and the host's admission must not refuse it.
 
 ### Undo, Redo, and Cancel
 
