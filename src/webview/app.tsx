@@ -7720,18 +7720,14 @@ export function App(): React.JSX.Element {
         [],
     );
     /**
-     * Whether history's next move is free: the terms above, and no view step's
-     * replay or column write in flight. A view replay moves its entry only when
-     * the host answers, and a column write records or moves only on its answer,
-     * so until then the next undo, redo, or view request has to wait.
+     * Whether history's next move is free but for a press waiting: the terms
+     * above, and no view step's replay or column write in flight. A view
+     * replay moves its entry only when the host answers, and a column write
+     * records or moves only on its answer, so until then the next undo, redo,
+     * or view request has to wait.
      *
      * A person's own sort, filter, or hide in flight does not count here: a
      * second one on the same sheet may still replace it, as it always could.
-     *
-     * And no press of Undo or Redo waiting (`press_admits`), unless the work
-     * that asks was made before that press and says so with its ticket: a
-     * gesture made after a press must not be recorded under it, and the work
-     * the press waits for must still finish.
      */
     const history_free_but_for_press = useCallback(
         (options?: GestureAdmissionOptions) => base_gestures_admitted(options)
@@ -7740,6 +7736,13 @@ export function App(): React.JSX.Element {
             && !pending_view_transforms_ref.current.some((pending) => pending?.replay !== undefined),
         [base_gestures_admitted],
     );
+    /**
+     * Whether history's next move is free: `history_free_but_for_press`, and
+     * no press of Undo or Redo waiting (`press_admits`), unless the work that
+     * asks was made before that press and says so with its ticket: a gesture
+     * made after a press must not be recorded under it, and the work the
+     * press waits for must still finish.
+     */
     const history_free = useCallback(
         (options?: GestureAdmissionOptions) => history_free_but_for_press(options) && press_admits(),
         [history_free_but_for_press, press_admits],
