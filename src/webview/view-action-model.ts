@@ -12,8 +12,8 @@
  * baseline and `requested`: a change made elsewhere can equal one of the
  * person's, and the difference would then lose it.
  *
- * A Hide rows in the action first asks the host which source rows it hides
- * (V2). Until the answer, the hide is resolving: it is part of the action and
+ * A Hide rows in the action first asks the host which source rows it hides.
+ * Until the answer, the hide is resolving: it is part of the action and
  * no request of it, and the action does not end. The answer joins the action
  * as a choice; a refusal, or no answer, drops it.
  *
@@ -440,7 +440,7 @@ const NO_RULES: SheetTransformState = { sort: [], filters: [], schema: '' };
  * Rules installed by someone else (I3): when they differ from the baseline, the
  * baseline moves to them and what the action asks for is composed again onto
  * them, whether or not a request is out, so a hide still resolving composes
- * onto them (V2). It is sent again only while the newest request is out.
+ * onto them. It is sent again only while the newest request is out.
  * Returns the action and whether to send again.
  *
  * "Differ" is the host's strict comparison, filter ids included: rules another
@@ -456,7 +456,7 @@ function adopt_from_elsewhere(
     if (transform_states_equal(rules ?? NO_RULES, action.baseline ?? NO_RULES)) return { action, resend: false };
     const moved: ViewAction = { ...action, baseline: rules };
     // Recomposed whether or not a request is out: a hide still resolving
-    // composes its answer onto these later (V2).
+    // composes its answer onto these later.
     const requested = action.cancelled
         ? view_action_cancel_target(moved)
         : apply_view_action_delta(action.delta, rules, action.schema);

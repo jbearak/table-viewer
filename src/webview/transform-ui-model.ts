@@ -319,7 +319,7 @@ export function transform_progress_label(
     if (sort_changed && filters_changed) return 'Applying sort & filters…';
     if (sort_changed) return 'Sorting…';
     if (filters_changed) return 'Filtering…';
-    // A hide's request, sent once the host said which rows it hides (V2).
+    // A hide's request, sent once the host said which rows it hides.
     const hidden_before = new Set(previous.hiddenRows ?? []);
     if ((next.hiddenRows ?? []).some((row) => !hidden_before.has(row))) return 'Hiding rows…';
     const has_sort = next.sort.length > 0;

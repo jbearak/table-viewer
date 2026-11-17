@@ -11654,7 +11654,7 @@ export function GridShell({
     // and filter items are disabled is `transform_choice_pending`: a replay or
     // a restore in flight, not the person's own request or a hide.
     const menu_transform_state = requested_transform_state;
-    // Hide rows is a choice of the view action like a sort or filter (V2): held
+    // Hide rows is a choice of the view action like a sort or filter: held
     // only by a replay or a restore in flight, not by the person's own request.
     const hide_rows_disabled_reason = inserted_rows_lock
         ? INSERTED_ROWS_TRANSFORM_MESSAGE

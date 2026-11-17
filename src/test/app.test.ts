@@ -24276,6 +24276,29 @@ describe('view steps in history', () => {
                 .toMatchObject({ sort: SORT_ASC, filters: [FILTER], hiddenRows: [1] });
         });
 
+        it('keeps "Only changed rows" in a hide\'s answer after a refused sort and a snapshot without it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [], onlyChangedRows: true });
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [], onlyChangedRows: true });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            // The durable rules never carry the session toggle; the rows, on
+            // the same basis, are the view on screen, toggle and all.
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [], schema: SCHEMA }] },
+            }));
+            await refuse(sort!);
+            await answer_hide(question!, [1]);
+
+            expect(latest_transform_request(post_message).state)
+                .toMatchObject({ sort: [], hiddenRows: [1], onlyChangedRows: true });
+        });
+
         it('ends a hide whose composed request the host refuses, with nothing recorded', async () => {
             const { post_message } = await render_app();
             await open(post_message);

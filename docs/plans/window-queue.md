@@ -466,7 +466,7 @@ The value list reads a source column. From V1, the host admits it by source gene
 
 ### The V2 stage
 
-This is the stage plan, written against V1 as built (#395). The design above stands; these are the decisions it leaves to the build.
+This is the stage plan, written against V1 as built (#395); its line numbers are at that commit, df274d58. The design above stands; these are the decisions it leaves to the build.
 
 - **The protocol.** `hideRows` (`viewer-controller.ts:15045`), which maps the rows, composes them onto the installed rules, and runs a transform, is replaced by `resolveHiddenRows`: sheet, display rows, request id, the sheet's mapping generation, and the source generation. The host answers `hiddenRowsResolved` with the source rows, or with a refusal reason. It computes nothing and takes no transform admission, so `transform_work_in_flight` (`viewer-controller.ts:5209`) never counts it. Its checks, in order: preview mode, no core (no answer), the source generation, the sheet, the sheet's mapping generation (`panel-core.ts:663`), and the mapping itself (`map_display_rows_to_source`). The old message and its handler are deleted.
 - **The row limit.** `handle_transform_message` refuses, terminally, a request whose hidden rows exceed `MAX_PERSISTED_HIDDEN_ROWS` (`types.ts:401`) with "Too many hidden rows to persist.", before `sanitize_transform_state` would cut them (`src/webview/sheet-state.ts:135`). The window checks the same limit when it composes the answer. The message moves next to the constant, and both sides use it.
@@ -545,6 +545,7 @@ For N2, "long" means it can exceed 1 s on a file the app supports.
    - A hide whose answer comes while a restore is out, or another of the checks a choice passes refuses, ends with "Wait for the table view to finish updating."
    - A transform with more hidden rows than can be saved is refused with "Too many hidden rows to persist." Today the host cuts the list silently.
    - While a hide's request computes, and while a Redo of a hide does, the toolbar says "Hiding rows…", not "Filtering…" or "Sorting…".
+   - Undo or Cancel of a hide alone says "Filtering…" while it computes, or "Sorting…" on a sorted sheet, as Unhide all does today.
 
 Message wording stays the same. Existing messages appear in new places only in changes 2 and 5.
 
