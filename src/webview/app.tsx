@@ -2415,6 +2415,12 @@ export function App(): React.JSX.Element {
             const target = hides_rows
                 ? { ...target_rest, ...(kept_hidden.length === 0 ? {} : { hiddenRows: kept_hidden }) }
                 : pending.target;
+            // And judged among the rows the baseline hid: the reload may carry
+            // the new ones, if the request had landed, and they say nothing.
+            const adopted_hidden = (adopted?.hiddenRows ?? []).filter((row) => baseline_hidden.has(row));
+            const adopted_judged = hides_rows && adopted !== undefined
+                ? { ...adopted, hiddenRows: adopted_hidden }
+                : adopted;
             const step = sheet === undefined
                 || index === undefined
                 || target === undefined
@@ -2429,7 +2435,7 @@ export function App(): React.JSX.Element {
                     pending.schema,
                     pending.baseline,
                     target,
-                    adopted,
+                    adopted_judged,
                 );
             if (step === undefined) {
                 // Nothing recorded for the person's own gesture: a press held behind it

@@ -26138,25 +26138,41 @@ describe('view steps in history', () => {
             expect(undo_labels()).toEqual(['Sort']);
         });
 
-        it('records an Unhide all that installed beside a hide when a reload overtakes the hide\'s composed request', async () => {
+        for (const landed of [false, true]) {
+            it(`records an Unhide all that installed beside a hide when a reload overtakes the hide's composed request${landed ? ', which had landed' : ''}`, async () => {
+                const { post_message } = await render_app();
+                await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                    capabilities: CSV,
+                    state: { transforms: [{ sort: [], filters: [], hiddenRows: [1], schema: SCHEMA }] },
+                }));
+                await install(latest_transform_request(post_message));
+
+                await click_button('Unhide all');
+                const unhide = latest_transform_request(post_message);
+                const question = await hide_rows_unanswered(post_message, [{ start: 2, end: 2 }]);
+                await install(unhide);
+                await answer_hide(question!, [2]);
+                expect(latest_transform_request(post_message).state.hiddenRows).toEqual([2]);
+
+                // The Unhide all was saved, and the hide's request too if it landed.
+                await reload([landed ? { sort: [], filters: [], hiddenRows: [2], schema: SCHEMA } : undefined]);
+
+                expect(undo_labels()).toEqual(['Unhide rows']);
+            });
+        }
+
+        it('records a filter that installed beside a hide when a reload overtakes the hide\'s composed request', async () => {
             const { post_message } = await render_app();
-            await dispatch_host_message(initial_snapshot_message(table_meta(), {
-                capabilities: CSV,
-                state: { transforms: [{ sort: [], filters: [], hiddenRows: [1], schema: SCHEMA }] },
-            }));
-            await install(latest_transform_request(post_message));
+            await open(post_message);
+            const filter = await ask(post_message, { sort: [], filters: [FILTER] });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await install(filter!);
+            await answer_hide(question!, [1]);
+            expect(latest_transform_request(post_message).state).toMatchObject({ filters: [FILTER], hiddenRows: [1] });
 
-            await click_button('Unhide all');
-            const unhide = latest_transform_request(post_message);
-            const question = await hide_rows_unanswered(post_message, [{ start: 2, end: 2 }]);
-            await install(unhide);
-            await answer_hide(question!, [2]);
-            expect(latest_transform_request(post_message).state.hiddenRows).toEqual([2]);
+            await reload([{ sort: [], filters: [FILTER], schema: SCHEMA }]);
 
-            // The Unhide all was saved; the hide's request had not been.
-            await reload([undefined]);
-
-            expect(undo_labels()).toEqual(['Unhide rows']);
+            expect(undo_labels()).toEqual(['Filter']);
         });
 
         it('moves a replay it overtook when the reload shows the replay\'s target', async () => {
