@@ -325,7 +325,7 @@ The ADR's decision for the view rests on these. V1 builds them, and V2 keeps the
 - **I1. One view action per window.**
   - A **sheet action** is the person's choices on one sheet since that sheet's last install: sort, filter, Hide rows (from V2), and Unhide all.
   - A choice on another sheet while an action is pending stays refused, as today (`view_gesture_may_start`, `app.tsx:10289-10293`). So does a choice during a replay (`history_free`, `7375`). So a window has at most one pending action.
-  - A restore and the compare strip's "Only changed rows" are not choices. They make no action, have no label, and are not undone. "Only changed rows" rides along in the requested rules.
+  - A restore and the compare strip's "Only changed rows" are not choices: they have no step, no label, and are not undone. A restore makes no action. "Only changed rows" rides along in the requested rules of a pending action; on its own it is carried by an action with no step, so the window keeps each request it sends until the host settles it, and the action, like any, holds Hide rows and edits until then. It records nothing, and Undo does not cancel it.
 - **I2. A step records when its view installs.**
   - An action records at most one step, when it ends (I3), on top of the stack, through `record_view_step` as today. The step comes from what is installed then, whichever message installed it.
   - The step runs from the action's baseline to what is then installed. It records nothing if the two are equal.
@@ -353,7 +353,7 @@ The ADR's decision for the view rests on these. V1 builds them, and V2 keeps the
   - So every install the host makes for this window is either recorded in a step or undone by the action's cancel.
 - **I4. The baseline, and cancelling.**
   - The baseline is the rules installed when the action's first choice was made, or the adopted rules after a refresh (I3).
-  - Undo of the pending action and the Cancel button both send the baseline, with the requested "Only changed rows" kept. That cancel is the action's newest request.
+  - Undo of the pending action and the Cancel button both send the baseline, with the requested "Only changed rows" kept. That cancel is the action's newest request. An action with no step, whose requested rules differ from the baseline in "Only changed rows" alone, has only the toggle to take back: Undo does not cancel it, and Cancel sends the baseline with its own toggle. A cancel sent again after a refusal asks for what the first one did.
   - When the action ends, it records a step if what is then installed differs from its baseline (I2), and nothing if it is the baseline. So an answered cancel leaves no step, and a refused one records any earlier request that installed.
   - A choice made before the cancel is answered replaces the cancel, in the same action, with the same baseline.
 - **I5. Presses wait for the action, as today.**
@@ -373,7 +373,7 @@ The ADR's decision for the view rests on these. V1 builds them, and V2 keeps the
 
 ### Controls
 
-- **The sort and filter controls** listed under "What the code does today" stop reading `transform_pending` for the action's own request. They read a new per-sheet flag instead: a hide, a replay, or a restore is in flight on the sheet. A hide is a pending request that is not a sort, filter, or Unhide all choice; V2 deletes that term when Hide rows becomes part of the action. That includes the compare strip's "Only changed rows".
+- **The sort and filter controls** listed under "What the code does today" stop reading `transform_pending` for the action's own request. They read a new per-sheet flag instead: a hide, a replay, or a restore is in flight on the sheet. A hide is a pending request that is not a sort, filter, or Unhide all choice; V2 deletes that term when Hide rows becomes part of the action. The compare strip's "Only changed rows" is read the same way: its own request, carried by an action, does not hold it or the other controls.
 - **They stay disabled for today's other reasons:** Save, a session claim, preview mode, a header change, a replay, inserted rows, and the reopen fence (`transform_ui_blocked`, `transform_request_blocked`). The cases where a control is enabled while its handler refuses are today's, and no more: `transform_request_blocked` refuses through `history_free` during a highlight, size, or column write, and while a press waits (`app.tsx:7369-7380`, `10233-10240`).
 - **During a restore,** an open filter editor's Apply is refused with "Wait for the table view to finish updating.", as the disabled controls are. Today it composes onto the restore's target.
 - **Hide rows** keeps `transform_pending` in V1, and V2 moves it. Unhide all moves in V1, because it composes like a filter.

@@ -11205,9 +11205,11 @@ export function App(): React.JSX.Element {
         // A cancel already out is not sent twice; one the host refused is sent again.
         if (pending.action.cancelled && !pending.refused) return true;
         drop_history_presses({ keep_typing: true });
-        // An action with no step has changed nothing but the compare toggle, so
-        // that is what its cancel takes back (I4 keeps the toggle otherwise). A
-        // cancel sent again already asks for the toggle the first one chose.
+        // An action with no step asks for nothing but its baseline and a compare
+        // toggle, so the toggle is what its cancel takes back (I4 keeps it
+        // otherwise). That is the net effect: a sort chosen and cleared again,
+        // with the toggle on, has no step either. A cancel sent again already
+        // asks for the toggle the first one chose.
         const keep_toggle = pending.action.cancelled || transform_view_step(
             pending.worksheet,
             pending.schema,
