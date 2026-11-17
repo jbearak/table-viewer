@@ -510,6 +510,7 @@ For N2, "long" means it can exceed 1 s on a file the app supports.
 1. **(V1)** Sort and filter controls stay enabled while the person's own request is in flight on their sheet, in the grid, menus, keyboard shortcut, filter editor, toolbar, and the compare strip's "Only changed rows". A new choice replaces the request and keeps what it asked for, as one step.
 2. **(V1)** Undo while the person's own request is still in flight cancels it, back to the rules from before it. Today the press waits for the install, then undoes it.
    - Every control shows and builds from the rules asked for, not only those installed.
+   - After Cancel, or an Undo that cancels, cells stay held until the host has settled the cancel, as for any view request of this window (exception 5). Today they are editable while the cancel is out. An Undo or Redo pressed after the cancel waits for it.
    - During a restore, an open filter editor's Apply is refused with "Wait for the table view to finish updating."
    - A refresh about another sheet, or another window's change to this sheet, no longer drops the request in flight. Today it is lost silently, though the host installs it. After another window's change to the sheet, the request is sent again onto it.
    - A new choice drops an Undo or Redo press waiting behind the request, silently.
