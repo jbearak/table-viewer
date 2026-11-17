@@ -1856,6 +1856,13 @@ export interface GridShellProps {
     transform_waits_for_claim?: boolean;
     transform_pending?: boolean;
     /**
+     * Whether the sort and filter controls wait: a hide, a replay, or a restore
+     * is in flight on the sheet. The person's own sort or filter in flight does
+     * not hold them, because a new choice replaces it. Defaults to
+     * `transform_pending`.
+     */
+    transform_choice_pending?: boolean;
+    /**
      * The rules the transform in flight will install. Menus offer their items
      * by these, and `transform_pending` only disables them, so an item does not
      * appear or vanish under the pointer when the transform lands.
@@ -1984,6 +1991,7 @@ export function GridShell({
     transform_sections = false,
     transform_waits_for_claim = false,
     transform_pending = false,
+    transform_choice_pending = transform_pending,
     pending_transform_target,
     on_transform_change = () => {},
     on_open_filter = () => {},
@@ -2172,11 +2180,17 @@ export function GridShell({
         structure?: RowStructureSelection;
     }) | null>(null);
 
+    // The rules asked for: what a transform in flight will install, or what is
+    // installed. A choice is built from these and the controls show them, so a
+    // second choice made while the first is in flight keeps the first.
+    const requested_transform_state = transform_pending
+        ? pending_transform_target ?? transform_state
+        : transform_state;
     const sort_metadata = useMemo(
-        () => header_sort_metadata(transform_state.sort),
-        [transform_state.sort],
+        () => header_sort_metadata(requested_transform_state.sort),
+        [requested_transform_state.sort],
     );
-    const show_sort_priority = transform_state.sort.length > 1;
+    const show_sort_priority = requested_transform_state.sort.length > 1;
     const draw_header: DrawHeaderCallback = useCallback((args, draw_content) => {
         draw_content();
         const source_column = visible_source_columns[args.columnIndex];
@@ -11452,33 +11466,33 @@ export function GridShell({
         direction: SortDirection,
         append: boolean,
     ) => {
-        if (!transform_sections || transform_pending || inserted_rows_lock) return;
+        if (!transform_sections || transform_choice_pending || inserted_rows_lock) return;
         on_transform_change({
-            ...transform_state,
+            ...requested_transform_state,
             sort: append
-                ? append_sort(transform_state.sort, source_column, direction)
+                ? append_sort(requested_transform_state.sort, source_column, direction)
                 : replace_sort(source_column, direction),
         });
     }, [
         inserted_rows_lock,
         on_transform_change,
-        transform_pending,
+        requested_transform_state,
+        transform_choice_pending,
         transform_sections,
-        transform_state,
     ]);
 
     const clear_filter_on_column = useCallback((source_column: number) => {
-        if (!transform_sections || transform_pending) return;
+        if (!transform_sections || transform_choice_pending) return;
         on_transform_change({
-            ...transform_state,
-            filters: transform_state.filters.filter((entry) =>
+            ...requested_transform_state,
+            filters: requested_transform_state.filters.filter((entry) =>
                 entry.colIndex !== source_column),
         });
     }, [
         on_transform_change,
-        transform_pending,
+        requested_transform_state,
+        transform_choice_pending,
         transform_sections,
-        transform_state,
     ]);
 
     const hide_source_columns_multi = useCallback((source_columns: number[]) => {
@@ -11499,18 +11513,18 @@ export function GridShell({
         source_columns: number[],
         direction: SortDirection,
     ) => {
-        if (!transform_sections || transform_pending || inserted_rows_lock) return;
+        if (!transform_sections || transform_choice_pending || inserted_rows_lock) return;
         if (source_columns.length === 0) return;
         on_transform_change({
-            ...transform_state,
+            ...requested_transform_state,
             sort: source_columns.map((colIndex) => ({ colIndex, direction })),
         });
     }, [
         inserted_rows_lock,
         on_transform_change,
-        transform_pending,
+        requested_transform_state,
+        transform_choice_pending,
         transform_sections,
-        transform_state,
     ]);
 
     // A Pending Column has no source column: focusing it leaves sort and
@@ -11637,9 +11651,7 @@ export function GridShell({
     const transform_menu_sections = transform_sections || transform_waits_for_claim;
     // Which items a menu offers follows the rules a transform in flight will
     // install; its being in flight only disables them.
-    const menu_transform_state = transform_pending
-        ? pending_transform_target ?? transform_state
-        : transform_state;
+    const menu_transform_state = requested_transform_state;
     const hide_rows_disabled_reason = inserted_rows_lock
         ? INSERTED_ROWS_TRANSFORM_MESSAGE
         : transform_pending ? STRUCTURE_BUSY_MESSAGE : undefined;
@@ -11788,7 +11800,7 @@ export function GridShell({
             if (
                 shortcut
                 && transform_sections
-                && !transform_pending
+                && !transform_choice_pending
                 && !is_editable_target(args.rawEvent?.target ?? null)
             ) {
                 if (inserted_rows_lock) {
@@ -11803,7 +11815,7 @@ export function GridShell({
                 if (shortcut.kind === 'sort' && source_column !== undefined) {
                     apply_column_sort(source_column, shortcut.direction, false);
                 } else if (shortcut.kind === 'clearSorts') {
-                    on_transform_change({ ...transform_state, sort: [] });
+                    on_transform_change({ ...requested_transform_state, sort: [] });
                 } else if (shortcut.kind === 'editFilter' && source_column !== undefined) {
                     const display_column = display_column_for_source(source_column);
                     const bounds = display_column === undefined
@@ -11820,7 +11832,7 @@ export function GridShell({
                 } else if (shortcut.kind === 'clearFilter' && source_column !== undefined) {
                     clear_filter_on_column(source_column);
                 } else if (shortcut.kind === 'clearFilters') {
-                    on_transform_change({ ...transform_state, filters: [] });
+                    on_transform_change({ ...requested_transform_state, filters: [] });
                 }
                 return;
             }
@@ -11953,10 +11965,10 @@ export function GridShell({
             on_transform_change,
             row_count,
             select_active_display_cell,
+            requested_transform_state,
             source_column_for_display,
-            transform_pending,
+            transform_choice_pending,
             transform_sections,
-            transform_state,
             visible_source_columns,
         ],
     );
@@ -13133,7 +13145,7 @@ export function GridShell({
                     y={context_menu.y}
                     column_count={context_menu.display_cols.length}
                     transform_sections={transform_menu_sections}
-                    transform_disabled={!transform_sections || transform_pending || inserted_rows_lock || has_pending}
+                    transform_disabled={!transform_sections || transform_choice_pending || inserted_rows_lock || has_pending}
                     {...(inserted_rows_lock
                         ? { transform_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE }
                         : has_pending
@@ -13227,7 +13239,7 @@ export function GridShell({
                         column_name={columns[context_menu.display_col]?.title
                             ?? `Column ${source_column + 1}`}
                         transform_sections={transform_menu_sections}
-                        transform_disabled={!transform_sections || transform_pending || inserted_rows_lock}
+                        transform_disabled={!transform_sections || transform_choice_pending || inserted_rows_lock}
                         {...(inserted_rows_lock
                             ? { transform_disabled_reason: INSERTED_ROWS_TRANSFORM_MESSAGE }
                             : {})}
@@ -13276,12 +13288,12 @@ export function GridShell({
                         on_sort={(direction, append) =>
                             apply_column_sort(source_column, direction, append)}
                         on_clear_column_sort={() => on_transform_change({
-                            ...transform_state,
-                            sort: transform_state.sort.filter((key) =>
+                            ...requested_transform_state,
+                            sort: requested_transform_state.sort.filter((key) =>
                                 key.colIndex !== source_column),
                         })}
                         on_clear_all_sorts={() => on_transform_change({
-                            ...transform_state,
+                            ...requested_transform_state,
                             sort: [],
                         })}
                         on_edit_filter={() => {
@@ -13294,7 +13306,7 @@ export function GridShell({
                         }}
                         on_clear_column_filter={() => clear_filter_on_column(source_column)}
                         on_clear_all_filters={() => on_transform_change({
-                            ...transform_state,
+                            ...requested_transform_state,
                             filters: [],
                         })}
                         on_dismiss={dismiss_context_menu}

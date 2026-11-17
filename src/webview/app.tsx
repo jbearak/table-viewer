@@ -3270,6 +3270,20 @@ export function App(): React.JSX.Element {
      * of the step the person made first.
      */
     const view_action_ref = useRef<PendingViewAction | undefined>(undefined);
+    /**
+     * Whether a sort or filter choice on a sheet waits: a request is pending
+     * there that is not the person's own view action's, that is a hide, a
+     * replay, or a restore. The action's own request does not hold a choice,
+     * because a new choice replaces it.
+     */
+    const view_choice_waits = (sheet_index: number): boolean => {
+        const request_id = pending_transform_request_ids_ref.current[sheet_index];
+        if (request_id === undefined) return false;
+        const pending = view_action_ref.current;
+        return pending === undefined
+            || pending.action.sheetIndex !== sheet_index
+            || !view_action_owns(pending.action, request_id);
+    };
     /** `cancel_view_action_on_sheet` and `cancel_blocked`, which are declared further down. */
     const cancel_view_action_ref = useRef<(sheet_index: number) => boolean>(() => false);
     const cancel_blocked_ref = useRef<() => boolean>(() => true);
@@ -10551,6 +10565,12 @@ export function App(): React.JSX.Element {
             ) {
                 drop_history_presses({ keep_typing: true });
             }
+            // A hide, a replay, or a restore in flight on the sheet holds the
+            // choice: replacing its request would leave its answer unmatched.
+            if (view_choice_waits(active_sheet_index)) {
+                show_warning(VIEW_GESTURE_WAIT_MESSAGE);
+                return false;
+            }
             if (!view_gesture_may_start(active_sheet_index)) return false;
             if (
                 (sanitized.sort.length > 0
@@ -10841,7 +10861,9 @@ export function App(): React.JSX.Element {
             });
             return;
         }
-        const current = state_ref.current.transforms?.[active_sheet_index]
+        // Composed onto the rules asked for, so a sort or filter in flight is kept (I6).
+        const current = pending_transform_states_ref.current[active_sheet_index]
+            ?? state_ref.current.transforms?.[active_sheet_index]
             ?? transforms[active_sheet_index]
             ?? EMPTY_TRANSFORM;
         const { hiddenRows: _hidden_rows, ...next } = current;
@@ -10903,14 +10925,13 @@ export function App(): React.JSX.Element {
         }
         if (
             !view_gesture_may_start(active_sheet_index)
-            || pending_transforms[active_sheet_index]
+            || view_choice_waits(active_sheet_index)
             || inserted_rows_refuse_transform(active_sheet_index)
         ) return;
         set_filter_editor({ column_index, anchor, restore_focus, origin });
     }, [
         active_sheet_index,
         inserted_rows_refuse_transform,
-        pending_transforms,
         view_gesture_may_start,
     ]);
 
@@ -11029,7 +11050,16 @@ export function App(): React.JSX.Element {
 
     const apply_filter_editor = useCallback((entry: FilterEntry) => {
         if (!filter_editor) return;
-        const current = transforms[active_sheet_index] ?? EMPTY_TRANSFORM;
+        // During a restore the editor stays open with its draft: the choice
+        // would otherwise be composed onto rules the restore is still asking for.
+        if (pending_transform_origins_ref.current[active_sheet_index] === 'restore') {
+            show_warning(VIEW_GESTURE_WAIT_MESSAGE);
+            return;
+        }
+        // Composed onto the rules asked for, so a choice in flight is kept (I6).
+        const current = pending_transform_states_ref.current[active_sheet_index]
+            ?? transforms[active_sheet_index]
+            ?? EMPTY_TRANSFORM;
         const requested = handle_transform_change({
             ...current,
             filters: upsert_filter(current.filters, entry),
@@ -11040,12 +11070,19 @@ export function App(): React.JSX.Element {
         close_filter_editor,
         filter_editor,
         handle_transform_change,
+        show_warning,
         transforms,
     ]);
 
     const remove_filter_editor = useCallback(() => {
         if (!filter_editor) return;
-        const current = transforms[active_sheet_index] ?? EMPTY_TRANSFORM;
+        if (pending_transform_origins_ref.current[active_sheet_index] === 'restore') {
+            show_warning(VIEW_GESTURE_WAIT_MESSAGE);
+            return;
+        }
+        const current = pending_transform_states_ref.current[active_sheet_index]
+            ?? transforms[active_sheet_index]
+            ?? EMPTY_TRANSFORM;
         // Remove by column, matching how the popover determines "existing".
         const requested = handle_transform_change({
             ...current,
@@ -11059,6 +11096,7 @@ export function App(): React.JSX.Element {
         close_filter_editor,
         filter_editor,
         handle_transform_change,
+        show_warning,
         transforms,
     ]);
 
@@ -13455,6 +13493,12 @@ export function App(): React.JSX.Element {
     const pending_transform_target = transform_pending && !preview_mode
         ? pending_transform_states_ref.current[active_sheet_index] ?? visible_transform
         : undefined;
+    // The rules asked for, which every sort and filter control shows and builds
+    // from (I6), and whether those controls wait: only for a hide, a replay, or
+    // a restore on the sheet, never for the person's own request, which a new
+    // choice replaces.
+    const requested_transform = pending_transform_target ?? visible_transform;
+    const transform_choice_pending = transform_pending && view_choice_waits(active_sheet_index);
     const excel_header_disabled_reason = !excel_header_candidate_available
         && !excel_header?.active
         ? 'This sheet has no first row to use as column names.'
@@ -13958,6 +14002,7 @@ export function App(): React.JSX.Element {
             transform_sections={!transform_ui_blocked}
             transform_waits_for_claim={transform_waits_for_claim}
             transform_pending={transform_pending}
+            transform_choice_pending={transform_choice_pending}
             {...(pending_transform_target === undefined ? {} : { pending_transform_target })}
             on_transform_change={handle_grid_transform_change}
             on_open_filter={open_grid_filter_editor}
@@ -13993,9 +14038,9 @@ export function App(): React.JSX.Element {
                     git_compare.changedColumnNames.some((columns) => columns.length > 0)
                     || git_compare.sheetStatuses.some((status) => status !== 'matched')
                 }
-                only_changed_rows={visible_transform.onlyChangedRows === true}
+                only_changed_rows={requested_transform.onlyChangedRows === true}
                 on_toggle_only_changed_rows={handle_toggle_only_changed_rows}
-                filter_pending={transform_pending}
+                filter_pending={transform_choice_pending}
             />
         )
         : null;
@@ -14042,13 +14087,14 @@ export function App(): React.JSX.Element {
     const sheet_pane = (
         <div className="sheet-pane">
             <StateStrip
-                transform={visible_transform}
+                transform={requested_transform}
                 transform_disabled={transform_ui_blocked}
                 transform_pending={transform_pending}
+                transform_choice_pending={transform_choice_pending}
                 transform_progress={pending_transform_labels[active_sheet_index]}
                 hidden_rows={{
                     count: hidden_row_count,
-                    pending: transform_pending,
+                    pending: transform_choice_pending,
                     // For a promoted header it is a Header Row change, so it
                     // waits like one; see `excel_header_change_pending`.
                     disabled: excel_header_change_pending
@@ -14172,7 +14218,7 @@ export function App(): React.JSX.Element {
                     column_index={filter_editor.column_index}
                     column_name={column_names[filter_editor.column_index]
                         ?? `Column ${filter_editor.column_index + 1}`}
-                    filters={visible_transform.filters}
+                    filters={requested_transform.filters}
                     anchor={filter_editor.anchor}
                     histogram={filter_histogram.key === `${source_generation_ref.current}:${active_sheet_index}:${filter_editor.column_index}`
                         ? filter_histogram.value

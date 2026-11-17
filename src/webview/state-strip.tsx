@@ -7,6 +7,12 @@ export interface StateStripProps {
     transform: SheetTransformState;
     transform_disabled: boolean;
     transform_pending: boolean;
+    /**
+     * Whether the sort and filter controls wait: a hide, a replay, or a restore
+     * is in flight. The person's own sort or filter in flight does not hold them.
+     * Defaults to `transform_pending`.
+     */
+    transform_choice_pending?: boolean;
     transform_progress?: string;
     hidden_rows?: {
         count: number;
@@ -63,7 +69,10 @@ export function StateStrip(props: StateStripProps): React.JSX.Element | null {
         || props.merges_flattened;
     if (!has_state) return null;
 
-    const controls_disabled = !!(props.transform_disabled || props.transform_pending);
+    const controls_disabled = !!(
+        props.transform_disabled
+        || (props.transform_choice_pending ?? props.transform_pending)
+    );
 
     return (
         <div className="state-strip" role="group" aria-label="Active view state">

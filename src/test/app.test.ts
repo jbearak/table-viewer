@@ -14794,7 +14794,9 @@ describe('sorting and filtering', () => {
         expect(request).toBeDefined();
         expect(document.activeElement).toBe(chip);
         expect(chip.disabled).toBe(false);
-        expect(chip.getAttribute('aria-disabled')).toBe('true');
+        // The person's own filter in flight does not hold the chip: a new choice
+        // replaces it (plan change 1).
+        expect(chip.getAttribute('aria-disabled')).toBeNull();
 
         await dispatch_host_message(
             transform_installed_message(request, { generation: 3 }),
@@ -23267,6 +23269,141 @@ describe('view steps in history', () => {
         });
     }
 
+    // Plan V1: the person's sort and filter choices on a sheet form one view
+    // action, which a new choice joins, Undo or Cancel takes back, and which
+    // records its step only when the host has settled everything it sent.
+    describe('a view action', () => {
+        it('keeps sort and filter controls enabled while the person\'s own request is in flight, and holds them for a hide', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const request = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            expect(props().transform_pending).toBe(true);
+            expect(props().transform_choice_pending).toBe(false);
+            // The controls show, and build from, the rules asked for.
+            expect(props().pending_transform_target?.sort).toEqual(SORT_ASC);
+            await install(request!);
+
+            expect(await hide_rows(post_message, [{ start: 0, end: 1 }])).toBeDefined();
+            expect(props().transform_choice_pending).toBe(true);
+            expect(await ask(post_message, { sort: [], filters: [FILTER] })).toBeUndefined();
+            expect(warnings(post_message)).toEqual(['Wait for the table view to finish updating.']);
+        });
+
+        it('keeps a sort when a filter is chosen while it computes, and records both as one step', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const first = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const second = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            expect(second!.requestId).not.toBe(first!.requestId);
+            await install(second!);
+
+            expect(undo_labels()).toEqual(['Change view']);
+            post_message.mockClear();
+            await undo();
+            expect(latest_transform_request(post_message).state).toMatchObject({ sort: [], filters: [] });
+        });
+
+        it('shows an install of a request a newer one replaced, and records one step when the newer one is settled', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const first = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const second = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            auto_settle_transforms = false;
+            // The host had installed the first before the second took the sheet.
+            await install(first!);
+            expect(props().transform_pending).toBe(true);
+            expect(undo_labels()).toEqual([]);
+            expect(cells_editable()).toEqual(HELD);
+            // Settled when the second took the sheet, after it had committed.
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: first!.requestId, committedBy: first!.requestId,
+            });
+            await install(second!);
+            expect(undo_labels()).toEqual([]);
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: second!.requestId,
+                committedBy: second!.requestId,
+                projection: {
+                    view: { basis: { generation: view_generation, sourceGeneration: 1, schema: SCHEMA }, permuted: true, rowCount: 6, rules: second!.state, hiddenEditedCellKeys: [] },
+                    rules: second!.state,
+                    rowHeights: {},
+                    mappingGeneration: view_generation,
+                },
+            } as HostMessage);
+
+            expect(undo_labels()).toEqual(['Change view']);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('records what an earlier request installed when the cancel is refused (I4)', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const first = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            auto_settle_transforms = false;
+            await install(first!);
+            await dispatch_host_message({ type: 'transformSettled', sheetIndex: 0, requestId: first!.requestId, committedBy: first!.requestId });
+            post_message.mockClear();
+            await undo();
+            const cancel = latest_transform_request(post_message);
+            expect(cancel).toMatchObject({ intent: 'cancel', state: { sort: [], filters: [] } });
+            // The second request was settled when the cancel took the sheet.
+            for (const request of sent_transform_requests) {
+                if (request.requestId === cancel.requestId || request.requestId === first!.requestId) continue;
+                await dispatch_host_message({ type: 'transformSettled', sheetIndex: 0, requestId: request.requestId, committedBy: first!.requestId });
+            }
+            await refuse(cancel);
+            expect(undo_labels()).toEqual([]);
+            // Settled with the sort the first request installed and committed.
+            await dispatch_host_message({ type: 'transformSettled', sheetIndex: 0, requestId: cancel.requestId, committedBy: first!.requestId });
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('keeps a choice made before the cancel is answered in the same action', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await undo();
+            const choice = await ask(post_message, { sort: [], filters: [FILTER] });
+            expect(choice).toMatchObject({ intent: 'user', state: { sort: [], filters: [FILTER] } });
+            await install(choice!);
+
+            expect(undo_labels()).toEqual(['Filter']);
+            post_message.mockClear();
+            await undo();
+            expect(latest_transform_request(post_message).state).toMatchObject({ sort: [], filters: [] });
+        });
+
+        it('keeps the request when a refresh about another sheet arrives, and records it when installed', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {}, table_meta(['Sheet1', 'Sheet2']));
+
+            const request = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            // Another sheet's change moved the core-wide generation on the same source.
+            await dispatch_host_message(refresh_snapshot_message(table_meta(['Sheet1', 'Sheet2']), {
+                generation: 7,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+            }));
+            expect(posted(post_message, 'setTransform')).toHaveLength(1);
+            expect(props().transform_pending).toBe(true);
+            expect(cells_editable()).toEqual(HELD);
+            view_generation = 7;
+            await install(request!);
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(cells_editable()).toEqual(EDITABLE);
+        });
+    });
+
     describe('recording', () => {
         it('records a sort when the host installs it, with no editing session', async () => {
             const { post_message } = await render_app();
@@ -23373,14 +23510,19 @@ describe('view steps in history', () => {
             expect(replay.state.filters).toEqual([]);
         });
 
-        it('records the sort alone when it replaces a restore still in flight', async () => {
+        it('refuses a sort while a restore is in flight, and records it alone once the restore is in', async () => {
             const { post_message } = await render_app();
             await dispatch_host_message(initial_snapshot_message(table_meta(), {
                 capabilities: CSV,
                 state: { transforms: [{ sort: [], filters: [FILTER], schema: SCHEMA }] },
             }));
-            expect(latest_transform_request(post_message).intent).toBe('restore');
+            const restore = latest_transform_request(post_message);
+            expect(restore.intent).toBe('restore');
 
+            // No choice is composed over a pending restore (plan exception 8).
+            expect(await ask(post_message, { sort: SORT_ASC, filters: [FILTER] })).toBeUndefined();
+            expect(warnings(post_message)).toEqual(['Wait for the table view to finish updating.']);
+            await install(restore);
             await change_view(post_message, { sort: SORT_ASC, filters: [FILTER] });
 
             expect(undo_labels()).toEqual(['Sort']);
