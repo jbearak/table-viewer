@@ -3874,6 +3874,43 @@ describe('Excel first-row header toggle', () => {
             .toBe('Restoring rows…');
     });
 
+    it('lets an Undo wait for an Unhide all queued behind the person\'s own sort, instead of cancelling the sort', async () => {
+        const { post_message } = await render_app();
+        const meta = excel_meta(true, 'on');
+        meta.sheets[0].sourceRowCount = 4;
+        meta.sheets[0].excelFirstRowHeader = {
+            ...meta.sheets[0].excelFirstRowHeader!,
+            sourceRow: 2,
+        };
+        const transform: SheetTransformState = {
+            sort: [],
+            filters: [],
+            hiddenRows: [0, 1],
+            schema: '["People",2,["Name","Age"]]',
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: { transforms: [transform] },
+            generation: 3,
+            sourceGeneration: 5,
+        }));
+        await acknowledge_transform(latest_transform_request(post_message), 4);
+        await act(async () => (grid_shell_mock.latest_props as unknown as GridShellProps).on_transform_change?.({
+            ...transform,
+            sort: [{ colIndex: 0, direction: 'asc' }],
+        }));
+        const sort = latest_transform_request(post_message);
+        expect(sort.intent).toBe('user');
+        // The header run waits for the sort, and is newer than it.
+        await click_button('Unhide all');
+        post_message.mockClear();
+
+        await dispatch_host_message({ type: 'editCommand', command: 'undo' });
+
+        expect(post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setTransform')).toEqual([]);
+        expect((grid_shell_mock.latest_props as unknown as GridShellProps).history_press_held?.()).toBe(true);
+    });
+
     it('keeps a row-zero header active when Unhide all clears other hidden rows', async () => {
         const { post_message } = await render_app();
         const meta = excel_meta(true, 'on');
@@ -23379,6 +23416,72 @@ describe('view steps in history', () => {
             expect(menu().undoLabel).toBeUndefined();
             await install(latest_transform_request(post_message));
             expect(undo_labels()).toEqual([]);
+        });
+
+        it('lets a Redo held behind a request that installs with nothing changed run', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+            await undo();
+            await install(latest_transform_request(post_message));
+            expect(redo_labels()).toEqual(['Filter']);
+            post_message.mockClear();
+
+            const request = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await redo();
+            expect(press_held()).toBe(true);
+            // The host installed the rules that were there: no step, and the press runs.
+            await install(request!, { sort: [], filters: [], schema: SCHEMA });
+
+            expect(press_held()).toBe(false);
+            const replay = latest_transform_request(post_message);
+            expect(replay.requestId).not.toBe(request!.requestId);
+            expect(replay.state.filters).toEqual([FILTER]);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('drops a Redo held behind the request when a new choice is made, and takes the choice', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+            await undo();
+            await install(latest_transform_request(post_message));
+            post_message.mockClear();
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await redo();
+            expect(press_held()).toBe(true);
+            const choice = await ask(post_message, { sort: [{ colIndex: 2, direction: 'desc' }], filters: [] });
+
+            expect(choice).toBeDefined();
+            expect(press_held()).toBe(false);
+            expect(warnings(post_message)).toEqual([]);
+            await install(choice!);
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(redo_labels()).toEqual([]);
+        });
+
+        it('holds a second Undo pressed after the first cancelled the request, then undoes the step under it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+            post_message.mockClear();
+
+            await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            await undo();
+            const cancel = latest_transform_request(post_message);
+            expect(cancel.intent).toBe('cancel');
+            await undo();
+            expect(press_held()).toBe(true);
+            await install(cancel);
+
+            const replay = latest_transform_request(post_message);
+            expect(replay.intent).toBe('user');
+            expect(replay.state.filters).toEqual([]);
+            await install(replay);
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Filter']);
+            expect(warnings(post_message)).toEqual([]);
         });
 
         it('keeps a choice made before the cancel is answered in the same action', async () => {
