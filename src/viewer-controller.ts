@@ -15113,7 +15113,7 @@ export function attach_viewer(
              * resize in undo history from it. `applied` is decided by the write alone.
              *
              * The request quotes the core generation and the source generation, and
-             * a stale one is refused as a moved view, because it names rows in a
+             * a stale one is answered `applied: false`, because it names rows in a
              * coordinate space only one specific permutation defines.
              *
              * Currency is the generation pair *plus the authority half* of

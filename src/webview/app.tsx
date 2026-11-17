@@ -9,7 +9,6 @@ import {
     refresh_view_action,
     refuse_in_view_action,
     resend_in_view_action,
-    view_action_resend_is_cancel,
     resolve_in_view_action,
     settle_view_action,
     take_resolution,
@@ -17,6 +16,7 @@ import {
     view_action_cancel_target,
     view_action_idle,
     view_action_owns,
+    view_action_resend_is_cancel,
     view_action_resolving_rows,
     type ViewAction,
 } from './view-action-model';
