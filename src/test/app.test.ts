@@ -3943,6 +3943,49 @@ describe('Excel first-row header toggle', () => {
         expect((grid_shell_mock.latest_props as unknown as GridShellProps).history_press_held?.()).toBe(true);
     });
 
+    it('queues an Unhide all of a promoted header behind a hide still resolving, which composes first', async () => {
+        const { post_message } = await render_app();
+        const meta = excel_meta(true, 'on');
+        meta.sheets[0].sourceRowCount = 4;
+        meta.sheets[0].excelFirstRowHeader = {
+            ...meta.sheets[0].excelFirstRowHeader!,
+            sourceRow: 2,
+        };
+        const transform: SheetTransformState = {
+            sort: [],
+            filters: [],
+            hiddenRows: [0, 1],
+            schema: '["People",2,["Name","Age"]]',
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: { transforms: [transform] },
+            generation: 3,
+            sourceGeneration: 5,
+        }));
+        await acknowledge_transform(latest_transform_request(post_message), 4);
+        const props = () => grid_shell_mock.latest_props as unknown as GridShellProps;
+        await act(async () => props().on_hide_rows?.([{ start: 0, end: 0 }]));
+        const question = post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: 'resolveHiddenRows' }> => (
+                message.type === 'resolveHiddenRows'
+            )).at(-1)!;
+        // The header run waits for the action the hide is part of.
+        await click_button('Unhide all');
+        const header_requests = () => post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setExcelFirstRowHeader');
+        expect(header_requests()).toEqual([]);
+
+        await dispatch_host_message({
+            type: 'hiddenRowsResolved', sheetIndex: 0, requestId: question.requestId, sourceRows: [3],
+        });
+        const hide = latest_transform_request(post_message);
+        expect(hide.state.hiddenRows).toEqual([0, 1, 3]);
+        expect(header_requests()).toEqual([]);
+        await acknowledge_transform(hide, 5);
+
+        await vi.waitFor(() => expect(header_requests()).toHaveLength(1));
+    });
+
     it('keeps a row-zero header active when Unhide all clears other hidden rows', async () => {
         const { post_message } = await render_app();
         const meta = excel_meta(true, 'on');
@@ -24323,6 +24366,47 @@ describe('view steps in history', () => {
 
             expect(warnings(post_message)).toEqual(['Wait for the table view to finish updating.']);
             expect(posted(post_message, 'setTransform').filter((sent) => sent.intent === 'user')).toEqual([]);
+        });
+
+        it('refuses a sort on another sheet while a hide resolves', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {}, table_meta(['Sheet1', 'Sheet2']));
+
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await click_button('Sheet2');
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+
+            expect(sort).toBeUndefined();
+            expect(warnings(post_message)).toContain('Wait for the table view to finish updating.');
+        });
+
+        it('ends a hide alone on Cancel, asking the host for nothing, and ignores its late answer', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await click_button('Cancel');
+            expect(props().transform_pending).toBe(false);
+            await answer_hide(question!, [1]);
+
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(undo_labels()).toEqual([]);
+        });
+
+        it('cancels a sort and the hide beside it on Cancel, and ignores the hide\'s late answer', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await click_button('Cancel');
+            const cancel = latest_transform_request(post_message);
+            expect(cancel).toMatchObject({ intent: 'cancel', state: { sort: [] } });
+            await answer_hide(question!, [1]);
+
+            expect(latest_transform_request(post_message).requestId).toBe(cancel.requestId);
+            await install(cancel);
+            expect(undo_labels()).toEqual([]);
         });
 
         it('sends a cancel the host refused again when Cancel is pressed again', async () => {
