@@ -26558,6 +26558,69 @@ describe('view steps in history', () => {
             expect(undo_labels()).toEqual([]);
         });
 
+        it('records one step for the newer request when the reload carries it and what installed alike', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await first_installed(post_message, { sort: SORT_ASC, filters: [FILTER] });
+
+            await reload([{ sort: SORT_ASC, filters: [FILTER], schema: SCHEMA }]);
+
+            // The newer request's own target is tried first: one step with both.
+            expect(undo_labels()).toEqual(['Change view']);
+            expect(step_delta()).toMatchObject({ sort: { before: [], after: SORT_ASC }, filters: { before: [], after: [FILTER] } });
+        });
+
+        it('records nothing more, and decides no press, for a late install and settlement after the reload', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            auto_settle_transforms = false;
+            await install(sort!);
+            await reload([SORTED]);
+            expect(undo_labels()).toEqual(['Sort']);
+            auto_settle_transforms = true;
+            const restore = latest_transform_request(post_message);
+            if (restore.intent === 'restore') await install(restore);
+            // Redo has the sort, and waits behind a newer request.
+            await undo();
+            await install(latest_transform_request(post_message));
+            expect(redo_labels()).toEqual(['Sort']);
+            await ask(post_message, { sort: SORT_DESC, filters: [] });
+            await redo();
+            expect(press_held()).toBe(true);
+
+            auto_settle_transforms = false;
+            await install(sort!);
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: sort!.requestId, committedBy: sort!.requestId,
+            });
+
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Sort']);
+            expect(press_held()).toBe(true);
+        });
+
+        it('records no Clear sort that installed when the reload brings other columns', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            const clear = await ask(post_message, { sort: [], filters: [] });
+            await ask(post_message, { sort: SORT_DESC, filters: [] });
+            auto_settle_transforms = false;
+            await install(clear!);
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: clear!.requestId, committedBy: clear!.requestId,
+            });
+            const renamed = table_meta();
+            renamed.sheets[0].columnNames = ['Name', 'Amount', 'Notes'];
+
+            // The host drops rules that named the old columns: "no sort" here
+            // says nothing about the Clear sort.
+            await reload([undefined], renamed);
+
+            expect(undo_labels()).toEqual(['Sort']);
+        });
+
         it('records nothing when the reload brings other columns', async () => {
             const { post_message } = await render_app();
             await open(post_message);
