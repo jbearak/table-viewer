@@ -15112,9 +15112,8 @@ export function attach_viewer(
              * the window holds its other gestures until the answer, and records the
              * resize in undo history from it. `applied` is decided by the write alone.
              *
-             * The display→source mapping and the generation pair guarding it are the
-             * ones Hide rows used to send, before `resolveHiddenRows` moved to the
-             * sheet's mapping generation, because the request names rows in a
+             * The request quotes the core generation and the source generation, and
+             * a stale one is refused as a moved view, because it names rows in a
              * coordinate space only one specific permutation defines.
              *
              * Currency is the generation pair *plus the authority half* of

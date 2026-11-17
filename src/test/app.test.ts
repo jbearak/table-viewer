@@ -24297,6 +24297,28 @@ describe('view steps in history', () => {
             expect(warnings(post_message)).toEqual([]);
         });
 
+        it('gives the grid focus when a hide chosen in the grid installs, though a toolbar choice began the action', async () => {
+            vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+            const { post_message } = await render_app();
+            await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [], hiddenRows: [0], schema: SCHEMA }] },
+            }));
+            await install(latest_transform_request(post_message));
+
+            await click_button('Unhide all');
+            const question = await hide_rows_unanswered(post_message, [{ start: 2, end: 2 }]);
+            await answer_hide(question!, [2]);
+            const hide = latest_transform_request(post_message);
+            expect(hide.state.hiddenRows).toEqual([2]);
+            grid_shell_mock.focus_grid.mockClear();
+            await install(hide);
+            await flush_focus_restore();
+
+            await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 0);
+            expect(document.activeElement).not.toBe(document.querySelector('.toolbar'));
+        });
+
         it('refuses edits and Save while a hide resolves, and admits them once it ends', async () => {
             const { post_message } = await render_app();
             await open(post_message);

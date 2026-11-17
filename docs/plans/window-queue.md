@@ -540,6 +540,11 @@ For N2, "long" means it can exceed 1 s on a file the app supports.
    - Unhide all ends hides still resolving.
    - The host answers with every source row a hide hides, and the window sends them back in its request, as every sort or filter request already carries the hidden rows. At the limit, a million rows, that is about 7 MB each way.
    - A hide resolution with no answer after 5 s ends with "Wait for the current change to finish."
+   - Hide rows is part of the view action, so Undo and Cancel take it back while it resolves or computes, as change 2 does for a sort; the Edit menu names it ("Undo Hide row", "Undo Hide 3 rows", or "Undo Change view" beside a sort). Today a hide in flight is not cancelled, and Undo waits for its install.
+   - Edits and Save are refused while a hide resolves, as during any view request of this window (exceptions 5 and 6).
+   - A hide whose answer comes while a restore is out, or another of the checks a choice passes refuses, ends with "Wait for the table view to finish updating."
+   - A transform with more hidden rows than can be saved is refused with "Too many hidden rows to persist." Today the host cuts the list silently.
+   - While a hide's request computes, and while a Redo of a hide does, the toolbar says "Hiding rows…", not "Filtering…" or "Sorting…".
 
 Message wording stays the same. Existing messages appear in new places only in changes 2 and 5.
 

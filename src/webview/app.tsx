@@ -10824,8 +10824,9 @@ export function App(): React.JSX.Element {
                 worksheet: pending_action?.worksheet ?? worksheet,
                 schema: pending_action?.schema ?? schema,
                 initialBaseline: pending_action?.initialBaseline ?? action.baseline,
-                // The newest choice decides a press behind the action: a sort
-                // or hide refused before it no longer does (`hide_refused` goes).
+                // The newest choice decides a press behind the action: this
+                // object leaves `hide_refused` unset, so a sort or hide refused
+                // before the choice no longer drops the press.
                 refused: false,
                 origin,
             };
@@ -11034,7 +11035,9 @@ export function App(): React.JSX.Element {
             schema: pending_action?.schema ?? schema,
             initialBaseline: pending_action?.initialBaseline ?? action.baseline,
             refused: pending_action?.refused ?? false,
-            origin: pending_action?.origin ?? 'grid',
+            // Where the newest choice came from, as `handle_transform_change`
+            // records: its request installs with focus brought back there.
+            origin: 'grid',
         };
         resolution_timers_ref.current.set(request_id, window.setTimeout(() => {
             resolution_timers_ref.current.delete(request_id);

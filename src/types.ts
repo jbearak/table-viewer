@@ -4070,9 +4070,8 @@ export type WebviewMessage =
      * dragged, in the coordinates the user was looking at, and the host resolves it
      * into the canonical source rows `PerFileState.rowHeights` is keyed by.
      *
-     * `generation` and `sourceGeneration` rather than a `snapshotIdentity`, as Hide
-     * rows did before it asked by mapping generation, and the omission is deliberate
-     * rather than an economy. Those two
+     * `generation` and `sourceGeneration` rather than a `snapshotIdentity`, and the
+     * omission is deliberate rather than an economy. Those two
      * are what make a display-row interval meaningful — they identify the permutation the
      * numbers were read off — and they are the *only* thing that does. A snapshot
      * identity would add a second, stricter currency test whose failures are not about
