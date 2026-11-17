@@ -24136,6 +24136,33 @@ describe('view steps in history', () => {
             expect(props().transform_pending).toBe(false);
         });
 
+        it('ends a hide alone with no answer in time, saying so, and ignores its late answer', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const menu = () => posted(post_message, 'historyMenuStateChanged').at(-1)!.state;
+
+            vi.useFakeTimers();
+            let question: Awaited<ReturnType<typeof hide_rows_unanswered>>;
+            try {
+                question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+                await act(async () => { vi.advanceTimersByTime(4_999); });
+                expect(props().transform_pending).toBe(true);
+                expect(menu().undoLabel).toBe('Hide row');
+                await act(async () => { vi.advanceTimersByTime(1); });
+            } finally {
+                vi.useRealTimers();
+            }
+
+            expect(warnings(post_message)).toEqual(['Wait for the current change to finish.']);
+            expect(undo_labels()).toEqual([]);
+            expect(props().transform_pending).toBe(false);
+            expect(menu().undoLabel).toBeUndefined();
+            expect(document.querySelector('.toolbar-progress')).toBeNull();
+            expect(Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Cancel')).toBe(false);
+            await answer_hide(question!, [1]);
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+        });
+
         it('records a sort that installed while a hide resolved, when the hide has no answer in time', async () => {
             const { post_message } = await render_app();
             await open(post_message);

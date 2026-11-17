@@ -3297,6 +3297,20 @@ export function App(): React.JSX.Element {
      * settlement would enter history ahead of the step the person made first.
      */
     const view_action_ref = useRef<PendingViewAction | undefined>(undefined);
+    /** Per resolving hide, the timer that ends it unanswered (V2). */
+    const resolution_timers_ref = useRef(new Map<string, number>());
+    useEffect(() => () => {
+        for (const timer of resolution_timers_ref.current.values()) window.clearTimeout(timer);
+        resolution_timers_ref.current.clear();
+    }, []);
+    /** Stop the timers of hides that end without their answer: it is ignored. */
+    const clear_resolution_timers = (resolving: readonly { readonly requestId: string }[]) => {
+        for (const resolution of resolving) {
+            const timer = resolution_timers_ref.current.get(resolution.requestId);
+            if (timer !== undefined) window.clearTimeout(timer);
+            resolution_timers_ref.current.delete(resolution.requestId);
+        }
+    };
     /**
      * Whether a sort, filter, or hide choice on a sheet waits: a request is
      * pending there that is not the person's own view action's, that is a
@@ -5580,7 +5594,8 @@ export function App(): React.JSX.Element {
                         // edits, waiting to be replayed through whatever
                         // worksheet identity happened to match here.
                         // The action goes first, so the menu the cleared history
-                        // publishes does not name it.
+                        // publishes does not name it, with its hides' timers.
+                        clear_resolution_timers(view_action_ref.current?.action.resolving ?? []);
                         view_action_ref.current = undefined;
                         history_store_ref.current!.clear();
                         // An empty history does not notify, so the menu is told here.
@@ -6310,11 +6325,7 @@ export function App(): React.JSX.Element {
                             const outgoing = view_action_ref.current;
                             view_action_ref.current = undefined;
                             // Its hides go with the source they were asked of.
-                            for (const resolution of outgoing.action.resolving) {
-                                const timer = resolution_timers_ref.current.get(resolution.requestId);
-                                if (timer !== undefined) window.clearTimeout(timer);
-                                resolution_timers_ref.current.delete(resolution.requestId);
-                            }
+                            clear_resolution_timers(outgoing.action.resolving);
                             if (outgoing.action.requests.every((request) => request.settled)) {
                                 // Held open only by hides (V2): every request it sent
                                 // was settled under the old source, so it ends by V1's
@@ -8109,8 +8120,9 @@ export function App(): React.JSX.Element {
             )?.label;
         // A hide still resolving is what Undo would cancel too (V2): alone it
         // is "Hide N rows", beside a step "Change view".
+        const resolving = pending === undefined ? 0 : pending.action.resolving.length;
         const resolving_rows = pending === undefined ? 0 : view_action_resolving_rows(pending.action);
-        const pending_label = resolving_rows === 0
+        const pending_label = resolving === 0
             ? step_label
             : step_label === undefined
                 ? (resolving_rows === 1 ? 'Hide row' : `Hide ${resolving_rows} rows`)
@@ -10876,13 +10888,6 @@ export function App(): React.JSX.Element {
         ],
     );
 
-    /** Per resolving hide, the timer that ends it unanswered (V2). */
-    const resolution_timers_ref = useRef(new Map<string, number>());
-    useEffect(() => () => {
-        for (const timer of resolution_timers_ref.current.values()) window.clearTimeout(timer);
-        resolution_timers_ref.current.clear();
-    }, []);
-
     /**
      * A resolving hide is over without a choice: refused, unanswered, or its
      * composed choice not admitted. Says nothing itself. The action ends with
@@ -10930,10 +10935,7 @@ export function App(): React.JSX.Element {
         const taken = take_resolution(pending.action, msg.requestId);
         if (taken === undefined) return;
         if ('refusal' in msg) {
-            host_bridge.postMessage({
-                type: 'showWarning',
-                message: `Could not update the table view: ${msg.refusal}`,
-            });
+            show_warning(`Could not update the table view: ${msg.refusal}`);
             end_resolution(msg.requestId);
             return;
         }
@@ -11290,11 +11292,7 @@ export function App(): React.JSX.Element {
                 keep_dropped_press();
                 return;
             }
-            for (const resolution of pending.action.resolving) {
-                const timer = resolution_timers_ref.current.get(resolution.requestId);
-                if (timer !== undefined) window.clearTimeout(timer);
-                resolution_timers_ref.current.delete(resolution.requestId);
-            }
+            clear_resolution_timers(pending.action.resolving);
             const dropped = drop_resolutions(pending.action);
             view_action_ref.current = { ...pending, action: dropped };
             set_view_action_tick((tick) => tick + 1);
@@ -11575,11 +11573,7 @@ export function App(): React.JSX.Element {
         if (pending.action.cancelled && !pending.refused) return true;
         drop_history_presses({ keep_typing: true });
         // Its resolving hides go with it, and their answers are ignored (V2).
-        for (const resolution of pending.action.resolving) {
-            const timer = resolution_timers_ref.current.get(resolution.requestId);
-            if (timer !== undefined) window.clearTimeout(timer);
-            resolution_timers_ref.current.delete(resolution.requestId);
-        }
+        clear_resolution_timers(pending.action.resolving);
         // Nothing sent yet, only hides resolving: it ends here, asking the host
         // for nothing, and records nothing.
         if (pending.action.requests.length === 0) {
