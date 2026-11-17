@@ -5,12 +5,18 @@ import {
     begin_view_action,
     cancel_view_action,
     choose_in_view_action,
+    drop_resolutions,
     refresh_view_action,
+    refuse_in_view_action,
     resend_in_view_action,
+    resolve_in_view_action,
     settle_view_action,
+    take_resolution,
     transforms_semantically_equal,
     view_action_cancel_target,
+    view_action_idle,
     view_action_owns,
+    view_action_resolving_rows,
     type ViewAction,
 } from './view-action-model';
 import React, {
@@ -23,7 +29,9 @@ import React, {
 } from 'react';
 import {
     EMPTY_TRANSFORM,
+    MAX_PERSISTED_HIDDEN_ROWS,
     MAX_PERSISTED_ROW_HEIGHTS,
+    TOO_MANY_HIDDEN_ROWS_MESSAGE,
     is_range_filter_operator,
     is_wire_csv_save_rejection,
     pending_edits_for_sheet,
@@ -352,6 +360,7 @@ import {
     INSERTED_ROWS_TRANSFORM_MESSAGE,
     rule_split_warning_message,
     rule_split_warnings,
+    STRUCTURE_BUSY_MESSAGE,
 } from './row-structure-model';
 
 /**
@@ -771,6 +780,8 @@ interface ExcelHeaderQueue {
 }
 
 /** How long a header change waits for the host to acknowledge the session's publications. */
+/** How long Hide rows waits for the host to say which source rows it hides (V2). */
+const HIDE_RESOLUTION_BOUND_MS = 5_000;
 const HEADER_ACK_WAIT_MS = 15_000;
 /** After this long without a result, the person is told to reload. */
 const HEADER_RESULT_GUARD_MS = 60_000;
@@ -2341,8 +2352,9 @@ export function App(): React.JSX.Element {
      *  - A sort or filter gesture landed only if the adopted rules equal its
      *    target in every slice it changed; its step is then that difference
      *    and nothing else the refresh carried.
-     *  - A Hide rows gesture has no target this window knows, so a snapshot
-     *    cannot say whether it landed. Nothing is recorded for it.
+     *  - A gesture that hides rows names source rows, which a reload can
+     *    number anew, so a snapshot cannot say whether it landed. Nothing is
+     *    recorded for it.
      *  - A replay moves if the adopted rules hold its target; otherwise its
      *    entry stays and the person is told.
      *  - A column write landed if the sheet's adopted hidden columns are the
@@ -2386,9 +2398,12 @@ export function App(): React.JSX.Element {
                 }
                 continue;
             }
+            const hides_rows = pending.target !== undefined
+                && (pending.target.hiddenRows ?? []).some((row) => !(pending.baseline?.hiddenRows ?? []).includes(row));
             const step = sheet === undefined
                 || index === undefined
                 || pending.target === undefined
+                || hides_rows
                 || !same_columns
                 ? undefined
                 : overtaken_transform_step(
@@ -3986,6 +4001,53 @@ export function App(): React.JSX.Element {
     }, [request_transform]);
 
     /**
+     * The view action has nothing out: every request settled, no hide
+     * resolving. It records one step, from `baseline` to what is `installed`
+     * (I2), whichever ended it: the last settlement, or the end of the last
+     * resolving hide (V2).
+     */
+    const end_view_action = useCallback((
+        pending: PendingViewAction,
+        baseline: SheetTransformState | undefined,
+        installed: SheetTransformState | undefined,
+        last_request_id: string,
+    ) => {
+        view_action_ref.current = undefined;
+        perf_mark('tv:view-action-ended', { requestId: last_request_id });
+        // The progress text and Cancel go only now, after the install: a toolbar
+        // control that started the action, Cancel above all, may be what goes, so
+        // the toolbar takes focus back as it does on an install.
+        if (pending.origin === 'toolbar') {
+            set_toolbar_focus_restore({
+                sheet_index: pending.action.sheetIndex,
+                document_epoch: document_epoch_ref.current,
+            });
+        }
+        const step = transform_view_step(
+            pending.worksheet,
+            pending.schema,
+            baseline,
+            installed,
+        );
+        record_view_step(step);
+        sync_view_request_pending();
+        publish_history_menu_ref.current();
+        if (
+            step === undefined
+            && !pending.action.cancelled
+            // Moved by a change made elsewhere, by the same strict comparison
+            // that moved it (I3).
+            && (pending.refused
+                || !transform_states_equal(
+                    baseline ?? EMPTY_TRANSFORM,
+                    pending.initialBaseline ?? EMPTY_TRANSFORM,
+                ))
+        ) {
+            drop_press_behind_unrecorded_gesture();
+        }
+    }, [drop_press_behind_unrecorded_gesture, record_view_step, sync_view_request_pending]);
+
+    /**
      * The host settled one of the view action's requests. When it has settled
      * every one, the action records one step, from its baseline to what is
      * installed (I2), and a press waiting behind it is decided as today: dropped
@@ -4007,42 +4069,11 @@ export function App(): React.JSX.Element {
             if (settlement.resend && !pending.refused) send_view_action_again();
             return;
         }
-        view_action_ref.current = undefined;
-        perf_mark('tv:view-action-ended', { requestId: msg.requestId });
-        // The progress text and Cancel go only now, after the install: a toolbar
-        // control that started the action, Cancel above all, may be what goes, so
-        // the toolbar takes focus back as it does on an install.
-        if (pending.origin === 'toolbar') {
-            set_toolbar_focus_restore({
-                sheet_index: pending.action.sheetIndex,
-                document_epoch: document_epoch_ref.current,
-            });
-        }
-        const step = transform_view_step(
-            pending.worksheet,
-            pending.schema,
-            settlement.baseline,
-            settlement.installed,
-        );
-        record_view_step(step);
-        sync_view_request_pending();
-        publish_history_menu_ref.current();
-        if (
-            step === undefined
-            && !pending.action.cancelled
-            // Moved by a change made elsewhere, by the same strict comparison
-            // that moved it (I3).
-            && (pending.refused
-                || !transform_states_equal(
-                    settlement.baseline ?? EMPTY_TRANSFORM,
-                    pending.initialBaseline ?? EMPTY_TRANSFORM,
-                ))
-        ) {
-            drop_press_behind_unrecorded_gesture();
-        }
-    }, [drop_press_behind_unrecorded_gesture, record_view_step, send_view_action_again, sync_view_request_pending]);
+        end_view_action(pending, settlement.baseline, settlement.installed, msg.requestId);
+    }, [end_view_action, send_view_action_again]);
     const settle_view_action_ref = useRef(settle_view_action_answer);
     settle_view_action_ref.current = settle_view_action_answer;
+
 
     /**
      * A snapshot on the same source was applied while the view action is
@@ -6791,6 +6822,21 @@ export function App(): React.JSX.Element {
                     pending_transform_request_ids_ref.current[msg.sheetIndex]
                     !== msg.requestId
                 ) {
+                    // An older request of the view action, still computing after
+                    // a newer one was refused before it took the sheet. Nothing
+                    // more is said, as before; but what the action asks for falls
+                    // back past it, so a hide still resolving does not send it (V2).
+                    const owner = view_action_ref.current;
+                    if (owner !== undefined && view_action_owns(owner.action, msg.requestId)) {
+                        view_action_ref.current = {
+                            ...owner,
+                            action: refuse_in_view_action(
+                                owner.action,
+                                msg.requestId,
+                                state_ref.current.transforms?.[msg.sheetIndex],
+                            ),
+                        };
+                    }
                     return;
                 }
                 // A refusal means the host changed nothing, and this arm of
@@ -6916,7 +6962,18 @@ export function App(): React.JSX.Element {
                 ) {
                     // The action ends when the host settles it; what a press behind
                     // it does is decided then, by whether anything was recorded.
-                    view_action_ref.current = { ...refused_action, refused: true };
+                    // A refused choice is not asked for again (I3): what the
+                    // action asks for falls back to what is still live, which a
+                    // hide still resolving composes onto (V2).
+                    view_action_ref.current = {
+                        ...refused_action,
+                        action: refuse_in_view_action(
+                            refused_action.action,
+                            msg.requestId,
+                            state_ref.current.transforms?.[msg.sheetIndex],
+                        ),
+                        refused: true,
+                    };
                 } else if (refused_replay === undefined && refusal_origin !== 'restore') {
                     // The person's own gesture was refused, so nothing was recorded: a press
                     // held behind it was for its step, and would otherwise undo the one under it
@@ -6926,6 +6983,10 @@ export function App(): React.JSX.Element {
                 return;
             }
 
+            if (msg.type === 'hiddenRowsResolved') {
+                answer_hidden_rows_ref.current(msg);
+                return;
+            }
             if (msg.type === 'transformSettled') {
                 perf_mark('tv:view-request-settled', { requestId: msg.requestId });
                 const settled_action = view_action_ref.current;
@@ -7978,17 +8039,26 @@ export function App(): React.JSX.Element {
         const store = history_store_ref.current;
         if (store === null) return;
         const pending = view_action_ref.current;
+        const step_label = pending === undefined || pending.action.cancelled
+            ? undefined
+            : transform_view_step(
+                pending.worksheet,
+                pending.schema,
+                pending.action.baseline,
+                pending.action.requested,
+            )?.label;
+        // A hide still resolving is what Undo would cancel too (V2): alone it
+        // is "Hide N rows", beside a step "Change view".
+        const resolving_rows = pending === undefined ? 0 : view_action_resolving_rows(pending.action);
+        const pending_label = resolving_rows === 0
+            ? step_label
+            : step_label === undefined
+                ? (resolving_rows === 1 ? 'Hide row' : `Hide ${resolving_rows} rows`)
+                : 'Change view';
         const projection = history_menu_projection(
             store.snapshot(),
             edit_command_target(document.activeElement) === 'text',
-            pending === undefined || pending.action.cancelled
-                ? undefined
-                : transform_view_step(
-                    pending.worksheet,
-                    pending.schema,
-                    pending.action.baseline,
-                    pending.action.requested,
-                )?.label,
+            pending_label,
         );
         // The helper already answers false for a ref that has never been posted,
         // which is what makes the first publish happen.
@@ -9105,12 +9175,13 @@ export function App(): React.JSX.Element {
             direction === 'undo'
             && pending_action !== undefined
             && !pending_action.action.cancelled
-            && transform_view_step(
-                pending_action.worksheet,
-                pending_action.schema,
-                pending_action.action.baseline,
-                pending_action.action.requested,
-            ) !== undefined
+            && (pending_action.action.resolving.length > 0
+                || transform_view_step(
+                    pending_action.worksheet,
+                    pending_action.schema,
+                    pending_action.action.baseline,
+                    pending_action.action.requested,
+                ) !== undefined)
             && !reopen_required_ref.current
             && excel_header_queue_ref.current === null
             && pending_excel_header_ref.current === null
@@ -10719,63 +10790,199 @@ export function App(): React.JSX.Element {
         ],
     );
 
+    /** Per resolving hide, the timer that ends it unanswered (V2). */
+    const resolution_timers_ref = useRef(new Map<string, number>());
+
+    /**
+     * A resolving hide is over without a choice: refused, unanswered, or its
+     * composed choice not admitted. Says nothing itself. The action ends with
+     * it when nothing else of it is out, by the same rule as a settlement:
+     * a step from the baseline to what is installed (I2).
+     */
+    const end_resolution = useCallback((request_id: string) => {
+        const timer = resolution_timers_ref.current.get(request_id);
+        if (timer !== undefined) window.clearTimeout(timer);
+        resolution_timers_ref.current.delete(request_id);
+        const pending = view_action_ref.current;
+        if (pending === undefined) return;
+        const taken = take_resolution(pending.action, request_id);
+        if (taken === undefined) return;
+        if (!view_action_idle(taken)) {
+            view_action_ref.current = { ...pending, action: taken };
+            publish_history_menu_ref.current();
+            return;
+        }
+        // A hide that came to nothing is a refused gesture for a press behind it.
+        end_view_action(
+            { ...pending, action: taken, refused: true },
+            taken.baseline,
+            state_ref.current.transforms?.[taken.sheetIndex],
+            request_id,
+        );
+    }, [end_view_action]);
+
+    /**
+     * The host said which source rows a resolving hide hides, or why not. The
+     * rows compose onto what the action asks for and go as its newest request,
+     * a choice like any other (I6); an answer the action no longer holds, after
+     * a cancel, Unhide all, or its time, is ignored.
+     */
+    const answer_hidden_rows = useCallback((
+        msg: Extract<HostMessage, { type: 'hiddenRowsResolved' }>,
+    ) => {
+        const pending = view_action_ref.current;
+        if (pending === undefined || pending.action.sheetIndex !== msg.sheetIndex) return;
+        const taken = take_resolution(pending.action, msg.requestId);
+        if (taken === undefined) return;
+        if ('refusal' in msg) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: `Could not update the table view: ${msg.refusal}`,
+            });
+            end_resolution(msg.requestId);
+            return;
+        }
+        const hidden = [...new Set([...(taken.requested.hiddenRows ?? []), ...msg.sourceRows])]
+            .sort((a, b) => a - b);
+        if (hidden.length > MAX_PERSISTED_HIDDEN_ROWS) {
+            show_warning(TOO_MANY_HIDDEN_ROWS_MESSAGE);
+            end_resolution(msg.requestId);
+            return;
+        }
+        // The checks a choice passes before it is sent, made now that it is one.
+        const sheet_index = msg.sheetIndex;
+        if (refused_for_reopen() || inserted_rows_refuse_transform(sheet_index)) {
+            end_resolution(msg.requestId);
+            return;
+        }
+        if (view_choice_waits(sheet_index) || transform_request_blocked()) {
+            show_warning(VIEW_GESTURE_WAIT_MESSAGE);
+            end_resolution(msg.requestId);
+            return;
+        }
+        const timer = resolution_timers_ref.current.get(msg.requestId);
+        if (timer !== undefined) window.clearTimeout(timer);
+        resolution_timers_ref.current.delete(msg.requestId);
+        // Sanitized and stamped with the sheet's schema, as `handle_transform_change`
+        // does for every choice: an action begun on no rules asks for no schema.
+        const sheet = meta_ref.current?.sheets[sheet_index];
+        const requested: SheetTransformState = (sheet === undefined
+            ? undefined
+            : sanitize_transform_state(
+                { ...taken.requested, hiddenRows: hidden, schema: pending.schema },
+                sheet.columnCount,
+                pending.schema,
+                sheet.sourceRowCount,
+            )) ?? { ...taken.requested, hiddenRows: hidden, schema: pending.schema };
+        const request_id = request_transform(sheet_index, requested, 'user', pending.origin, {
+            worksheet: pending.worksheet,
+            schema: pending.schema,
+            baseline: taken.baseline,
+            target: requested,
+        });
+        view_action_ref.current = {
+            ...pending,
+            action: choose_in_view_action(taken, requested, request_id),
+            refused: false,
+        };
+        sync_view_request_pending();
+        publish_history_menu_ref.current();
+    }, [
+        end_resolution,
+        inserted_rows_refuse_transform,
+        refused_for_reopen,
+        request_transform,
+        show_warning,
+        sync_view_request_pending,
+        transform_request_blocked,
+    ]);
+    const answer_hidden_rows_ref = useRef(answer_hidden_rows);
+    answer_hidden_rows_ref.current = answer_hidden_rows;
+
+    /**
+     * Hide rows: ask the host which source rows the display rows are, as part
+     * of the sheet's view action (V2). It computes nothing; the answer is the
+     * choice. Until then the hide holds the action open, and it ends unanswered
+     * after a bound.
+     */
     const handle_hide_rows = useCallback((display_rows: DisplayRowInterval[]) => {
+        const sheet_index = active_sheet_index;
+        const sheet = meta_ref.current?.sheets[sheet_index];
+        if (sheet === undefined) return;
+        if (view_choice_waits(sheet_index)) {
+            show_warning(VIEW_GESTURE_WAIT_MESSAGE);
+            return;
+        }
         if (
-            !view_gesture_may_start(active_sheet_index)
-            || pending_transforms[active_sheet_index]
-            // The person's sort or filter may have installed and still be settling.
-            || view_action_ref.current !== undefined
-            || inserted_rows_refuse_transform(active_sheet_index)
+            !view_gesture_may_start(sheet_index)
+            || inserted_rows_refuse_transform(sheet_index)
         ) return;
+        // A choice drops a press waiting behind the action, silently (I5).
+        if (
+            view_action_ref.current?.action.sheetIndex === sheet_index
+            && held_press_ref.current !== null
+            && held_press_ref.current.typing !== true
+        ) drop_history_presses({ keep_typing: true });
+        const schema = transform_schema_for_sheet(sheet);
+        const worksheet: WorksheetTarget = {
+            sheetIndex: sheet_index,
+            sheetName: sheet.name,
+            ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+        };
         const request_id = [
-            'transform',
+            'resolve',
             transform_request_prefix_ref.current,
-            active_sheet_index,
+            sheet_index,
             ++transform_request_seq_ref.current,
         ].join(':');
-        pending_transform_request_ids_ref.current[active_sheet_index] = request_id;
-        pending_transform_states_ref.current[active_sheet_index] = undefined;
-        pending_transform_origins_ref.current[active_sheet_index] = 'grid';
-        // No target: this window sends display rows and learns the source rows
-        // it hid only from the install.
-        const hidden_sheet = meta_ref.current?.sheets[active_sheet_index];
-        pending_view_transforms_ref.current[active_sheet_index] = hidden_sheet === undefined
-            ? undefined
-            : {
-                requestId: request_id,
-                worksheet: {
-                    sheetIndex: active_sheet_index,
-                    sheetName: hidden_sheet.name,
-                    ...(hidden_sheet.worksheetId === undefined
-                        ? {}
-                        : { worksheetId: hidden_sheet.worksheetId }),
-                },
-                schema: transform_schema_for_sheet(hidden_sheet),
-                baseline: state_ref.current.transforms?.[active_sheet_index],
-            };
+        const rows = display_rows.reduce((total, interval) => total + interval.end - interval.start + 1, 0);
+        const pending_action = view_action_ref.current?.action.sheetIndex === sheet_index
+            ? view_action_ref.current
+            : undefined;
+        const action = pending_action?.action ?? begin_view_action(
+            sheet_index,
+            schema,
+            state_ref.current.transforms?.[sheet_index],
+        );
+        view_action_ref.current = {
+            action: resolve_in_view_action(action, request_id, rows),
+            worksheet: pending_action?.worksheet ?? worksheet,
+            schema: pending_action?.schema ?? schema,
+            initialBaseline: pending_action?.initialBaseline ?? action.baseline,
+            refused: pending_action?.refused ?? false,
+            origin: pending_action?.origin ?? 'grid',
+        };
+        // Nothing of the action is out but this: the toolbar says so.
+        if (pending_transform_request_ids_ref.current[sheet_index] === undefined) {
+            set_pending_transform_labels((prev) => {
+                const next = [...prev];
+                next[sheet_index] = 'Hiding rows…';
+                return next;
+            });
+        }
+        resolution_timers_ref.current.set(request_id, window.setTimeout(() => {
+            resolution_timers_ref.current.delete(request_id);
+            const still = view_action_ref.current;
+            if (still === undefined || take_resolution(still.action, request_id) === undefined) return;
+            show_warning(STRUCTURE_BUSY_MESSAGE);
+            end_resolution(request_id);
+        }, HIDE_RESOLUTION_BOUND_MS));
         sync_view_request_pending();
-        set_pending_transforms((prev) => {
-            const next = [...prev];
-            next[active_sheet_index] = true;
-            return next;
-        });
-        set_pending_transform_labels((prev) => {
-            const next = [...prev];
-            next[active_sheet_index] = 'Hiding rows…';
-            return next;
-        });
+        publish_history_menu_ref.current();
         host_bridge.postMessage({
-            type: 'hideRows',
-            sheetIndex: active_sheet_index,
+            type: 'resolveHiddenRows',
+            sheetIndex: sheet_index,
             displayRows: display_rows,
             requestId: request_id,
-            generation: generation_ref.current,
+            mappingGeneration: mapping_generations_ref.current[sheet_index] ?? generation_ref.current,
             sourceGeneration: source_generation_ref.current,
         });
     }, [
         active_sheet_index,
+        drop_history_presses,
+        end_resolution,
         inserted_rows_refuse_transform,
-        pending_transforms,
+        show_warning,
         sync_view_request_pending,
         view_gesture_may_start,
     ]);
@@ -10949,19 +11156,57 @@ export function App(): React.JSX.Element {
             });
             return;
         }
+        // Unhide all ends every hide still resolving on its sheet (V2): once it
+        // is admitted, as a choice that never happened drops nothing, and before
+        // the test that skips a choice equal to the rules asked for, which
+        // would leave the hides out.
+        const pending = view_action_ref.current;
+        if (pending?.action.sheetIndex === active_sheet_index && pending.action.resolving.length > 0) {
+            if (view_choice_waits(active_sheet_index)) {
+                show_warning(VIEW_GESTURE_WAIT_MESSAGE);
+                return;
+            }
+            if (!view_gesture_may_start(active_sheet_index)) return;
+            for (const resolution of pending.action.resolving) {
+                const timer = resolution_timers_ref.current.get(resolution.requestId);
+                if (timer !== undefined) window.clearTimeout(timer);
+                resolution_timers_ref.current.delete(resolution.requestId);
+            }
+            const dropped = drop_resolutions(pending.action);
+            view_action_ref.current = { ...pending, action: dropped };
+            publish_history_menu_ref.current();
+        }
         // Composed onto the rules asked for, so a sort or filter in flight is kept (I6).
         const current = pending_transform_states_ref.current[active_sheet_index]
             ?? state_ref.current.transforms?.[active_sheet_index]
             ?? transforms[active_sheet_index]
             ?? EMPTY_TRANSFORM;
         const { hiddenRows: _hidden_rows, ...next } = current;
-        handle_transform_change(next, 'toolbar');
+        const sent = handle_transform_change(next, 'toolbar');
+        // Nothing sent, and the hides it ended were all the action had out.
+        const after = view_action_ref.current;
+        if (
+            !sent
+            && after !== undefined
+            && after.action.sheetIndex === active_sheet_index
+            && view_action_idle(after.action)
+        ) {
+            end_view_action(
+                after,
+                after.action.baseline,
+                state_ref.current.transforms?.[active_sheet_index],
+                after.action.requests.at(-1)?.requestId ?? 'unhide-all',
+            );
+        }
     }, [
         active_sheet_index,
+        end_view_action,
         enqueue_excel_header_change,
         handle_transform_change,
         meta,
+        show_warning,
         transforms,
+        view_gesture_may_start,
     ]);
 
     const handle_grid_transform_change = useCallback(
@@ -11206,6 +11451,24 @@ export function App(): React.JSX.Element {
         // A cancel already out is not sent twice; one the host refused is sent again.
         if (pending.action.cancelled && !pending.refused) return true;
         drop_history_presses({ keep_typing: true });
+        // Its resolving hides go with it, and their answers are ignored (V2).
+        for (const resolution of pending.action.resolving) {
+            const timer = resolution_timers_ref.current.get(resolution.requestId);
+            if (timer !== undefined) window.clearTimeout(timer);
+            resolution_timers_ref.current.delete(resolution.requestId);
+        }
+        // Nothing sent yet, only hides resolving: it ends here, asking the host
+        // for nothing, and records nothing.
+        if (pending.action.requests.length === 0) {
+            const installed = state_ref.current.transforms?.[sheet_index];
+            end_view_action(
+                { ...pending, action: { ...pending.action, cancelled: true, resolving: [] }, origin },
+                installed,
+                installed,
+                pending.action.resolving.at(-1)?.requestId ?? '',
+            );
+            return true;
+        }
         // An action with no step asks for nothing but its baseline and a compare
         // toggle, so the toggle is what its cancel takes back (I4 keeps it
         // otherwise). That is the net effect: a sort chosen and cleared again,
@@ -11231,7 +11494,7 @@ export function App(): React.JSX.Element {
         };
         publish_history_menu_ref.current();
         return true;
-    }, [drop_history_presses, request_transform]);
+    }, [drop_history_presses, end_view_action, request_transform]);
 
     cancel_view_action_ref.current = cancel_view_action_on_sheet;
     cancel_blocked_ref.current = cancel_blocked;
