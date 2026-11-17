@@ -12,6 +12,12 @@ import {
     view_action_delta,
     view_action_in_flight,
     view_action_owns,
+    resolve_in_view_action,
+    take_resolution,
+    drop_resolutions,
+    view_action_idle,
+    view_action_resolving_rows,
+    refuse_in_view_action,
 } from '../webview/view-action-model';
 import { transform_view_step } from '../webview/view-history-model';
 
@@ -76,6 +82,30 @@ describe('merging deltas', () => {
             filters: [filter('f2', 1, 'b')],
             hiddenRows: [2, 3],
         }));
+    });
+
+    // Up to the persisted limit of hidden rows in one action: linear, not a
+    // scan of one list per row of the other, which would not finish here.
+    const ROWS = 300_000;
+    const range = (start: number, length: number) => Array.from({ length }, (_row, index) => start + index);
+
+    it('composes two large hides', () => {
+        const first = range(0, ROWS);
+        const second = range(ROWS, ROWS);
+        const earlier = view_action_delta(rules({}), rules({ hiddenRows: first }));
+        const next = view_action_delta(rules({ hiddenRows: first }), rules({ hiddenRows: [...first, ...second] }));
+        const merged = merge_view_action_delta(earlier, next);
+        expect(merged.hidden).toHaveLength(2 * ROWS);
+        expect(merged.shown).toEqual([]);
+    });
+
+    it('clears a large hide with Unhide all', () => {
+        const rows = range(0, ROWS);
+        const earlier = view_action_delta(rules({}), rules({ hiddenRows: rows }));
+        const next = view_action_delta(rules({ hiddenRows: rows }), rules({}));
+        const merged = merge_view_action_delta(earlier, next);
+        expect(merged.hidden).toEqual([]);
+        expect(apply_view_action_delta(merged, rules({}), schema)).toEqual(rules({}));
     });
 });
 
@@ -285,5 +315,201 @@ describe('a view action', () => {
         expect(settle_view_action(action, 'restore', by_b, undefined)).toEqual({
             kind: 'pending', action, resend: false,
         });
+    });
+});
+
+describe('a hide resolving in a view action', () => {
+    it('keeps a refused cancel\'s rules when a hide was chosen after it, the cancelled sort still out', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'R1');
+        action = cancel_view_action(action, 'R2');
+        action = resolve_in_view_action(action, 'H', 1);
+        // Refused before it took the sheet: R1 is still out.
+        action = refuse_in_view_action(action, 'R2', undefined);
+
+        // The hide composes onto the baseline the cancel asked for, not onto
+        // the sort it cancelled.
+        expect(action.requested.sort).toEqual([]);
+        expect(action.delta.sort).toBeUndefined();
+    });
+
+    for (const hide_first of [false, true]) {
+        it(`keeps the rules of a cancel sent again onto a moved baseline when it is refused, a hide chosen ${hide_first ? 'before' : 'after'} the move`, () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'R1');
+        action = cancel_view_action(action, 'R2');
+        if (hide_first) action = resolve_in_view_action(action, 'H', 1);
+        action = refresh_view_action(action, filtered, undefined).action;
+        action = resend_in_view_action(action, 'R3');
+        // The sort R1 asked for installed onto the other window's filter, and
+        // R2 was superseded: what is installed is the sort the cancel takes back.
+        const sorted = rules({ sort: by_a.sort, filters: filtered.filters });
+        let settled = settle_view_action(action, 'R1', sorted, 'R1');
+        if (settled.kind !== 'pending') throw new Error('unreachable');
+        settled = settle_view_action(settled.action, 'R2', sorted, 'R1');
+        if (settled.kind !== 'pending') throw new Error('unreachable');
+        action = hide_first ? settled.action : resolve_in_view_action(settled.action, 'H', 1);
+        action = refuse_in_view_action(action, 'R3', sorted);
+
+        expect(action.requested.sort).toEqual([]);
+        expect(action.requested.filters).toEqual(filtered.filters);
+        });
+    }
+
+    it('keeps another window\'s change when the request sent again onto it is refused', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'A');
+        action = resolve_in_view_action(action, 'H', 1);
+        const refreshed = refresh_view_action(action, filtered, undefined);
+        action = resend_in_view_action(refreshed.action, 'A2');
+        // Refused before it took the sheet: A is still out, and still the choice.
+        action = refuse_in_view_action(action, 'A2', filtered);
+
+        expect(action.requested).toEqual(rules({
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [filter('f1', 2, 'x')],
+        }));
+        expect(action.delta.removals).toEqual([]);
+    });
+
+    it('falls back onto the moved baseline past a newer choice refused after a refresh', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'A');
+        action = resolve_in_view_action(action, 'H', 1);
+        action = refresh_view_action(action, filtered, undefined).action;
+        action = resend_in_view_action(action, 'A2');
+        action = choose_in_view_action(action, rules({ ...by_b, filters: filtered.filters }), 'B');
+        action = refuse_in_view_action(action, 'B', filtered);
+
+        // A2, still out, carries the sort onto the other window's filter.
+        expect(action.requested).toEqual(rules({
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [filter('f1', 2, 'x')],
+        }));
+    });
+
+    it('keeps the action from ending until it is answered, though its other request settled', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'A');
+        action = resolve_in_view_action(action, 'H', 2);
+        const settled = settle_view_action(action, 'A', by_a, 'A');
+        expect(settled).toMatchObject({ kind: 'pending', resend: false });
+        if (settled.kind !== 'pending') throw new Error('unreachable');
+        expect(view_action_idle(settled.action)).toBe(false);
+        expect(view_action_resolving_rows(settled.action)).toBe(2);
+        const answered = take_resolution(settled.action, 'H')!;
+        expect(view_action_idle(answered)).toBe(true);
+    });
+
+    it('answers only a hide the action still holds', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = resolve_in_view_action(action, 'H', 1);
+        expect(take_resolution(action, 'other')).toBeUndefined();
+        expect(take_resolution(drop_resolutions(action), 'H')).toBeUndefined();
+        expect(take_resolution(cancel_view_action(action, 'C'), 'H')).toBeUndefined();
+    });
+
+    it('keeps the toggle a cancel kept when a hide made after it meets a change made elsewhere', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, { ...by_a, onlyChangedRows: true }, 'A');
+        action = cancel_view_action(action, 'C');
+        action = resolve_in_view_action(action, 'H', 1);
+        const moved = refresh_view_action(action, filtered, undefined);
+        expect(moved.action.requested).toEqual({ ...filtered, onlyChangedRows: true });
+    });
+
+    it('is a choice after a cancel: the action is no longer cancelled', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'A');
+        action = cancel_view_action(action, 'C');
+        action = resolve_in_view_action(action, 'H', 1);
+        expect(action.cancelled).toBe(false);
+        expect(action.requested).toEqual(rules({}));
+    });
+
+    it('composes its answer onto what is installed, not onto a sort the host refused', () => {
+        let action = begin_view_action(0, schema, filtered);
+        action = resolve_in_view_action(action, 'H', 1);
+        action = choose_in_view_action(action, { ...filtered, sort: by_a.sort }, 'S');
+        action = refuse_in_view_action(action, 'S', filtered);
+        expect(action.requested).toEqual(filtered);
+        const answered = take_resolution(action, 'H')!;
+        expect(apply_view_action_delta(answered.delta, filtered, schema)).toEqual(filtered);
+    });
+
+    it('composes its answer onto an older request still out when the newer is refused', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'A');
+        action = resolve_in_view_action(action, 'H', 1);
+        action = choose_in_view_action(action, by_b, 'B');
+        action = refuse_in_view_action(action, 'B', undefined);
+        expect(action.requested).toEqual(by_a);
+    });
+
+    it('falls back past an older request the host refuses after the newer one', () => {
+        // A is out, H resolves, B is refused (back to A), then A is refused.
+        let action = begin_view_action(0, schema, filtered);
+        action = choose_in_view_action(action, { ...filtered, sort: by_a.sort }, 'A');
+        action = resolve_in_view_action(action, 'H', 1);
+        action = choose_in_view_action(action, { ...filtered, sort: by_b.sort }, 'B');
+        action = refuse_in_view_action(action, 'B', filtered);
+        expect(action.requested.sort).toEqual(by_a.sort);
+        action = refuse_in_view_action(action, 'A', filtered);
+        expect(action.requested).toEqual(filtered);
+        expect(apply_view_action_delta(take_resolution(action, 'H')!.delta, filtered, schema)).toEqual(filtered);
+    });
+
+    it('falls back to what is installed when the older request is refused first, then the newer', () => {
+        let action = begin_view_action(0, schema, filtered);
+        action = choose_in_view_action(action, { ...filtered, sort: by_a.sort }, 'A');
+        action = resolve_in_view_action(action, 'H', 1);
+        action = choose_in_view_action(action, { ...filtered, sort: by_b.sort }, 'B');
+        action = refuse_in_view_action(action, 'A', filtered);
+        expect(action.requested.sort).toEqual(by_b.sort);
+        action = refuse_in_view_action(action, 'B', filtered);
+        expect(action.requested).toEqual(filtered);
+    });
+
+    it('keeps what it asks for when a request it no longer asks for is refused', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'A');
+        action = choose_in_view_action(action, by_b, 'B');
+        expect(refuse_in_view_action(action, 'A', undefined).requested).toEqual(by_b);
+    });
+
+    it('keeps a refused cancel\'s rules, which Cancel sends again', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, { ...by_a, onlyChangedRows: true }, 'A');
+        action = cancel_view_action(action, 'C');
+        const refused = refuse_in_view_action(action, 'C', undefined);
+        expect(refused.requested).toEqual(action.requested);
+        expect(refused.cancelled).toBe(true);
+    });
+
+    it('recomposes what it asks for onto a change made elsewhere while only a hide resolves', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'A');
+        const settled = settle_view_action(resolve_in_view_action(action, 'H', 1), 'A', by_a, 'A');
+        if (settled.kind !== 'pending') throw new Error('unreachable');
+        // Its sort has settled; another window adds a filter.
+        const moved = refresh_view_action(settled.action, { ...by_a, filters: filtered.filters }, undefined);
+        expect(moved.resend).toBe(false);
+        expect(moved.action.requested).toEqual({ ...by_a, filters: filtered.filters });
+        // A hide alone, before anything was sent.
+        const alone = refresh_view_action(resolve_in_view_action(begin_view_action(0, schema, undefined), 'H', 1), filtered, undefined);
+        expect(alone).toMatchObject({ resend: false, action: { requested: filtered } });
+    });
+
+    it('composes its answer as a choice that replaces the request in flight', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'A');
+        action = resolve_in_view_action(action, 'H', 1);
+        const answered = take_resolution(action, 'H')!;
+        action = choose_in_view_action(answered, { ...answered.requested, hiddenRows: [4] }, 'A+H');
+        // A is settled when A+H takes the sheet, before it installed.
+        let outcome = settle_view_action(action, 'A', undefined, undefined);
+        if (outcome.kind !== 'pending') throw new Error('unreachable');
+        outcome = settle_view_action(outcome.action, 'A+H', { ...by_a, hiddenRows: [4] }, 'A+H');
+        expect(outcome).toEqual({ kind: 'ended', baseline: undefined, installed: { ...by_a, hiddenRows: [4] } });
     });
 });

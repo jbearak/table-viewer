@@ -3943,6 +3943,49 @@ describe('Excel first-row header toggle', () => {
         expect((grid_shell_mock.latest_props as unknown as GridShellProps).history_press_held?.()).toBe(true);
     });
 
+    it('queues an Unhide all of a promoted header behind a hide still resolving, which composes first', async () => {
+        const { post_message } = await render_app();
+        const meta = excel_meta(true, 'on');
+        meta.sheets[0].sourceRowCount = 4;
+        meta.sheets[0].excelFirstRowHeader = {
+            ...meta.sheets[0].excelFirstRowHeader!,
+            sourceRow: 2,
+        };
+        const transform: SheetTransformState = {
+            sort: [],
+            filters: [],
+            hiddenRows: [0, 1],
+            schema: '["People",2,["Name","Age"]]',
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: { transforms: [transform] },
+            generation: 3,
+            sourceGeneration: 5,
+        }));
+        await acknowledge_transform(latest_transform_request(post_message), 4);
+        const props = () => grid_shell_mock.latest_props as unknown as GridShellProps;
+        await act(async () => props().on_hide_rows?.([{ start: 0, end: 0 }]));
+        const question = post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: 'resolveHiddenRows' }> => (
+                message.type === 'resolveHiddenRows'
+            )).at(-1)!;
+        // The header run waits for the action the hide is part of.
+        await click_button('Unhide all');
+        const header_requests = () => post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'setExcelFirstRowHeader');
+        expect(header_requests()).toEqual([]);
+
+        await dispatch_host_message({
+            type: 'hiddenRowsResolved', sheetIndex: 0, requestId: question.requestId, sourceRows: [3],
+        });
+        const hide = latest_transform_request(post_message);
+        expect(hide.state.hiddenRows).toEqual([0, 1, 3]);
+        expect(header_requests()).toEqual([]);
+        await acknowledge_transform(hide, 5);
+
+        await vi.waitFor(() => expect(header_requests()).toHaveLength(1));
+    });
+
     it('keeps a row-zero header active when Unhide all clears other hidden rows', async () => {
         const { post_message } = await render_app();
         const meta = excel_meta(true, 'on');
@@ -23356,14 +23399,51 @@ describe('view steps in history', () => {
         return request!;
     }
 
+    /**
+     * Hide rows (V2): the window asks which source rows the display rows are,
+     * and the host's answer, `source_rows` or else the display rows themselves,
+     * becomes the action's request. Returns that request, or undefined when
+     * nothing was sent. `hide_rows_unanswered` leaves the question open.
+     */
     async function hide_rows(
         post_message: ReturnType<typeof vi.fn>,
         display_rows: { start: number; end: number }[],
+        source_rows?: number[],
     ) {
-        const before = posted(post_message, 'hideRows').length;
+        const before = posted(post_message, 'resolveHiddenRows').length;
         await act(async () => props().on_hide_rows?.(display_rows));
-        const requests = posted(post_message, 'hideRows');
-        return requests.length > before ? requests.at(-1)! : undefined;
+        const questions = posted(post_message, 'resolveHiddenRows');
+        if (questions.length <= before) return undefined;
+        const question = questions.at(-1)!;
+        const requests_before = posted(post_message, 'setTransform').length;
+        await answer_hide(question, source_rows ?? display_rows.flatMap(({ start, end }) => (
+            Array.from({ length: end - start + 1 }, (_row, index) => start + index)
+        )));
+        const requests = posted(post_message, 'setTransform');
+        return requests.length > requests_before ? requests.at(-1)! : undefined;
+    }
+
+    /** Ask which source rows the display rows are, and leave it unanswered. */
+    async function hide_rows_unanswered(
+        post_message: ReturnType<typeof vi.fn>,
+        display_rows: { start: number; end: number }[],
+    ) {
+        const before = posted(post_message, 'resolveHiddenRows').length;
+        await act(async () => props().on_hide_rows?.(display_rows));
+        const questions = posted(post_message, 'resolveHiddenRows');
+        return questions.length > before ? questions.at(-1)! : undefined;
+    }
+
+    async function answer_hide(
+        question: { sheetIndex: number; requestId: string },
+        answer: number[] | string,
+    ) {
+        await dispatch_host_message({
+            type: 'hiddenRowsResolved',
+            sheetIndex: question.sheetIndex,
+            requestId: question.requestId,
+            ...(typeof answer === 'string' ? { refusal: answer } : { sourceRows: answer }),
+        } as HostMessage);
     }
 
     async function refuse(
@@ -23385,7 +23465,7 @@ describe('view steps in history', () => {
     // action, which a new choice joins, Undo or Cancel takes back, and which
     // records its step only when the host has settled everything it sent.
     describe('a view action', () => {
-        it('keeps sort and filter controls enabled while the person\'s own request is in flight, and holds them for a hide', async () => {
+        it('keeps sort and filter controls enabled while the person\'s own request is in flight, a hide included', async () => {
             const { post_message } = await render_app();
             await open(post_message);
 
@@ -23396,10 +23476,12 @@ describe('view steps in history', () => {
             expect(props().pending_transform_target?.sort).toEqual(SORT_ASC);
             await install(request!);
 
+            // A hide is a choice of the action too (V2): one in flight holds no choice.
             expect(await hide_rows(post_message, [{ start: 0, end: 1 }])).toBeDefined();
-            expect(props().transform_choice_pending).toBe(true);
-            expect(await ask(post_message, { sort: [], filters: [FILTER] })).toBeUndefined();
-            expect(warnings(post_message)).toEqual(['Wait for the table view to finish updating.']);
+            expect(props().transform_choice_pending).toBe(false);
+            expect(await ask(post_message, { sort: [], filters: [FILTER] }))
+                .toMatchObject({ intent: 'user', state: { sort: [], filters: [FILTER] } });
+            expect(warnings(post_message)).toEqual([]);
         });
 
         it('keeps a sort when a filter is chosen while it computes, and records both as one step', async () => {
@@ -23832,9 +23914,10 @@ describe('view steps in history', () => {
             const second = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
             await refuse(second!);
 
-            // The first still computes: the indicator, Cancel, and the held cells stay.
+            // The first still computes: the indicator, named for it, Cancel,
+            // and the held cells stay.
             expect(props().transform_pending).toBe(true);
-            expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Applying sort & filters…');
+            expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Sorting…');
             expect(cells_editable()).toEqual(HELD);
             await install(first!);
 
@@ -23859,18 +23942,905 @@ describe('view steps in history', () => {
             expect(cells_editable()).toEqual(EDITABLE);
         });
 
-        it('sends no Hide rows while an older request of the action still computes', async () => {
+        it('composes a hide onto the older request still computing, not the newer one refused', async () => {
             const { post_message } = await render_app();
             await open(post_message);
 
             const first = await ask(post_message, { sort: SORT_ASC, filters: [] });
             const second = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
             await refuse(second!);
-            await act(async () => props().on_hide_rows?.([{ start: 0, end: 0 }]));
+            const hide = await hide_rows(post_message, [{ start: 0, end: 0 }]);
 
-            expect(post_message.mock.calls.some(([message]) => message?.type === 'hideRows')).toBe(false);
+            expect(hide).toMatchObject({ intent: 'user', state: { sort: SORT_ASC, filters: [], hiddenRows: [0] } });
+            await install(hide!);
+            expect(undo_labels()).toEqual(['Change view']);
+            // A new request, composed onto the older one's rules.
+            expect(hide!.requestId).not.toBe(first!.requestId);
+        });
+
+        it('keeps a sort when Hide rows is chosen while it computes, and records both as one step', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 2 }]);
+            expect(question).toMatchObject({ type: 'resolveHiddenRows', displayRows: [{ start: 1, end: 2 }] });
+            expect(props().transform_choice_pending).toBe(false);
+            expect(posted(post_message, 'historyMenuStateChanged').at(-1)?.state.undoLabel).toBe('Change view');
+            await answer_hide(question!, [3, 5]);
+            const both = latest_transform_request(post_message);
+            expect(both).toMatchObject({ intent: 'user', state: { sort: SORT_ASC, hiddenRows: [3, 5] } });
+            await install(both);
+
+            expect(undo_labels()).toEqual(['Change view']);
+            expect(both.requestId).not.toBe(sort!.requestId);
+            await undo();
+            const undone = latest_transform_request(post_message);
+            expect(undone.state).toMatchObject({ sort: [] });
+            expect(undone.state.hiddenRows ?? []).toEqual([]);
+        });
+
+        it('keeps Hide rows when a sort is chosen while it resolves', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const question = await hide_rows_unanswered(post_message, [{ start: 0, end: 0 }]);
+            expect(posted(post_message, 'historyMenuStateChanged').at(-1)?.state.undoLabel).toBe('Hide row');
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            expect(sort!.state.hiddenRows ?? []).toEqual([]);
+            await answer_hide(question!, [2]);
+            const both = latest_transform_request(post_message);
+            expect(both.state).toMatchObject({ sort: SORT_ASC, hiddenRows: [2] });
+            await install(both);
+
+            expect(undo_labels()).toEqual(['Change view']);
+        });
+
+        it('sends nothing for a second hide of rows the first already asks to hide', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const first = await hide_rows(post_message, [{ start: 1, end: 1 }]);
+            // The grid still shows the old rows, so the same row is offered again.
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await answer_hide(question!, [1]);
+
+            expect(latest_transform_request(post_message).requestId).toBe(first!.requestId);
+            expect(warnings(post_message)).toEqual([]);
             await install(first!);
+            expect(undo_labels()).toEqual(['Hide row']);
+        });
+
+        it('composes two hides that resolve together', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const first = await hide_rows_unanswered(post_message, [{ start: 0, end: 0 }]);
+            const second = await hide_rows_unanswered(post_message, [{ start: 4, end: 5 }]);
+            expect(posted(post_message, 'historyMenuStateChanged').at(-1)?.state.undoLabel).toBe('Hide 3 rows');
+            await answer_hide(second!, [4, 5]);
+            await answer_hide(first!, [0]);
+            const both = latest_transform_request(post_message);
+            expect(both.state.hiddenRows).toEqual([0, 4, 5]);
+            await install(both);
+
+            expect(undo_labels()).toEqual(['Hide 3 rows']);
+        });
+
+        it('ends Hide rows alone on Undo, asking the host for nothing, and ignores its late answer', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            post_message.mockClear();
+
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            expect(cells_editable()).toEqual(HELD);
+            await undo();
+
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(props().transform_pending).toBe(false);
             expect(undo_labels()).toEqual(['Sort']);
+            expect(cells_editable()).toEqual(EDITABLE);
+            await answer_hide(question!, [1]);
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+        });
+
+        it.each([
+            ['a sort, then a hide', true],
+            ['a hide, then a sort', false],
+        ])('cancels %s on Undo, and ignores the hide\'s late answer', async (_name, sort_first) => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            if (sort_first) await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            if (!sort_first) await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await undo();
+            const cancel = latest_transform_request(post_message);
+            expect(cancel).toMatchObject({ intent: 'cancel', state: { sort: [] } });
+            await answer_hide(question!, [1]);
+            expect(latest_transform_request(post_message).requestId).toBe(cancel.requestId);
+            await install(cancel);
+
+            expect(undo_labels()).toEqual([]);
+        });
+
+        it.each([
+            ['Undo', () => undo()],
+            ['Cancel', () => click_button('Cancel')],
+        ])('cancels again on %s a hide made after a cancel', async (_name, cancel_again) => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await undo();
+            const first_cancel = latest_transform_request(post_message);
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await cancel_again();
+            const second_cancel = latest_transform_request(post_message);
+            expect(second_cancel).toMatchObject({ intent: 'cancel' });
+            expect(second_cancel.requestId).not.toBe(first_cancel.requestId);
+            await answer_hide(question!, [1]);
+            expect(latest_transform_request(post_message).requestId).toBe(second_cancel.requestId);
+        });
+
+        it('ends a resolving hide on Unhide all, whose answer is then ignored', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await install((await hide_rows(post_message, [{ start: 0, end: 0 }]))!);
+
+            const question = await hide_rows_unanswered(post_message, [{ start: 3, end: 3 }]);
+            await click_button('Unhide all');
+            const unhide = latest_transform_request(post_message);
+            expect(unhide.state.hiddenRows ?? []).toEqual([]);
+            await answer_hide(question!, [3]);
+            expect(latest_transform_request(post_message).requestId).toBe(unhide.requestId);
+            await install(unhide);
+
+            expect(undo_labels()).toEqual(['Hide row', 'Unhide rows']);
+        });
+
+        it('ends a resolving hide on an Unhide all that asks for what is asked for already', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await install((await hide_rows(post_message, [{ start: 0, end: 0 }]))!);
+
+            await click_button('Unhide all');
+            const unhide = latest_transform_request(post_message);
+            const question = await hide_rows_unanswered(post_message, [{ start: 3, end: 3 }]);
+            // The rules asked for already show every row: this Unhide all asks
+            // for nothing new, and still ends the hide.
+            await click_button('Unhide all');
+            await answer_hide(question!, [3]);
+
+            expect(latest_transform_request(post_message).requestId).toBe(unhide.requestId);
+            await install(unhide);
+            expect(undo_labels()).toEqual(['Hide row', 'Unhide rows']);
+            expect(props().transform_pending).toBe(false);
+        });
+
+        it('records a sort that installed while a hide resolved, when the host then refuses the hide', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await install(sort!);
+            expect(props().transform_pending).toBe(true);
+            expect(undo_labels()).toEqual([]);
+            await answer_hide(question!, 'The view changed before this table view request arrived.');
+
+            expect(warnings(post_message)).toEqual([
+                'Could not update the table view: The view changed before this table view request arrived.',
+            ]);
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(props().transform_pending).toBe(false);
+        });
+
+        it('ends a hide alone with no answer in time, saying so, and ignores its late answer', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const menu = () => posted(post_message, 'historyMenuStateChanged').at(-1)!.state;
+
+            vi.useFakeTimers();
+            let question: Awaited<ReturnType<typeof hide_rows_unanswered>>;
+            try {
+                question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+                await act(async () => { vi.advanceTimersByTime(4_999); });
+                expect(props().transform_pending).toBe(true);
+                expect(menu().undoLabel).toBe('Hide row');
+                await act(async () => { vi.advanceTimersByTime(1); });
+            } finally {
+                vi.useRealTimers();
+            }
+
+            expect(warnings(post_message)).toEqual(['Wait for the current change to finish.']);
+            expect(undo_labels()).toEqual([]);
+            expect(props().transform_pending).toBe(false);
+            expect(menu().undoLabel).toBeUndefined();
+            expect(document.querySelector('.toolbar-progress')).toBeNull();
+            expect(Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Cancel')).toBe(false);
+            await answer_hide(question!, [1]);
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+        });
+
+        it('records a sort that installed while a hide resolved, when the hide has no answer in time', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            vi.useFakeTimers();
+            let question: Awaited<ReturnType<typeof hide_rows_unanswered>>;
+            try {
+                question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+                await install(sort!);
+                await act(async () => { vi.advanceTimersByTime(4_999); });
+                expect(undo_labels()).toEqual([]);
+                await act(async () => { vi.advanceTimersByTime(1); });
+            } finally {
+                vi.useRealTimers();
+            }
+
+            expect(warnings(post_message)).toEqual(['Wait for the current change to finish.']);
+            expect(undo_labels()).toEqual(['Sort']);
+            const sent = posted(post_message, 'setTransform').length;
+            await answer_hide(question!, [1]);
+            expect(posted(post_message, 'setTransform')).toHaveLength(sent);
+        });
+
+        for (const terminal of [false, true]) {
+            it(`sends a hide alone onto what is installed after the sort chosen during it is refused${terminal ? ' terminally' : ''}`, async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await change_view(post_message, { sort: [], filters: [FILTER] });
+
+                const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+                const sort = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+                await refuse(sort!, 'The file is being saved.', terminal);
+                await answer_hide(question!, [1]);
+
+                const hide = latest_transform_request(post_message);
+                expect(hide.state).toMatchObject({ sort: [], filters: [FILTER], hiddenRows: [1] });
+                await install(hide);
+                expect(undo_labels()).toEqual(['Filter', 'Hide row']);
+            });
+        }
+
+        for (const terminal of [false, true]) {
+            it(`sends a hide alone when the sorts before and after it are both refused${terminal ? ' terminally' : ''}`, async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                await change_view(post_message, { sort: [], filters: [FILTER] });
+
+                const older = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+                const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+                const newer = await ask(post_message, { sort: [{ colIndex: 1, direction: 'desc' }], filters: [FILTER] });
+                await refuse(newer!, 'The file is being saved.', terminal);
+                await refuse(older!, 'The file is being saved.', terminal);
+                await answer_hide(question!, [1]);
+
+                const hide = latest_transform_request(post_message);
+                expect(hide.state).toMatchObject({ sort: [], filters: [FILTER], hiddenRows: [1] });
+                await install(hide);
+                expect(undo_labels()).toEqual(['Filter', 'Hide row']);
+            });
+        }
+
+        it('composes a hide alone onto another window\'s change made while it resolved', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [FILTER], schema: SCHEMA }] },
+            }));
+            // The window installs the other window's rules, as today.
+            const restore = latest_transform_request(post_message);
+            expect(restore.intent).toBe('restore');
+            await install(restore);
+            const before = posted(post_message, 'setTransform').filter((sent) => sent.intent === 'user').length;
+            await answer_hide(question!, [1]);
+
+            const user = posted(post_message, 'setTransform').filter((sent) => sent.intent === 'user');
+            expect(user).toHaveLength(before + 1);
+            expect(user.at(-1)!.state).toMatchObject({ filters: [FILTER], hiddenRows: [1] });
+        });
+
+        it('keeps another window\'s filter in a hide\'s answer when the sort sent again onto it is refused', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [FILTER], schema: SCHEMA }] },
+            }));
+            const sent = posted(post_message, 'setTransform');
+            const again = sent.filter((request) => request.intent === 'user').at(-1)!;
+            expect(again.requestId).not.toBe(sort!.requestId);
+            expect(again.state).toMatchObject({ sort: SORT_ASC, filters: [FILTER] });
+            // The action sends its sort again onto the filter, and nothing else.
+            expect(sent.filter((request) => request.intent === 'restore')).toEqual([]);
+            // Refused before it took the sheet: the first sort is still out.
+            await refuse(again);
+            await answer_hide(question!, [1]);
+
+            expect(latest_transform_request(post_message).state)
+                .toMatchObject({ sort: SORT_ASC, filters: [FILTER], hiddenRows: [1] });
+        });
+
+        it('keeps "Only changed rows" in a hide chosen after a snapshot without it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [], onlyChangedRows: true });
+            // The durable rules never carry the session toggle; the rows, on
+            // the same basis, are the view on screen, toggle and all.
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [], schema: SCHEMA }] },
+            }));
+
+            await hide_rows(post_message, [{ start: 1, end: 1 }]);
+
+            expect(latest_transform_request(post_message).state)
+                .toMatchObject({ hiddenRows: [1], onlyChangedRows: true });
+        });
+
+        it('keeps "Only changed rows" in an Unhide all chosen after a snapshot without it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [], hiddenRows: [1], onlyChangedRows: true });
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [], hiddenRows: [1], schema: SCHEMA }] },
+            }));
+
+            await click_button('Unhide all');
+
+            const unhide = latest_transform_request(post_message);
+            expect(unhide.state.hiddenRows ?? []).toEqual([]);
+            expect(unhide.state.onlyChangedRows).toBe(true);
+        });
+
+        it('keeps "Only changed rows" in a hide\'s answer after a refused sort and a snapshot without it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [], onlyChangedRows: true });
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [], onlyChangedRows: true });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            // The durable rules never carry the session toggle; the rows, on
+            // the same basis, are the view on screen, toggle and all.
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [], schema: SCHEMA }] },
+            }));
+            // Refused, and then settled with no projection: both the refusal's
+            // fallback and the settlement read what is installed.
+            await refuse(sort!);
+            await answer_hide(question!, [1]);
+
+            expect(latest_transform_request(post_message).state)
+                .toMatchObject({ sort: [], hiddenRows: [1], onlyChangedRows: true });
+        });
+
+        it('composes a hide chosen after a cancel onto the baseline when the cancel is refused, the sort still out', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await click_button('Cancel');
+            const cancel = latest_transform_request(post_message);
+            expect(cancel.intent).toBe('cancel');
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            // Refused before it took the sheet: the sort is still out.
+            await refuse(cancel);
+            await answer_hide(question!, [1]);
+
+            const hide = latest_transform_request(post_message);
+            expect(hide.intent).toBe('user');
+            expect(hide.state).toMatchObject({ sort: [], hiddenRows: [1] });
+        });
+
+        it('composes a hide chosen after a cancel onto the cancel\'s rules when the cancel sent again onto another window\'s change is refused', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await click_button('Cancel');
+            const cancel = latest_transform_request(post_message);
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [FILTER], schema: SCHEMA }] },
+            }));
+            const again = latest_transform_request(post_message);
+            expect(again.requestId).not.toBe(cancel.requestId);
+            // Still a cancel on the wire, which the host can commit without
+            // computing when its rules are installed already.
+            expect(again).toMatchObject({ intent: 'cancel', state: { sort: [], filters: [FILTER] } });
+            // The sort had installed onto the filter, and the first cancel was
+            // superseded by the one sent again, which the host then refuses.
+            auto_settle_transforms = false;
+            await install(sort!, { sort: SORT_ASC, filters: [FILTER], schema: SCHEMA });
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: sort!.requestId, committedBy: sort!.requestId,
+            });
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: cancel.requestId, committedBy: sort!.requestId,
+            });
+            await refuse(again);
+            await answer_hide(question!, [1]);
+
+            expect(latest_transform_request(post_message).state)
+                .toMatchObject({ sort: [], filters: [FILTER], hiddenRows: [1] });
+        });
+
+        it('ends a hide whose composed request the host refuses, with nothing recorded', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const hide = await hide_rows(post_message, [{ start: 1, end: 1 }]);
+            await refuse(hide!, 'The file is being saved.', true);
+
+            expect(props().transform_pending).toBe(false);
+            expect(undo_labels()).toEqual([]);
+        });
+
+        it('refuses a hide whose rows, with those hidden, are more than can be saved', async () => {
+            const { post_message } = await render_app();
+            // A sheet with every row but the last few hidden already, up to the limit.
+            const meta = table_meta();
+            meta.sheets[0].sourceRowCount = MAX_PERSISTED_HIDDEN_ROWS + 5;
+            const hidden = Array.from({ length: MAX_PERSISTED_HIDDEN_ROWS }, (_row, index) => index);
+            await dispatch_host_message(initial_snapshot_message(meta, {
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [], hiddenRows: hidden, schema: SCHEMA }] },
+            }));
+            await install(latest_transform_request(post_message));
+            post_message.mockClear();
+
+            // One more row, a valid one, is one past the limit once composed.
+            const question = await hide_rows_unanswered(post_message, [{ start: 0, end: 0 }]);
+            await answer_hide(question!, [MAX_PERSISTED_HIDDEN_ROWS]);
+
+            expect(warnings(post_message)).toEqual(['Too many hidden rows to persist.']);
+            expect(posted(post_message, 'setTransform').filter((sent) => sent.intent === 'user')).toEqual([]);
+            expect(props().transform_pending).toBe(false);
+        });
+
+        /** A Filter step, undone: Redo has it. */
+        async function redo_available(post_message: ReturnType<typeof vi.fn>) {
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+            await undo();
+            await install(latest_transform_request(post_message));
+            expect(redo_labels()).toEqual(['Filter']);
+            post_message.mockClear();
+        }
+
+        it('sends a hide\'s answer though a Redo waits behind it, and the Redo still waits', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await redo_available(post_message);
+
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await redo();
+            expect(press_held()).toBe(true);
+            await answer_hide(question!, [1]);
+
+            const hide = latest_transform_request(post_message);
+            expect(hide).toMatchObject({ intent: 'user', state: { hiddenRows: [1] } });
+            expect(warnings(post_message)).toEqual([]);
+            expect(press_held()).toBe(true);
+            await install(hide);
+            expect(undo_labels()).toEqual(['Hide row']);
+        });
+
+        it('takes Hide rows chosen while a Redo waits behind a sort, dropping the Redo', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await redo_available(post_message);
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await redo();
+            expect(press_held()).toBe(true);
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+
+            expect(question).toMatchObject({ sheetIndex: 0, displayRows: [{ start: 1, end: 1 }] });
+            expect(press_held()).toBe(false);
+            expect(warnings(post_message)).toEqual([]);
+        });
+
+        it('gives the grid focus when a hide chosen in the grid installs, though a toolbar choice began the action', async () => {
+            vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+            const { post_message } = await render_app();
+            await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [], hiddenRows: [0], schema: SCHEMA }] },
+            }));
+            await install(latest_transform_request(post_message));
+
+            await click_button('Unhide all');
+            const question = await hide_rows_unanswered(post_message, [{ start: 2, end: 2 }]);
+            await answer_hide(question!, [2]);
+            const hide = latest_transform_request(post_message);
+            expect(hide.state.hiddenRows).toEqual([2]);
+            grid_shell_mock.focus_grid.mockClear();
+            await install(hide);
+            await flush_focus_restore();
+
+            await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 0);
+            expect(document.activeElement).not.toBe(document.querySelector('.toolbar'));
+        });
+
+        it('refuses edits and Save while a hide resolves, and admits them once it ends', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await acquire_editing_session(post_message);
+            seed_mounted_store({ '1:0': { value: 'Alicia', base: 'Alice' } });
+
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            expect(cells_editable()).toEqual(HELD);
+            expect(props().gestures_admitted?.()).toBe(false);
+            const said = warnings(post_message).length;
+            await act(async () => { props().on_save_request?.(); });
+            expect(posted(post_message, 'saveCsv')).toEqual([]);
+            expect(warnings(post_message).slice(said)).toEqual(['Wait for the table view to finish updating.']);
+
+            await answer_hide(question!, 'The view changed before this table view request arrived.');
+            expect(props().gestures_admitted?.()).toBe(true);
+            await act(async () => { props().on_save_request?.(); });
+            expect(posted(post_message, 'saveCsv')).toHaveLength(1);
+        });
+
+        it('takes Unhide all chosen while a Redo waits behind a hide still resolving, dropping the Redo', async () => {
+            const { post_message } = await render_app();
+            await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [], hiddenRows: [0], schema: SCHEMA }] },
+            }));
+            // The saved view is installed on open.
+            await install(latest_transform_request(post_message));
+            await change_view(post_message, { sort: [], filters: [FILTER], hiddenRows: [0] });
+            await undo();
+            await install(latest_transform_request(post_message));
+            expect(redo_labels()).toEqual(['Filter']);
+
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await redo();
+            expect(press_held()).toBe(true);
+            await click_button('Unhide all');
+
+            const unhide = latest_transform_request(post_message);
+            expect(unhide.state.hiddenRows ?? []).toEqual([]);
+            expect(press_held()).toBe(false);
+            expect(warnings(post_message)).toEqual([]);
+            await answer_hide(question!, [1]);
+            expect(latest_transform_request(post_message).requestId).toBe(unhide.requestId);
+        });
+
+        it('drops a Redo waiting behind an action whose hide came to nothing, though the rest installed no step', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await redo_available(post_message);
+
+            const toggle = await ask(post_message, { sort: [], filters: [], onlyChangedRows: true });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await redo();
+            expect(press_held()).toBe(true);
+            await answer_hide(question!, 'The view changed before this table view request arrived.');
+            await install(toggle!);
+
+            expect(press_held()).toBe(false);
+            expect(latest_transform_request(post_message).requestId).toBe(toggle!.requestId);
+            expect(undo_labels()).toEqual([]);
+        });
+
+        it('lets a Redo run behind a choice made after a hide came to nothing, when the choice installs no step', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await redo_available(post_message);
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await answer_hide(question!, 'The view changed before this table view request arrived.');
+            // The newest choice decides the press, as after a refused sort (V1).
+            const clear = await ask(post_message, { sort: [], filters: [] });
+            await redo();
+            expect(press_held()).toBe(true);
+            await install(clear!);
+
+            expect(press_held()).toBe(false);
+            expect(undo_labels()).toEqual([]);
+            const replay = latest_transform_request(post_message);
+            expect(replay.requestId).not.toBe(clear!.requestId);
+            expect(replay.state.filters).toEqual([FILTER]);
+        });
+
+        it('builds the controls from what the action asks for, after a change made elsewhere while a hide resolved', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await install(sort!);
+            // Another window replaces the sort with its filter; the window installs it.
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: 2,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [FILTER], schema: SCHEMA }] },
+            }));
+            await install(latest_transform_request(post_message));
+
+            // The action still asks for its sort, onto the other window's filter.
+            expect(props().pending_transform_target).toMatchObject({ sort: SORT_ASC, filters: [FILTER] });
+        });
+
+        it('builds the controls from what is live once an older sort is refused after a newer one, while a hide resolves', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+
+            const older = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            const newer = await ask(post_message, { sort: [{ colIndex: 1, direction: 'desc' }], filters: [FILTER] });
+            await refuse(newer!);
+            expect(props().pending_transform_target).toMatchObject({ sort: SORT_ASC, filters: [FILTER] });
+            await refuse(older!);
+
+            // Neither refused sort is offered as what is asked for.
+            expect(props().pending_transform_target).toMatchObject({ sort: [], filters: [FILTER] });
+        });
+
+        it('names the hide alone on the Edit menu when another window committed the sort it installed beside it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const menu = () => posted(post_message, 'historyMenuStateChanged').at(-1)!.state;
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            auto_settle_transforms = false;
+            await install(sort!);
+            expect(menu().undoLabel).toBe('Change view');
+            // Another window committed the same rules first: the baseline moves
+            // onto them, and only the hide is left of the action.
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: sort!.requestId, committedBy: 'other-panel',
+            });
+
+            expect(menu().undoLabel).toBe('Hide row');
+        });
+
+        it('names what is left on the Edit menu when a sort chosen during a hide is refused', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            expect(posted(post_message, 'historyMenuStateChanged').at(-1)?.state.undoLabel).toBe('Change view');
+            await refuse(sort!);
+
+            expect(posted(post_message, 'historyMenuStateChanged').at(-1)?.state.undoLabel).toBe('Hide row');
+        });
+
+        it('says it is hiding rows for a hide chosen between a sort\'s install and its settlement', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            auto_settle_transforms = false;
+            await install(sort!);
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+
+            expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Hiding rows…');
+        });
+
+        it('says it is sorting while an older sort computes past a newer one refused, a hide resolving', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            const newer = await ask(post_message, { sort: [{ colIndex: 1, direction: 'desc' }], filters: [] });
+            await refuse(newer!);
+
+            expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Sorting…');
+        });
+
+        it('says it is hiding rows once the sort beside the hide has installed', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Sorting…');
+            await install(sort!);
+
+            expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Hiding rows…');
+        });
+
+        it('says it is hiding rows while the hide\'s answer is computed', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Hiding rows…');
+            await answer_hide(question!, [1]);
+
+            expect(latest_transform_request(post_message).state.hiddenRows).toEqual([1]);
+            expect(document.querySelector('.toolbar-progress')?.textContent).toBe('Hiding rows…');
+        });
+
+        it.each([
+            ['a new source arrives', () => refresh_snapshot_message(table_meta(), {
+                generation: 2,
+                sourceGeneration: 2,
+                reason: 'fileReload',
+                capabilities: CSV,
+            })],
+            ['the document is replaced', () => initial_snapshot_message(table_meta(), { capabilities: CSV })],
+        ])('forgets a hide still resolving when %s, and its time finds nothing', async (_name, snapshot) => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            vi.useFakeTimers();
+            try {
+                const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+                await dispatch_host_message(snapshot());
+                expect(props().transform_pending).toBe(false);
+                await act(async () => { vi.advanceTimersByTime(5_000); });
+                await answer_hide(question!, [1]);
+            } finally {
+                vi.useRealTimers();
+            }
+
+            expect(warnings(post_message)).toEqual([]);
+            expect(posted(post_message, 'setTransform').filter((sent) => sent.intent === 'user')).toEqual([]);
+        });
+
+        it('records a sort that installed beside a hide still resolving when a new source arrives', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await install(sort!);
+            expect(undo_labels()).toEqual([]);
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: 3,
+                sourceGeneration: 2,
+                reason: 'fileReload',
+                capabilities: CSV,
+                state: { transforms: [{ sort: SORT_ASC, filters: [], schema: SCHEMA }] },
+            }));
+
+            expect(undo_labels()).toEqual(['Sort']);
+            // The hide went with the old source.
+            expect(posted(post_message, 'setTransform').some((sent) => sent.state.hiddenRows?.length)).toBe(false);
+        });
+
+        it('drops a Redo waiting behind a hide alone that a new source ends', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await redo_available(post_message);
+
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await redo();
+            expect(press_held()).toBe(true);
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: 3,
+                sourceGeneration: 2,
+                reason: 'fileReload',
+                capabilities: CSV,
+            }));
+
+            expect(press_held()).toBe(false);
+            expect(redo_labels()).toEqual(['Filter']);
+            expect(posted(post_message, 'setTransform').filter((sent) => sent.state.filters?.length)).toEqual([]);
+        });
+
+        for (const settled of [false, true]) {
+            it.each([
+                ['Undo', () => undo()],
+                ['Cancel', () => click_button('Cancel')],
+            ])(`keeps "Only changed rows" on %s of a hide still resolving${settled ? ', the toggle installed' : ''}`, async (_name, cancel) => {
+                const { post_message } = await render_app();
+                await open(post_message);
+
+                await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+                const toggle = await ask(post_message, { sort: [], filters: [], onlyChangedRows: true });
+                if (settled) await install(toggle!);
+                await cancel();
+
+                const sent = latest_transform_request(post_message);
+                expect(sent.intent).toBe('cancel');
+                expect(sent.state.onlyChangedRows).toBe(true);
+            });
+        }
+
+        it('ends a hide answered while a restore is out, saying to wait', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: 1,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [FILTER], schema: SCHEMA }] },
+            }));
+            expect(latest_transform_request(post_message).intent).toBe('restore');
+            await answer_hide(question!, [1]);
+
+            expect(warnings(post_message)).toEqual(['Wait for the table view to finish updating.']);
+            expect(posted(post_message, 'setTransform').filter((sent) => sent.intent === 'user')).toEqual([]);
+        });
+
+        it('refuses a sort on another sheet while a hide resolves', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {}, table_meta(['Sheet1', 'Sheet2']));
+
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await click_button('Sheet2');
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+
+            expect(sort).toBeUndefined();
+            expect(warnings(post_message)).toContain('Wait for the table view to finish updating.');
+        });
+
+        it('ends a hide alone on Cancel, asking the host for nothing, and ignores its late answer', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await click_button('Cancel');
+            expect(props().transform_pending).toBe(false);
+            await answer_hide(question!, [1]);
+
+            expect(posted(post_message, 'setTransform')).toEqual([]);
+            expect(undo_labels()).toEqual([]);
+        });
+
+        it.each([
+            ['a sort, then a hide', true],
+            ['a hide, then a sort', false],
+        ])('cancels %s on Cancel, and ignores the hide\'s late answer', async (_name, sort_first) => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            if (sort_first) await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            if (!sort_first) await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await click_button('Cancel');
+            const cancel = latest_transform_request(post_message);
+            expect(cancel).toMatchObject({ intent: 'cancel', state: { sort: [] } });
+            await answer_hide(question!, [1]);
+
+            expect(latest_transform_request(post_message).requestId).toBe(cancel.requestId);
+            await install(cancel);
+            expect(undo_labels()).toEqual([]);
         });
 
         it('sends a cancel the host refused again when Cancel is pressed again', async () => {
@@ -24202,7 +25172,7 @@ describe('view steps in history', () => {
             await open(post_message);
             const first = await hide_rows(post_message, [{ start: 1, end: 2 }]);
             await install(first!, { sort: [], filters: [], hiddenRows: [1, 2], schema: SCHEMA });
-            const second = await hide_rows(post_message, [{ start: 2, end: 2 }]);
+            const second = await hide_rows(post_message, [{ start: 2, end: 2 }], [4]);
             await install(second!, { sort: [], filters: [], hiddenRows: [1, 2, 4], schema: SCHEMA });
             expect(undo_labels()).toEqual(['Hide 2 rows', 'Hide row']);
             post_message.mockClear();
@@ -25138,6 +26108,71 @@ describe('view steps in history', () => {
 
             expect(undo_labels()).toEqual([]);
             expect(cells_editable()).toEqual(EDITABLE);
+        });
+
+        it('records a sort over rows already hidden, which it does not hide again', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await install((await hide_rows(post_message, [{ start: 1, end: 2 }]))!);
+            expect(undo_labels()).toEqual(['Hide 2 rows']);
+            await ask(post_message, { sort: SORT_ASC, filters: [], hiddenRows: [1, 2] });
+
+            await reload([{ sort: SORT_ASC, filters: [], hiddenRows: [1, 2], schema: SCHEMA }]);
+
+            expect(undo_labels()).toEqual(['Hide 2 rows', 'Sort']);
+        });
+
+        it('records a sort that installed beside a hide when a reload overtakes the hide\'s composed request', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await install(sort!);
+            await answer_hide(question!, [1]);
+            const composed = latest_transform_request(post_message);
+            expect(composed.state).toMatchObject({ sort: SORT_ASC, hiddenRows: [1] });
+
+            // The sort was saved; the hide's request had not been.
+            await reload([SORTED]);
+
+            expect(undo_labels()).toEqual(['Sort']);
+        });
+
+        for (const landed of [false, true]) {
+            it(`records an Unhide all that installed beside a hide when a reload overtakes the hide's composed request${landed ? ', which had landed' : ''}`, async () => {
+                const { post_message } = await render_app();
+                await dispatch_host_message(initial_snapshot_message(table_meta(), {
+                    capabilities: CSV,
+                    state: { transforms: [{ sort: [], filters: [], hiddenRows: [1], schema: SCHEMA }] },
+                }));
+                await install(latest_transform_request(post_message));
+
+                await click_button('Unhide all');
+                const unhide = latest_transform_request(post_message);
+                const question = await hide_rows_unanswered(post_message, [{ start: 2, end: 2 }]);
+                await install(unhide);
+                await answer_hide(question!, [2]);
+                expect(latest_transform_request(post_message).state.hiddenRows).toEqual([2]);
+
+                // The Unhide all was saved, and the hide's request too if it landed.
+                await reload([landed ? { sort: [], filters: [], hiddenRows: [2], schema: SCHEMA } : undefined]);
+
+                expect(undo_labels()).toEqual(['Unhide rows']);
+            });
+        }
+
+        it('records a filter that installed beside a hide when a reload overtakes the hide\'s composed request', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const filter = await ask(post_message, { sort: [], filters: [FILTER] });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await install(filter!);
+            await answer_hide(question!, [1]);
+            expect(latest_transform_request(post_message).state).toMatchObject({ filters: [FILTER], hiddenRows: [1] });
+
+            await reload([{ sort: [], filters: [FILTER], schema: SCHEMA }]);
+
+            expect(undo_labels()).toEqual(['Filter']);
         });
 
         it('moves a replay it overtook when the reload shows the replay\'s target', async () => {
@@ -30248,7 +31283,11 @@ describe('the header row as a step in history', () => {
             await open(post_message, plain);
             // Hide rows 1 and 5 with the header off.
             await act(async () => props().on_hide_rows?.([{ start: 0, end: 0 }, { start: 4, end: 4 }]));
-            await install(posted(post_message, 'hideRows').at(-1)!, hiding(plain, [0, 4]));
+            const question = posted(post_message, 'resolveHiddenRows').at(-1)!;
+            await dispatch_host_message({
+                type: 'hiddenRowsResolved', sheetIndex: 0, requestId: question.requestId, sourceRows: [0, 4],
+            });
+            await install(posted(post_message, 'setTransform').at(-1)!, hiding(plain, [0, 4]));
             // Then choose row 3 as the header: the host also hides row 2.
             await act(async () => props().on_promote_row_to_header!(1));
             const promoted = book([on(2)]);

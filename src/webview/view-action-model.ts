@@ -12,10 +12,15 @@
  * baseline and `requested`: a change made elsewhere can equal one of the
  * person's, and the difference would then lose it.
  *
- * It ends when the host has settled every request it sent (I3), and its step
- * runs from the baseline to what is then installed (I2). An install written by
- * another panel moves the baseline instead, so it is never recorded as this
- * action's.
+ * A Hide rows in the action first asks the host which source rows it hides.
+ * Until the answer, the hide is resolving: it is part of the action, though
+ * not yet a request of it, and the action does not end. The answer joins
+ * the action as a choice; a refusal, or no answer, drops it.
+ *
+ * It ends when the host has settled every request it sent and no hide is
+ * resolving (I3), and its step runs from the baseline to what is then
+ * installed (I2). An install written by another panel moves the baseline
+ * instead, so it is never recorded as this action's.
  */
 
 import {
@@ -150,12 +155,15 @@ export function merge_view_action_delta(
         )),
         ...next.removals,
     ];
+    // Sets: an action can hide up to `MAX_PERSISTED_HIDDEN_ROWS` rows.
+    const next_hidden = new Set(next.hidden);
+    const next_shown = new Set(next.shown);
     const hidden = [
-        ...earlier.hidden.filter((row) => !next.shown.includes(row) && !next.hidden.includes(row)),
+        ...earlier.hidden.filter((row) => !next_shown.has(row) && !next_hidden.has(row)),
         ...next.hidden,
     ];
     const shown = [
-        ...earlier.shown.filter((row) => !next.hidden.includes(row) && !next.shown.includes(row)),
+        ...earlier.shown.filter((row) => !next_hidden.has(row) && !next_shown.has(row)),
         ...next.shown,
     ];
     const sort = next.sort ?? earlier.sort;
@@ -195,7 +203,17 @@ export function apply_view_action_delta(
 export interface ViewActionRequest {
     readonly requestId: string;
     readonly target: SheetTransformState;
+    /**
+     * The person's choices it carries, from the baseline: what a fallback to
+     * it applies onto the baseline as it is then, which another window's
+     * change may have moved since it was sent (I3).
+     */
+    readonly delta: ViewActionDelta;
+    /** A cancel back to the baseline: refused, it keeps its rules (I4). */
+    readonly cancel?: boolean;
     readonly settled: boolean;
+    /** The host refused it: its target is not asked for again (I3). */
+    readonly refused?: boolean;
 }
 
 export interface ViewAction {
@@ -205,9 +223,20 @@ export interface ViewAction {
     readonly requested: SheetTransformState;
     /** Every change the person made in the action, merged; empty after a cancel. */
     readonly delta: ViewActionDelta;
-    /** The newest request is a cancel back to the baseline. */
+    /**
+     * Cancelled back to the baseline, with no choice since, a hide included: a
+     * hide chosen after the cancel clears it though the newest request is
+     * still the cancel (`ViewActionRequest.cancel` says which requests are).
+     */
     readonly cancelled: boolean;
     readonly requests: readonly ViewActionRequest[];
+    /** Hides asking which source rows they hide: their ids, and how many display rows each chose. */
+    readonly resolving: readonly ViewActionResolution[];
+}
+
+export interface ViewActionResolution {
+    readonly requestId: string;
+    readonly rows: number;
 }
 
 export function begin_view_action(
@@ -223,6 +252,7 @@ export function begin_view_action(
         delta: EMPTY_DELTA,
         cancelled: false,
         requests: [],
+        resolving: [],
     };
 }
 
@@ -232,17 +262,18 @@ export function choose_in_view_action(
     requested: SheetTransformState,
     request_id: string,
 ): ViewAction {
+    // After a cancel the action is back at its baseline, so a choice is
+    // measured from there, as its first one was: from the cancel's target it
+    // would miss what that target kept, the compare toggle.
+    const delta = action.cancelled
+        ? view_action_delta(rules_or_empty(action.baseline), requested)
+        : merge_view_action_delta(action.delta, view_action_delta(action.requested, requested));
     return {
         ...action,
         requested,
-        // After a cancel the action is back at its baseline, so a choice is
-        // measured from there, as its first one was: from the cancel's target
-        // it would miss what that target kept, the compare toggle.
-        delta: action.cancelled
-            ? view_action_delta(rules_or_empty(action.baseline), requested)
-            : merge_view_action_delta(action.delta, view_action_delta(action.requested, requested)),
+        delta,
         cancelled: false,
-        requests: [...action.requests, { requestId: request_id, target: requested, settled: false }],
+        requests: [...action.requests, { requestId: request_id, target: requested, delta, settled: false }],
     };
 }
 
@@ -276,23 +307,154 @@ export function cancel_view_action(action: ViewAction, request_id: string, keep_
         requested: target,
         delta: EMPTY_DELTA,
         cancelled: true,
-        requests: [...action.requests, { requestId: request_id, target, settled: false }],
+        resolving: [],
+        requests: [...action.requests, {
+            requestId: request_id,
+            target,
+            delta: view_action_delta(rules_or_empty(action.baseline), target),
+            cancel: true,
+            settled: false,
+        }],
     };
 }
 
-/** The same request again, onto a moved baseline: it supersedes the one in flight. */
+/** Whether the request sent again is a cancel: the one it replaces was. */
+export function view_action_resend_is_cancel(action: ViewAction): boolean {
+    return action.cancelled || action.requests.at(-1)?.cancel === true;
+}
+
+/**
+ * The same request again, onto a moved baseline: it supersedes the one in
+ * flight, and is a cancel when that one was, though a hide chosen after the
+ * cancel has cleared the action's mark.
+ */
 export function resend_in_view_action(action: ViewAction, request_id: string): ViewAction {
+    const cancel = view_action_resend_is_cancel(action);
     return {
         ...action,
         requests: [
             ...action.requests,
-            { requestId: request_id, target: action.requested, settled: false },
+            {
+                requestId: request_id,
+                target: action.requested,
+                delta: action.cancelled
+                    ? view_action_delta(rules_or_empty(action.baseline), action.requested)
+                    : action.delta,
+                ...(cancel ? { cancel: true } : {}),
+                settled: false,
+            },
         ],
     };
 }
 
 export function view_action_owns(action: ViewAction, request_id: string): boolean {
     return action.requests.some((request) => request.requestId === request_id);
+}
+
+/**
+ * The host refused one of the action's requests. It is marked, and when it was
+ * what the action asks for, its newest request or the older one it fell back
+ * to, what the action asks for becomes what is still live, since a person's
+ * refused choice is not asked for again (I3): the choices of the newest
+ * request still out and not refused, applied onto the baseline as it is now,
+ * or else what is installed. A hide answered later composes onto that. A
+ * refused cancel keeps its rules, since Cancel sends it again, and so does one
+ * a hide was chosen after: the hide composes onto what the cancel asked for.
+ */
+export function refuse_in_view_action(
+    action: ViewAction,
+    request_id: string,
+    installed: SheetTransformState | undefined,
+): ViewAction {
+    if (!view_action_owns(action, request_id)) return action;
+    // What the action asks for now: the newest request still out and not refused.
+    const live_before = live_request(action);
+    const marked: ViewAction = {
+        ...action,
+        requests: action.requests.map((request) => (
+            request.requestId === request_id ? { ...request, refused: true } : request
+        )),
+    };
+    // A refused cancel keeps its rules, since Cancel sends it again; a refusal
+    // of a request that is not what the action asks for changes nothing more.
+    if (action.cancelled) return marked;
+    const newest = action.requests.at(-1)!;
+    if (newest.requestId !== request_id && live_before?.requestId !== request_id) return marked;
+    // A refused cancel that a hide chose after keeps its rules too: the hide
+    // composes onto the baseline it asked for, not onto what it cancelled.
+    const refused = action.requests.find((request) => request.requestId === request_id)!;
+    if (refused.cancel === true) {
+        return {
+            ...marked,
+            requested: apply_view_action_delta(refused.delta, action.baseline, action.schema),
+            delta: refused.delta,
+        };
+    }
+    // Falls back to what is still live: the choices of the newest request out
+    // and not refused, which may itself be refused later, onto the baseline as
+    // it is now, or else what is installed.
+    const live = live_request(marked);
+    if (live !== undefined) {
+        return {
+            ...marked,
+            requested: apply_view_action_delta(live.delta, action.baseline, action.schema),
+            delta: live.delta,
+        };
+    }
+    const fallback = rules_or_empty(installed);
+    return {
+        ...marked,
+        requested: fallback,
+        delta: view_action_delta(rules_or_empty(action.baseline), fallback),
+    };
+}
+
+/** The newest request of the action still out and not refused. */
+function live_request(action: ViewAction): ViewActionRequest | undefined {
+    return [...action.requests].reverse().find((request) => !request.settled && !request.refused);
+}
+
+/** A Hide rows asks which source rows it hides: a choice of the action, after a cancel too. */
+export function resolve_in_view_action(action: ViewAction, request_id: string, rows: number): ViewAction {
+    return {
+        ...action,
+        // After a cancel the action is back at its baseline, and what it asks
+        // for, the toggle the cancel kept, is measured from there, as a choice
+        // after a cancel is (`choose_in_view_action`).
+        ...(action.cancelled
+            ? { delta: view_action_delta(rules_or_empty(action.baseline), action.requested) }
+            : {}),
+        cancelled: false,
+        resolving: [...action.resolving, { requestId: request_id, rows }],
+    };
+}
+
+/**
+ * Take a resolving hide out of the action: its answer, its refusal, or no
+ * answer in time. Undefined when the action no longer holds it, after a
+ * cancel or Unhide all, and its answer is then ignored.
+ */
+export function take_resolution(action: ViewAction, request_id: string): ViewAction | undefined {
+    if (!action.resolving.some((resolution) => resolution.requestId === request_id)) return undefined;
+    return {
+        ...action,
+        resolving: action.resolving.filter((resolution) => resolution.requestId !== request_id),
+    };
+}
+
+/** Unhide all ends every hide still resolving on its sheet. */
+export function drop_resolutions(action: ViewAction): ViewAction {
+    return action.resolving.length === 0 ? action : { ...action, resolving: [] };
+}
+
+/** Nothing of the action is out: every request settled, no hide resolving. It ends. */
+export function view_action_idle(action: ViewAction): boolean {
+    return action.resolving.length === 0 && action.requests.every((request) => request.settled);
+}
+
+/** The display rows the action's resolving hides chose. */
+export function view_action_resolving_rows(action: ViewAction): number {
+    return action.resolving.reduce((total, resolution) => total + resolution.rows, 0);
 }
 
 /** The newest request is still out: the host has not settled it. */
@@ -305,8 +467,10 @@ const NO_RULES: SheetTransformState = { sort: [], filters: [], schema: '' };
 
 /**
  * Rules installed by someone else (I3): when they differ from the baseline, the
- * baseline moves to them and, while the newest request is out, the request is
- * composed again onto them. Returns the action and whether to send again.
+ * baseline moves to them and what the action asks for is composed again onto
+ * them, whether or not a request is out, so a hide still resolving composes
+ * onto them. It is sent again only while the newest request is out.
+ * Returns the action and whether to send again.
  *
  * "Differ" is the host's strict comparison, filter ids included: rules another
  * window wrote that only mean the same as the baseline are still its change,
@@ -320,10 +484,12 @@ function adopt_from_elsewhere(
 ): { readonly action: ViewAction; readonly resend: boolean } {
     if (transform_states_equal(rules ?? NO_RULES, action.baseline ?? NO_RULES)) return { action, resend: false };
     const moved: ViewAction = { ...action, baseline: rules };
-    if (!view_action_in_flight(action)) return { action: moved, resend: false };
+    // Recomposed whether or not a request is out: a hide still resolving
+    // composes its answer onto these later.
     const requested = action.cancelled
         ? view_action_cancel_target(moved)
         : apply_view_action_delta(action.delta, rules, action.schema);
+    if (!view_action_in_flight(action)) return { action: { ...moved, requested }, resend: false };
     const newest = action.requests.at(-1)!;
     return {
         action: { ...moved, requested },
@@ -356,7 +522,7 @@ export type ViewActionSettlement =
 /**
  * The host settled one of the action's requests, and the sheet now has `rules`
  * installed, committed by `committed_by`. The action ends when every request it
- * sent is settled and nothing is to be sent again.
+ * sent is settled, no hide is resolving, and nothing is to be sent again.
  */
 export function settle_view_action(
     action: ViewAction,
@@ -378,7 +544,7 @@ export function settle_view_action(
     const adopted = committed_by_action(marked, committed_by)
         ? { action: marked, resend: false }
         : adopt_from_elsewhere(marked, rules);
-    if (adopted.resend || marked.requests.some((request) => !request.settled)) {
+    if (adopted.resend || !view_action_idle(adopted.action)) {
         return { kind: 'pending', action: adopted.action, resend: adopted.resend };
     }
     return {

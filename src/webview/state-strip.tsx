@@ -8,8 +8,8 @@ export interface StateStripProps {
     transform_disabled: boolean;
     transform_pending: boolean;
     /**
-     * Whether the sort and filter controls wait: a hide, a replay, or a restore
-     * is in flight. The person's own sort or filter in flight does not hold them.
+     * Whether the sort and filter controls wait: a replay or a restore is in
+     * flight. The person's own sort, filter, or hide in flight does not hold them.
      * Defaults to `transform_pending`.
      */
     transform_choice_pending?: boolean;

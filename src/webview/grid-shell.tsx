@@ -1856,9 +1856,9 @@ export interface GridShellProps {
     transform_waits_for_claim?: boolean;
     transform_pending?: boolean;
     /**
-     * Whether the sort and filter controls wait: a hide, a replay, or a restore
-     * is in flight on the sheet. The person's own sort or filter in flight does
-     * not hold them, because a new choice replaces it. Defaults to
+     * Whether the sort, filter, and Hide rows controls wait: a replay or a
+     * restore is in flight on the sheet. The person's own request in flight,
+     * hides included, does not hold them, because a new choice replaces it. Defaults to
      * `transform_pending`.
      */
     transform_choice_pending?: boolean;
@@ -11651,12 +11651,14 @@ export function GridShell({
     const menu_edits_shown = menu_lists_editable_cells || menu_session_coming;
     const transform_menu_sections = transform_sections || transform_waits_for_claim;
     // Which items a menu offers follows the rules asked for. Whether the sort
-    // and filter items are disabled is `transform_choice_pending`: a hide, a
-    // replay, or a restore in flight, not the person's own request.
+    // and filter items are disabled is `transform_choice_pending`: a replay or
+    // a restore in flight, not the person's own request or a hide.
     const menu_transform_state = requested_transform_state;
+    // Hide rows is a choice of the view action like a sort or filter: held
+    // only by a replay or a restore in flight, not by the person's own request.
     const hide_rows_disabled_reason = inserted_rows_lock
         ? INSERTED_ROWS_TRANSFORM_MESSAGE
-        : transform_pending ? STRUCTURE_BUSY_MESSAGE : undefined;
+        : transform_choice_pending ? STRUCTURE_BUSY_MESSAGE : undefined;
     // Asked again when a sort or filter settles: one in flight is refused.
     useEffect(() => {
         if (menu_open && edit_armed && menu_offers_edits && !transform_pending) {
@@ -12678,7 +12680,7 @@ export function GridShell({
             // boundary there.
             can_hide_rows: !!selected_rows
                 && transform_sections
-                && !transform_pending
+                && !transform_choice_pending
                 && !preview_mode
                 && !selection_has_structural_rows
                 && !inserted_rows_lock,
@@ -13028,7 +13030,7 @@ export function GridShell({
                             // Offered while editing, refused in preview; see the
                             // cell menu's can_hide_rows above.
                             can_hide_rows: transform_sections
-                                && !transform_pending
+                                && !transform_choice_pending
                                 && !preview_mode
                                 && !has_structural_rows
                                 && !inserted_rows_lock,

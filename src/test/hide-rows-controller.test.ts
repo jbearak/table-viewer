@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 import { attach_viewer, csv_table_profile, type ViewerProfile } from '../viewer-controller';
 import type { FileStateStore } from '../state';
+import { MAX_PERSISTED_HIDDEN_ROWS, TOO_MANY_HIDDEN_ROWS_MESSAGE } from '../types';
 import type { HostMessage, WebviewMessage } from '../types';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import { with_in_memory_authority_transactions } from '../state-authority';
@@ -47,52 +48,34 @@ async function ready(panel: ReturnType<typeof open_csv_table>): Promise<Workbook
     return messages_of(panel, 'workbookSnapshot').at(-1)!.snapshot;
 }
 
-type TransformAnswer = Extract<
-    HostMessage,
-    { type: 'transformInstalled' | 'transformRefused' }
->;
+type Resolution = Extract<HostMessage, { type: 'hiddenRowsResolved' }>;
 
-async function send_hide_rows(
+/** Ask the host which source rows `displayRows` are, and wait for its answer. */
+async function resolve_hidden_rows(
     panel: ReturnType<typeof open_csv_table>,
-    basis: Pick<WorkbookSnapshot, 'generation' | 'sourceGeneration'>,
+    basis: { mappingGeneration: number; sourceGeneration: number },
     requestId: string,
     displayRows: Array<{ start: number; end: number }>,
-): Promise<TransformAnswer> {
+): Promise<Resolution> {
     await panel.__receive({
-        type: 'hideRows',
+        type: 'resolveHiddenRows',
         sheetIndex: 0,
         displayRows,
         requestId,
-        generation: basis.generation,
+        mappingGeneration: basis.mappingGeneration,
         sourceGeneration: basis.sourceGeneration,
-    } satisfies Extract<WebviewMessage, { type: 'hideRows' }>);
-    const answers = (): TransformAnswer[] => [
-        ...messages_of(panel, 'transformInstalled'),
-        ...messages_of(panel, 'transformRefused'),
-    ].filter((message) => message.requestId === requestId);
+    } satisfies Extract<WebviewMessage, { type: 'resolveHiddenRows' }>);
+    const answers = () => messages_of(panel, 'hiddenRowsResolved')
+        .filter((message) => message.requestId === requestId);
     await vi.waitFor(() => expect(answers()).toHaveLength(1));
     return answers()[0];
 }
 
-/** A hide request that installed a view. Refusals cannot describe one. */
-async function hide_rows_installed(
-    panel: ReturnType<typeof open_csv_table>,
-    basis: Pick<WorkbookSnapshot, 'generation' | 'sourceGeneration'>,
-    requestId: string,
-    displayRows: Array<{ start: number; end: number }>,
-): Promise<Extract<HostMessage, { type: 'transformInstalled' }>> {
-    const answer = await send_hide_rows(panel, basis, requestId, displayRows);
-    expect(answer.type).toBe('transformInstalled');
-    return answer as Extract<HostMessage, { type: 'transformInstalled' }>;
-}
-
-/** The basis a following request should quote, read off an install. */
-function basis_of(
-    installed: Extract<HostMessage, { type: 'transformInstalled' }>,
-): Pick<WorkbookSnapshot, 'generation' | 'sourceGeneration'> {
+/** A snapshot's basis for a resolution of sheet 0. */
+function basis_of(snapshot: WorkbookSnapshot): { mappingGeneration: number; sourceGeneration: number } {
     return {
-        generation: installed.view.basis.generation,
-        sourceGeneration: installed.view.basis.sourceGeneration,
+        mappingGeneration: snapshot.mappingGenerations[0],
+        sourceGeneration: snapshot.sourceGeneration,
     };
 }
 
@@ -151,31 +134,30 @@ describe('hide rows controller', () => {
         }]);
     });
 
-    it('maps, deduplicates, sorts, and persists hidden source rows', async () => {
+    it('resolves display rows to sorted, distinct source rows, and computes and saves nothing', async () => {
         const state = versioned_state_store();
         const panel = open_csv_table(state.store);
         const initial = await ready(panel);
+        const revision = state.revision(file_path);
 
-        const applied = await hide_rows_installed(panel, initial, 'hide-natural', [
+        const resolved = await resolve_hidden_rows(panel, basis_of(initial), 'hide-natural', [
             { start: 2, end: 2 },
             { start: 0, end: 1 },
             { start: 1, end: 2 },
         ]);
 
-        expect(applied).toMatchObject({
+        expect(resolved).toEqual({
+            type: 'hiddenRowsResolved',
+            sheetIndex: 0,
             requestId: 'hide-natural',
-            view: {
-                basis: {
-                    generation: initial.generation + 1,
-                    sourceGeneration: initial.sourceGeneration,
-                },
-                rules: { hiddenRows: [0, 1, 2] },
-            },
+            sourceRows: [0, 1, 2],
         });
-        expect(state.get_state(file_path).transforms?.[0]?.hiddenRows).toEqual([0, 1, 2]);
+        expect(messages_of(panel, 'transformInstalled')).toEqual([]);
+        expect(messages_of(panel, 'transformSettled')).toEqual([]);
+        expect(state.revision(file_path)).toBe(revision);
     });
 
-    it('maps display rows through the installed sort', async () => {
+    it('resolves display rows through the installed sort', async () => {
         const state = versioned_state_store();
         const panel = open_csv_table(state.store);
         const initial = await ready(panel);
@@ -196,130 +178,150 @@ describe('hide rows controller', () => {
             (message) => message.requestId === 'sort-ascending',
         )!;
 
-        const applied = await hide_rows_installed(
-            panel,
-            basis_of(sorted),
-            'hide-sorted',
-            [{ start: 0, end: 1 }],
-        );
+        const resolved = await resolve_hidden_rows(panel, {
+            mappingGeneration: sorted.mappingGeneration,
+            sourceGeneration: initial.sourceGeneration,
+        }, 'hide-sorted', [{ start: 0, end: 1 }]);
 
-        // The rules the host now holds, read from the ack message beside the record:
-        // the record carries rules only for a view it permuted, and this assertion is
-        // about the durable set the next line matches against the persisted copy.
-        expect(applied.rules?.hiddenRows).toEqual([1, 2]);
-        expect(state.get_state(file_path).transforms?.[0]?.hiddenRows).toEqual([1, 2]);
+        // Sorted ascending, c a b shows a b c: display rows 0 and 1 are source rows 1 and 2.
+        expect(resolved).toMatchObject({ sourceRows: [1, 2] });
     });
 
-    it('unions consecutive requests without duplicates', async () => {
+    it('refuses a mapping generation the sheet has moved past, since its rows moved', async () => {
         const state = versioned_state_store();
         const panel = open_csv_table(state.store);
         const initial = await ready(panel);
-        const first = await hide_rows_installed(panel, initial, 'hide-first', [
+        const basis = basis_of(initial);
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'sort-moves-rows',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        } satisfies Extract<WebviewMessage, { type: 'setTransform' }>);
+
+        const refused = await resolve_hidden_rows(panel, basis, 'stale-mapping', [
             { start: 0, end: 0 },
         ]);
 
-        const second = await hide_rows_installed(
-            panel,
-            basis_of(first),
-            'hide-second',
-            [{ start: 0, end: 0 }],
-        );
-
-        expect(second.rules?.hiddenRows).toEqual([0, 1]);
-        expect(state.get_state(file_path).transforms?.[0]?.hiddenRows).toEqual([0, 1]);
-    });
-
-    it('rejects a stale generation without changing installed or persisted state', async () => {
-        const state = versioned_state_store();
-        const panel = open_csv_table(state.store);
-        const initial = await ready(panel);
-        const revision = state.revision(file_path);
-
-        const rejected = await send_hide_rows(
-            panel,
-            { ...initial, generation: initial.generation + 1 },
-            'stale-generation',
-            [{ start: 0, end: 0 }],
-        );
-
-        // A refusal names the reason and nothing else — no state, no generation, no
-        // row count to be mistaken for an install. That the installed and persisted
-        // view are untouched is proven by the durable store below.
-        expect(rejected).toEqual({
-            type: 'transformRefused',
+        expect(refused).toEqual({
+            type: 'hiddenRowsResolved',
             sheetIndex: 0,
-            requestId: 'stale-generation',
-            intent: 'user',
-            reason: 'The view changed before this table view request arrived.',
-            terminal: true,
+            requestId: 'stale-mapping',
+            refusal: 'The view changed before this table view request arrived.',
         });
-        expect(state.revision(file_path)).toBe(revision);
-        expect(state.get_state(file_path)).toEqual({});
     });
 
-    it('rejects a stale source generation without changing installed or persisted state', async () => {
+    it('resolves against a generation that moved no rows of the sheet', async () => {
         const state = versioned_state_store();
         const panel = open_csv_table(state.store);
         const initial = await ready(panel);
-        const revision = state.revision(file_path);
+        const basis = basis_of(initial);
+        // A disabled filter changes the rules, and the core-wide generation, but
+        // not the sheet's mapping.
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'disabled-filter',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [],
+                filters: [{
+                    id: 'off', colIndex: 0, operator: 'contains', value: 'a',
+                    caseSensitive: false, enabled: false,
+                }],
+                schema: '["Sheet1",1,["h"]]',
+            },
+        } satisfies Extract<WebviewMessage, { type: 'setTransform' }>);
+        await vi.waitFor(() => expect(messages_of(panel, 'transformInstalled')
+            .some((message) => message.requestId === 'disabled-filter')).toBe(true));
 
-        const rejected = await send_hide_rows(
+        const resolved = await resolve_hidden_rows(panel, basis, 'unmoved-mapping', [
+            { start: 0, end: 0 },
+        ]);
+
+        expect(resolved).toMatchObject({ sourceRows: [0] });
+    });
+
+    it('refuses a stale source generation', async () => {
+        const panel = open_csv_table(versioned_state_store().store);
+        const initial = await ready(panel);
+
+        const refused = await resolve_hidden_rows(
             panel,
-            { ...initial, sourceGeneration: initial.sourceGeneration + 1 },
+            { ...basis_of(initial), sourceGeneration: initial.sourceGeneration + 1 },
             'stale-source-generation',
             [{ start: 0, end: 0 }],
         );
 
-        expect(rejected).toMatchObject({
-            type: 'transformRefused',
-            requestId: 'stale-source-generation',
-            reason: 'The source changed before this table view request arrived.',
-            terminal: true,
+        expect(refused).toMatchObject({
+            refusal: 'The source changed before this table view request arrived.',
         });
-        expect(state.revision(file_path)).toBe(revision);
-        expect(state.get_state(file_path)).toEqual({});
     });
 
-    it('rejects an out-of-range display interval without changing state', async () => {
+    it('refuses an out-of-range display interval', async () => {
+        const panel = open_csv_table(versioned_state_store().store);
+        const initial = await ready(panel);
+
+        const refused = await resolve_hidden_rows(panel, basis_of(initial), 'out-of-range', [
+            { start: 1, end: 3 },
+        ]);
+
+        expect(refused).toMatchObject({ refusal: 'display row interval 1-3 out of range (3 rows)' });
+    });
+
+    it('refuses row hiding in preview mode', async () => {
+        const panel = open_csv_table(versioned_state_store().store, {
+            ...csv_table_profile(),
+            previewMode: true,
+        });
+        const initial = await ready(panel);
+
+        const refused = await resolve_hidden_rows(panel, basis_of(initial), 'preview-hide', [
+            { start: 0, end: 0 },
+        ]);
+
+        expect(refused).toMatchObject({ refusal: 'Row hiding is unavailable in preview mode.' });
+    });
+
+    it('refuses, terminally and before saving, a transform hiding more rows than can be saved', async () => {
         const state = versioned_state_store();
         const panel = open_csv_table(state.store);
         const initial = await ready(panel);
         const revision = state.revision(file_path);
 
-        const rejected = await send_hide_rows(panel, initial, 'out-of-range', [
-            { start: 1, end: 3 },
-        ]);
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'too-many',
+            generation: initial.generation,
+            sourceGeneration: initial.sourceGeneration,
+            intent: 'user',
+            state: {
+                sort: [],
+                filters: [],
+                hiddenRows: Array.from({ length: MAX_PERSISTED_HIDDEN_ROWS + 1 }, (_row, index) => index),
+                schema: '["Sheet1",1,["h"]]',
+            },
+        } satisfies Extract<WebviewMessage, { type: 'setTransform' }>);
 
-        expect(rejected).toMatchObject({
+        await vi.waitFor(() => expect(messages_of(panel, 'transformRefused')).toEqual([{
             type: 'transformRefused',
-            requestId: 'out-of-range',
-            reason: 'display row interval 1-3 out of range (3 rows)',
+            sheetIndex: 0,
+            requestId: 'too-many',
+            intent: 'user',
+            reason: TOO_MANY_HIDDEN_ROWS_MESSAGE,
             terminal: true,
-        });
+        }]));
+        expect(messages_of(panel, 'transformInstalled')).toEqual([]);
         expect(state.revision(file_path)).toBe(revision);
-        expect(state.get_state(file_path)).toEqual({});
-    });
-
-    it('rejects row hiding in preview mode', async () => {
-        const state = versioned_state_store();
-        const panel = open_csv_table(state.store, {
-            ...csv_table_profile(),
-            previewMode: true,
-        });
-        const initial = await ready(panel);
-        const revision = state.revision(file_path);
-
-        const rejected = await send_hide_rows(panel, initial, 'preview-hide', [
-            { start: 0, end: 0 },
-        ]);
-
-        expect(rejected).toMatchObject({
-            type: 'transformRefused',
-            requestId: 'preview-hide',
-            reason: 'Row hiding is unavailable in preview mode.',
-            terminal: true,
-        });
-        expect(state.revision(file_path)).toBe(revision);
-        expect(state.get_state(file_path)).toEqual({});
     });
 });
