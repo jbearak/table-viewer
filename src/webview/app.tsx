@@ -522,7 +522,11 @@ interface PendingViewTransform {
      * bring other columns.
      */
     readonly schema: string;
-    /** The rules this window held for the sheet when the request was composed. */
+    /**
+     * The rules this window held for the sheet when the request was composed.
+     * When a new source overtakes the request of a view action, it becomes the
+     * action's baseline as it is then, which another window may have moved.
+     */
     readonly baseline: SheetTransformState | undefined;
     /** The rules requested. Absent for Hide rows: only the host knows its source rows. */
     readonly target?: SheetTransformState;
@@ -533,7 +537,10 @@ interface PendingViewTransform {
      * it and not the request's own target.
      */
     readonly installed?: { readonly rules: SheetTransformState | undefined };
-    /** Added at the new source for what was installed: no request of it was out. */
+    /**
+     * A record the window added at the new source for what was installed: the
+     * action had none left. It never drops a waiting press.
+     */
     readonly added?: true;
 }
 
@@ -6417,7 +6424,7 @@ export function App(): React.JSX.Element {
                                     };
                                 } else if (record === undefined && moved) {
                                     pending_view_transforms_ref.current[sheet_index] = {
-                                        // A request is out, so there is one.
+                                        // Not every request is settled, so the list is not empty.
                                         requestId: outgoing.action.requests.at(-1)!.requestId,
                                         worksheet: outgoing.worksheet,
                                         schema: outgoing.schema,

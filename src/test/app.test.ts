@@ -26600,6 +26600,8 @@ describe('view steps in history', () => {
                 type: 'transformSettled', sheetIndex: 0, requestId: sort!.requestId, committedBy: sort!.requestId,
             });
 
+            // Undo is empty because the Sort is in Redo; a late answer adds
+            // no second step, and the press still waits.
             expect(undo_labels()).toEqual([]);
             expect(redo_labels()).toEqual(['Sort']);
             expect(press_held()).toBe(true);
