@@ -9,7 +9,7 @@ import * as path from 'path';
 import { expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
 import { history_menu_item, type HistoryMenuState } from '../main/history-menu-model';
-import { click_menu_item, isolated_user_data } from './smoke-helpers';
+import { isolated_user_data } from './smoke-helpers';
 import {
     exit_app,
     install_dialog_capture,
@@ -83,29 +83,27 @@ const undo_label = () => menu_label('undo');
 const redo_label = () => menu_label('redo');
 
 /**
- * Click an Edit menu item once the native menu has it. The capture above sees
- * the window's post before main.ts rebuilds the menu from it, so the label
- * there can be ahead of the menu's. main.ts rebuilds it only for the focused
- * window, and routes the click to it, so the viewer is focused first, as
- * desktop-smoke.spec.ts's `focus_viewer` does.
+ * Click the Edit menu's Undo or Redo item, as the native menu would, once the
+ * item reads `label` by the menu's own label rule.
+ *
+ * Read through the capture above, not off the native menu: main.ts rebuilds
+ * the menu only for the focused window, and a smoke run cannot count on its
+ * window being in front (desktop-smoke.spec.ts covers the rebuild). The item
+ * is the real one, found by its id, and its click routes on the window it is
+ * given (`route_edit_command`), so it is given the viewer.
  */
-async function click_edit_item(label: string): Promise<void> {
-    const viewer = await app!.evaluate(({ BrowserWindow }) => {
-        const window = BrowserWindow.getAllWindows()
+async function click_edit_item(label: 'Undo Sort' | 'Redo Sort'): Promise<void> {
+    const direction = label.startsWith('Undo') ? 'undo' : 'redo';
+    await expect.poll(() => menu_label(direction)).toBe(label);
+    const clicked = await app!.evaluate(({ BrowserWindow, Menu }, id) => {
+        const viewer = BrowserWindow.getAllWindows()
             .find((candidate) => candidate.webContents.getURL().startsWith('tv-app://viewer'));
-        window?.show();
-        window?.focus();
-        return window?.id ?? null;
-    });
-    expect(viewer, 'a viewer window').not.toBeNull();
-    await expect.poll(
-        () => app!.evaluate(({ BrowserWindow }) => BrowserWindow.getFocusedWindow()?.id ?? null),
-        { message: 'the viewer is focused; is another app in front?', timeout: 15_000 },
-    ).toBe(viewer);
-    await expect.poll(() => app!.evaluate(({ Menu }, wanted) => Menu.getApplicationMenu()
-        ?.items.find((item) => item.label === 'Edit')
-        ?.submenu?.items.some((item) => item.label === wanted) ?? false, label)).toBe(true);
-    await click_menu_item(app!, 'Edit', label);
+        const item = Menu.getApplicationMenu()?.getMenuItemById(id);
+        if (viewer === undefined || !item?.click) return false;
+        item.click(item, viewer, {});
+        return true;
+    }, `edit.${direction}`);
+    expect(clicked, `Edit > ${label} and a viewer exist`).toBe(true);
 }
 
 async function choose_sort(page: Page, column: number, direction: 'ascending' | 'descending'): Promise<void> {

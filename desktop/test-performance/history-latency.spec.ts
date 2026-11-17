@@ -399,7 +399,10 @@ test('a 1M-row sort: Undo before it installs, and a second sort during the first
     // Apply to the end of the action.
     await click_sort(page, 1, 'ascending');
     await expect(page.locator('.toolbar-progress')).toBeVisible();
-    await choose(await open_column_menu(page, 0), 'Filter…');
+    // Its accessible name carries the shortcut, so it is matched by its start.
+    const column_menu = await open_column_menu(page, 0);
+    await column_menu.getByRole('menuitem', { name: /^Filter…/ }).click();
+    await expect(column_menu).toHaveCount(0);
     const popover = page.locator('.filter-popover');
     await expect(popover).toBeVisible();
     await popover.locator('#filter-condition').selectOption('contains');
