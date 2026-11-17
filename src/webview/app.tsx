@@ -522,11 +522,26 @@ interface PendingViewTransform {
      * bring other columns.
      */
     readonly schema: string;
-    /** The rules this window held for the sheet when the request was composed. */
+    /**
+     * The rules this window held for the sheet when the request was composed.
+     * When a new source overtakes the request of a view action, the action's
+     * current baseline replaces this value; another window may have moved it.
+     */
     readonly baseline: SheetTransformState | undefined;
     /** The rules requested. Absent for Hide rows: only the host knows its source rows. */
     readonly target?: SheetTransformState;
     readonly replay?: ViewReplay & { readonly delta: TransformViewDelta };
+    /**
+     * What the request's view action had installed when a new source overtook
+     * it, when that is a step from the baseline: recorded if the reload shows
+     * it and not the request's own target.
+     */
+    readonly installed?: { readonly rules: SheetTransformState | undefined };
+    /**
+     * A record the window added at the new source for what was installed: the
+     * action had none left. It never drops a waiting press.
+     */
+    readonly added?: true;
 }
 
 /** The window's view action, with what its step needs that the model does not keep. */
@@ -2357,6 +2372,11 @@ export function App(): React.JSX.Element {
      *  - A sort or filter gesture landed only if the adopted rules equal its
      *    target in every slice it changed; its step is then that difference
      *    and nothing else the refresh carried.
+     *  - Else what its view action had installed under the old source, when
+     *    the record carries it, is judged the same way: it was saved, and
+     *    the reload may show it. The window adds a record for that when the
+     *    action had none left; such a record never drops a waiting press,
+     *    since with no record nothing was decided.
      *  - A gesture that hides rows names source rows, which a reload can
      *    number anew, so the rows it would hide are left out; the rest of
      *    the request is judged as above.
@@ -2403,30 +2423,27 @@ export function App(): React.JSX.Element {
                 }
                 continue;
             }
-            // Rows it would hide are left out: a new source can renumber them,
-            // so a reload cannot vouch for them. The rest of the request, a sort
-            // a hide was composed onto or rows it shows included, is recorded if
-            // the reload shows it.
-            const baseline_hidden = new Set(pending.baseline?.hiddenRows ?? []);
-            const hides_rows = pending.target !== undefined
-                && (pending.target.hiddenRows ?? []).some((row) => !baseline_hidden.has(row));
-            const kept_hidden = (pending.target?.hiddenRows ?? []).filter((row) => baseline_hidden.has(row));
-            const { hiddenRows: _target_hidden, ...target_rest } = pending.target ?? EMPTY_TRANSFORM;
-            const target = hides_rows
-                ? { ...target_rest, ...(kept_hidden.length === 0 ? {} : { hiddenRows: kept_hidden }) }
-                : pending.target;
-            // And judged among the rows the baseline hid: the reload may carry
-            // the new ones, if the request had landed, and they say nothing.
-            const adopted_hidden = (adopted?.hiddenRows ?? []).filter((row) => baseline_hidden.has(row));
-            const adopted_judged = hides_rows && adopted !== undefined
-                ? { ...adopted, hiddenRows: adopted_hidden }
-                : adopted;
-            const step = sheet === undefined
-                || index === undefined
-                || target === undefined
-                || !same_columns
-                ? undefined
-                : overtaken_transform_step(
+            // Rows a set of rules would hide are left out: a new source can
+            // renumber them, so a reload cannot vouch for them. The rest, a
+            // sort a hide was composed onto or rows it shows included, is
+            // recorded if the reload shows it.
+            const judge = (rules: SheetTransformState | undefined): ViewStep | undefined => {
+                if (sheet === undefined || index === undefined || !same_columns) return undefined;
+                const baseline_hidden = new Set(pending.baseline?.hiddenRows ?? []);
+                const hides_rows = (rules?.hiddenRows ?? []).some((row) => !baseline_hidden.has(row));
+                const kept_hidden = (rules?.hiddenRows ?? []).filter((row) => baseline_hidden.has(row));
+                const { hiddenRows: _rules_hidden, ...rules_rest } = rules ?? EMPTY_TRANSFORM;
+                const target = hides_rows
+                    ? { ...rules_rest, ...(kept_hidden.length === 0 ? {} : { hiddenRows: kept_hidden }) }
+                    : rules ?? EMPTY_TRANSFORM;
+                // And judged among the rows the baseline hid: the reload may
+                // carry the new ones, if the request had landed, and they say
+                // nothing.
+                const adopted_hidden = (adopted?.hiddenRows ?? []).filter((row) => baseline_hidden.has(row));
+                const adopted_judged = hides_rows && adopted !== undefined
+                    ? { ...adopted, hiddenRows: adopted_hidden }
+                    : adopted;
+                return overtaken_transform_step(
                     {
                         sheetIndex: index,
                         sheetName: sheet.name,
@@ -2437,10 +2454,17 @@ export function App(): React.JSX.Element {
                     target,
                     adopted_judged,
                 );
+            };
+            // The request's own target, one step for its whole action; else
+            // what its action had installed under the old source.
+            const step = (pending.target === undefined ? undefined : judge(pending.target))
+                ?? (pending.installed === undefined ? undefined : judge(pending.installed.rules));
             if (step === undefined) {
                 // Nothing recorded for the person's own gesture: a press held behind it
                 // was for its step, and would otherwise undo the one under it (as with Cancel).
-                drop_press_behind_unrecorded_gesture();
+                // Not for a record added for what was installed: with no record,
+                // nothing was decided, as for a cancel that landed.
+                if (pending.added !== true) drop_press_behind_unrecorded_gesture();
                 continue;
             }
             record_view_step(step);
@@ -6376,7 +6400,39 @@ export function App(): React.JSX.Element {
                                 );
                             } else {
                                 // Its requests still out are overtaken, and settled
-                                // below by what this snapshot shows.
+                                // below by what this snapshot shows, measured from the
+                                // action's baseline as it is now: another window can
+                                // have moved it with nothing sent again (I3). What the
+                                // action had installed under the old source goes with
+                                // them, when it is a step: no record of it is left once
+                                // a newer request is sent or it installs (I2).
+                                const sheet_index = outgoing.action.sheetIndex;
+                                const baseline = outgoing.action.baseline;
+                                const installed = state_ref.current.transforms?.[sheet_index];
+                                const moved = transform_view_step(
+                                    outgoing.worksheet,
+                                    outgoing.schema,
+                                    baseline,
+                                    installed,
+                                ) !== undefined;
+                                const record = pending_view_transforms_ref.current[sheet_index];
+                                if (record !== undefined && view_action_owns(outgoing.action, record.requestId)) {
+                                    pending_view_transforms_ref.current[sheet_index] = {
+                                        ...record,
+                                        baseline,
+                                        ...(moved ? { installed: { rules: installed } } : {}),
+                                    };
+                                } else if (record === undefined && moved) {
+                                    pending_view_transforms_ref.current[sheet_index] = {
+                                        // Not every request is settled, so the list is not empty.
+                                        requestId: outgoing.action.requests.at(-1)!.requestId,
+                                        worksheet: outgoing.worksheet,
+                                        schema: outgoing.schema,
+                                        baseline,
+                                        installed: { rules: installed },
+                                        added: true,
+                                    };
+                                }
                                 publish_history_menu_ref.current();
                             }
                         }

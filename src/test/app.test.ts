@@ -26228,6 +26228,445 @@ describe('view steps in history', () => {
         });
     });
 
+    describe('a reload that overtakes a request after an older one of the action installed', () => {
+        const SORTED: SheetTransformState = { sort: SORT_ASC, filters: [], schema: SCHEMA };
+        const SORT_DESC: SheetTransformState['sort'] = [{ colIndex: 1, direction: 'desc' }];
+        const step_delta = () => {
+            const change = history().undoStack.at(-1)!.action.changes[0];
+            return change.kind === 'view' && change.delta.slice === 'transform' ? change.delta : undefined;
+        };
+        /** A Filter step, undone: Redo has it. */
+        async function redo_available(post_message: ReturnType<typeof vi.fn>) {
+            await change_view(post_message, { sort: [], filters: [FILTER] });
+            await undo();
+            await install(latest_transform_request(post_message));
+            expect(redo_labels()).toEqual(['Filter']);
+            post_message.mockClear();
+        }
+        /** Sort A installs and the host settles it while a newer request B is out. */
+        async function first_installed(
+            post_message: ReturnType<typeof vi.fn>,
+            second: SheetTransformState = { sort: SORT_DESC, filters: [] },
+        ) {
+            const first = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const newer = await ask(post_message, second);
+            auto_settle_transforms = false;
+            await install(first!);
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: first!.requestId, committedBy: first!.requestId,
+            });
+            expect(undo_labels()).toEqual([]);
+            return { first: first!, newer: newer! };
+        }
+        const replays = (post_message: ReturnType<typeof vi.fn>) => posted(post_message, 'setTransform')
+            .filter((sent) => (sent.state.filters ?? []).length > 0);
+
+        it('records the sort that installed when the reload carries it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await first_installed(post_message);
+
+            await reload([SORTED]);
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(step_delta()?.sort).toMatchObject({ before: [], after: SORT_ASC });
+        });
+
+        it('records one step to the newer sort when the reload carries it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await first_installed(post_message);
+
+            await reload([{ sort: SORT_DESC, filters: [], schema: SCHEMA }]);
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(step_delta()?.sort).toMatchObject({ before: [], after: SORT_DESC });
+        });
+
+        it('records nothing, and drops a press waiting, when the reload carries neither', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await redo_available(post_message);
+            await first_installed(post_message);
+            await redo();
+            expect(press_held()).toBe(true);
+
+            await reload([undefined]);
+
+            expect(undo_labels()).toEqual([]);
+            expect(press_held()).toBe(false);
+            expect(redo_labels()).toEqual(['Filter']);
+            expect(replays(post_message)).toEqual([]);
+        });
+
+        it('records the sort once, and decides a press waiting once, when the reload carries it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await redo_available(post_message);
+            await first_installed(post_message);
+            await redo();
+            expect(press_held()).toBe(true);
+            const said = warnings(post_message).length;
+
+            await reload([SORTED]);
+
+            // The new step leaves Redo nothing, and the press ends quietly:
+            // no message, and no replay.
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(redo_labels()).toEqual([]);
+            expect(press_held()).toBe(false);
+            expect(warnings(post_message).slice(said)).toEqual([]);
+            expect(replays(post_message)).toEqual([]);
+        });
+
+        it('records the sort a cancel that never landed meant to take back', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await first_installed(post_message);
+            await undo();
+            expect(latest_transform_request(post_message).intent).toBe('cancel');
+
+            await reload([SORTED]);
+
+            expect(undo_labels()).toEqual(['Sort']);
+        });
+
+        it('records nothing for a cancel that landed, and leaves a press waiting behind it to run', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await redo_available(post_message);
+            await first_installed(post_message);
+            await undo();
+            expect(latest_transform_request(post_message).intent).toBe('cancel');
+            await redo();
+            expect(press_held()).toBe(true);
+
+            await reload([undefined]);
+
+            expect(undo_labels()).toEqual([]);
+            // As when the cancel's own answer ends a cancelled action: the
+            // press is not dropped, and runs.
+            expect(replays(post_message)).not.toEqual([]);
+        });
+
+        it('records the newest request that installed and was not settled, and nothing more for its late settlement', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            auto_settle_transforms = false;
+            await install(sort!);
+            expect(undo_labels()).toEqual([]);
+
+            await reload([SORTED]);
+            expect(undo_labels()).toEqual(['Sort']);
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: sort!.requestId, committedBy: sort!.requestId,
+            });
+
+            expect(undo_labels()).toEqual(['Sort']);
+        });
+
+        it('records the older sort that installed when the newer one was refused', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const { newer } = await first_installed(post_message);
+            await refuse(newer);
+
+            await reload([SORTED]);
+
+            expect(undo_labels()).toEqual(['Sort']);
+        });
+
+        it('records nothing for "Only changed rows" alone', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const toggle = await ask(post_message, { sort: [], filters: [], onlyChangedRows: true });
+            await ask(post_message, { sort: SORT_DESC, filters: [], onlyChangedRows: true });
+            auto_settle_transforms = false;
+            await install(toggle!);
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: toggle!.requestId, committedBy: toggle!.requestId,
+            });
+
+            await reload([undefined]);
+
+            expect(undo_labels()).toEqual([]);
+        });
+
+        it('records a Clear sort that installed', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            const clear = await ask(post_message, { sort: [], filters: [] });
+            await ask(post_message, { sort: SORT_DESC, filters: [] });
+            auto_settle_transforms = false;
+            await install(clear!);
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: clear!.requestId, committedBy: clear!.requestId,
+            });
+
+            await reload([undefined]);
+
+            expect(undo_labels()).toEqual(['Sort', 'Clear sort']);
+        });
+
+        it('keeps another window\'s filter out of the step when it moved the baseline with no resend', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const both = await ask(post_message, { sort: SORT_ASC, filters: [FILTER] });
+            // Another window installs the same filter: the action's baseline
+            // moves to it, and what the action asks for is unchanged, so
+            // nothing is sent again.
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: [], filters: [FILTER], schema: SCHEMA }] },
+            }));
+            const user = posted(post_message, 'setTransform').filter((sent) => sent.intent === 'user');
+            expect(user.at(-1)!.requestId).toBe(both!.requestId);
+
+            await reload([{ sort: SORT_ASC, filters: [FILTER], schema: SCHEMA }]);
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(step_delta()?.filters).toBeUndefined();
+        });
+
+        it('records the sort alone when what installed also hid rows', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await answer_hide(question!, [1]);
+            const composed = latest_transform_request(post_message);
+            expect(composed.state).toMatchObject({ sort: SORT_ASC, hiddenRows: [1] });
+            await ask(post_message, { sort: SORT_DESC, filters: [], hiddenRows: [1] });
+            auto_settle_transforms = false;
+            await install(composed);
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: composed.requestId, committedBy: composed.requestId,
+            });
+
+            await reload([{ sort: SORT_ASC, filters: [], hiddenRows: [1], schema: SCHEMA }]);
+
+            expect(undo_labels()).toEqual(['Sort']);
+            expect(step_delta()?.hiddenRows).toBeUndefined();
+        });
+
+        it('leaves a press alone when the newer sort had installed, unsettled, and the reload carries neither', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await redo_available(post_message);
+            const { newer } = await first_installed(post_message);
+            await install(newer);
+            await redo();
+            expect(press_held()).toBe(true);
+
+            await reload([undefined]);
+
+            expect(undo_labels()).toEqual([]);
+            // No record was left to settle, as today: the press runs.
+            expect(replays(post_message)).not.toEqual([]);
+        });
+
+        it('lets an Undo waiting behind a cancel that never landed take back the sort it records', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await first_installed(post_message);
+            await undo();
+            expect(latest_transform_request(post_message).intent).toBe('cancel');
+            await undo();
+            expect(press_held()).toBe(true);
+
+            await reload([SORTED]);
+            auto_settle_transforms = true;
+
+            // The sort is recorded, and the Undo waiting runs against it,
+            // after the saved view the reload brought if the window asked for
+            // that first. Which goes first follows state left by earlier tests
+            // in this file (V2's Unhide all tests make it the restore); both
+            // end the same.
+            expect(undo_labels()).toEqual(['Sort']);
+            const first = latest_transform_request(post_message);
+            if (first.intent === 'restore') await install(first);
+            expect(press_held()).toBe(false);
+            const replay = latest_transform_request(post_message);
+            expect(replay.intent).toBe('user');
+            expect(replay.state.sort).toEqual([]);
+            await install(replay);
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Sort']);
+        });
+
+        it('records the sort that installed beside a hide still resolving', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const first = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await ask(post_message, { sort: SORT_DESC, filters: [] });
+            auto_settle_transforms = false;
+            await install(first!);
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: first!.requestId, committedBy: first!.requestId,
+            });
+
+            await reload([SORTED]);
+
+            expect(undo_labels()).toEqual(['Sort']);
+        });
+
+        it('records nothing yet on a refresh of the same source, and keeps the action', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await first_installed(post_message);
+
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [SORTED] },
+            }));
+
+            expect(undo_labels()).toEqual([]);
+            expect(props().transform_pending).toBe(true);
+        });
+
+        it('takes the recorded sort back to the baseline on Undo', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await first_installed(post_message);
+            await reload([SORTED]);
+            auto_settle_transforms = true;
+            // The window installs the saved view the reload brought.
+            const restore = latest_transform_request(post_message);
+            expect(restore.intent).toBe('restore');
+            await install(restore);
+
+            await undo();
+
+            const replay = latest_transform_request(post_message);
+            expect(replay.state).toMatchObject({ sort: [], filters: [] });
+            await install(replay);
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Sort']);
+        });
+
+        it('records nothing when the reload removes the sheet', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await first_installed(post_message);
+
+            await reload([undefined], table_meta(['Other']));
+
+            expect(undo_labels()).toEqual([]);
+        });
+
+        it('records one step for the newer request when the reload carries it and what installed alike', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await first_installed(post_message, { sort: SORT_ASC, filters: [FILTER] });
+
+            await reload([{ sort: SORT_ASC, filters: [FILTER], schema: SCHEMA }]);
+
+            // The newer request's own target is tried first: one step with both.
+            expect(undo_labels()).toEqual(['Change view']);
+            expect(step_delta()).toMatchObject({ sort: { before: [], after: SORT_ASC }, filters: { before: [], after: [FILTER] } });
+        });
+
+        it('records nothing more, and decides no press, for a late install and settlement after the reload', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            auto_settle_transforms = false;
+            await install(sort!);
+            await reload([SORTED]);
+            expect(undo_labels()).toEqual(['Sort']);
+            auto_settle_transforms = true;
+            const restore = latest_transform_request(post_message);
+            if (restore.intent === 'restore') await install(restore);
+            // Redo has the sort, and waits behind a newer request.
+            await undo();
+            await install(latest_transform_request(post_message));
+            expect(redo_labels()).toEqual(['Sort']);
+            await ask(post_message, { sort: SORT_DESC, filters: [] });
+            await redo();
+            expect(press_held()).toBe(true);
+
+            auto_settle_transforms = false;
+            await install(sort!);
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: sort!.requestId, committedBy: sort!.requestId,
+            });
+
+            // Undo is empty because the Sort is in Redo; a late answer adds
+            // no second step, and the press still waits.
+            expect(undo_labels()).toEqual([]);
+            expect(redo_labels()).toEqual(['Sort']);
+            expect(press_held()).toBe(true);
+        });
+
+        it('records no Clear sort that installed when the reload brings other columns', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await change_view(post_message, { sort: SORT_ASC, filters: [] });
+            const clear = await ask(post_message, { sort: [], filters: [] });
+            await ask(post_message, { sort: SORT_DESC, filters: [] });
+            auto_settle_transforms = false;
+            await install(clear!);
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: clear!.requestId, committedBy: clear!.requestId,
+            });
+            const renamed = table_meta();
+            renamed.sheets[0].columnNames = ['Name', 'Amount', 'Notes'];
+
+            // The host drops rules that named the old columns: "no sort" here
+            // says nothing about the Clear sort.
+            await reload([undefined], renamed);
+
+            expect(undo_labels()).toEqual(['Sort']);
+        });
+
+        it('records nothing when the reload brings other columns, though it carries the sort', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await first_installed(post_message);
+            const renamed = table_meta();
+            renamed.sheets[0].columnNames = ['Name', 'Amount', 'Notes'];
+
+            await reload([{ sort: SORT_ASC, filters: [], schema: '["Sheet1",3,["Name","Amount","Notes"]]' }], renamed);
+
+            expect(undo_labels()).toEqual([]);
+        });
+
+        it('records no step holding another window\'s filter when it composed onto the installed sort', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await first_installed(post_message);
+            // Another window adds a filter onto the saved sort. By the strict
+            // comparison (I3) the action's baseline moves to the sort and the
+            // filter, so the sort is no longer this action's to record.
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: view_generation,
+                sourceGeneration: 1,
+                reason: 'other',
+                capabilities: CSV,
+                state: { transforms: [{ sort: SORT_ASC, filters: [FILTER], schema: SCHEMA }] },
+            }));
+            auto_settle_transforms = true;
+            const restore = latest_transform_request(post_message);
+            if (restore.intent === 'restore') await install(restore);
+            auto_settle_transforms = false;
+
+            await reload([{ sort: SORT_ASC, filters: [FILTER], schema: SCHEMA }]);
+
+            // Measured from where the record was composed, the step would
+            // hold the other window's filter, and Undo would take it away.
+            expect(undo_labels()).toEqual([]);
+        });
+    });
+
     describe('worksheets that move or go while a request is pending', () => {
         function workbook(order: ('a' | 'b')[]): WorkbookMeta {
             const meta = table_meta(order.map((id) => (id === 'a' ? 'Alpha' : 'Beta')));
@@ -26254,6 +26693,44 @@ describe('view steps in history', () => {
                 sheetName: 'Alpha',
                 worksheetId: 'ws-a',
             });
+        });
+
+        it('records a sort that installed before a newer one on its own worksheet after a reload reorders them', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {}, workbook(['a', 'b']));
+            const first = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await ask(post_message, { sort: [{ colIndex: 1, direction: 'desc' }], filters: [] });
+            auto_settle_transforms = false;
+            await install(first!);
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: first!.requestId, committedBy: first!.requestId,
+            });
+
+            await reload(
+                [undefined, { sort: SORT_ASC, filters: [], schema: ALPHA_SCHEMA }],
+                workbook(['b', 'a']),
+            );
+
+            expect(undo_labels()).toEqual(['Sort']);
+            const change = history().undoStack[0].action.changes[0];
+            expect(change.kind === 'view' && change.delta.worksheet).toMatchObject({ sheetIndex: 1, worksheetId: 'ws-a' });
+        });
+
+        it('records nothing for a sort that installed when only the sheet now at the old index holds it', async () => {
+            const { post_message } = await render_app();
+            await open(post_message, {}, workbook(['a', 'b']));
+            const first = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await ask(post_message, { sort: [{ colIndex: 1, direction: 'desc' }], filters: [] });
+            auto_settle_transforms = false;
+            await install(first!);
+            await dispatch_host_message({
+                type: 'transformSettled', sheetIndex: 0, requestId: first!.requestId, committedBy: first!.requestId,
+            });
+
+            // Alpha is gone; Beta, now at its index, is sorted the same way.
+            await reload([{ sort: SORT_ASC, filters: [], schema: BETA_SCHEMA }], workbook(['b']));
+
+            expect(undo_labels()).toEqual([]);
         });
 
         it('records nothing when only the sheet now at the old index holds the sort', async () => {

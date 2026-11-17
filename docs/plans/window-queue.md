@@ -491,6 +491,66 @@ This is the stage plan, written against V1 as built (#395); its line numbers are
   - in the window: hide during a sort; a sort during resolution; hide after hide; Unhide all before and after the answer; hide, then sort, then Undo or Cancel, then the late answer; a sort's install before the host resolves the hide: the hide is refused, with the menu's label before and after; an install that moves no display row before it: the hide composes (on the host, where the mapping generation is checked); a choice on another sheet while a hide resolves: refused; each refusal of a resolution ending only the hide; a resolution with no answer; an edit and a Save refused while a hide resolves (the session wait cannot be held by it, since a resolution keeps no pending request id); Unhide all with a promoted Header Row during a sort and during a resolution; a replaced document;
   - the new smoke spec: Hide rows during a sort.
 
+### A fix after V2: an install a reload overtakes
+
+Written against main at a83ac382 (V2 merged, #396); line numbers are at that commit.
+
+**The bug.** Sort A installs, and the host settles it, while a newer sort B of the same view action is still out. A source reload then overtakes B. A was installed and saved, and the reload carries it, but A gets no Undo step. Main has had this since V1; the build's first test reproduces it.
+
+**Why.** The sheet keeps one pending record, `pending_view_transforms_ref`, which describes its newest request. Sending B replaced A's record (`app.tsx:4009`), so only the view action remembers that A installed. The record also goes when the newest request installs (`app.tsx:7177`) or is refused (`app.tsx:6983`). At a new source the window drops an action that still has a request out (`app.tsx:6377`, the `else` of V2's hides-only branch). B's record is settled by `settle_overtaken_view_requests` (`app.tsx:2375`), which records B's step only if the snapshot shows B's own target (`overtaken_transform_step`). It doesn't, so nothing is recorded, and the press waiting behind B is dropped (`app.tsx:2443`).
+
+**The rule.** At a new source, an action that still has a request out hands what it had installed under the old source to the overtaken settlement. That applies when what was installed differs from the action's current baseline by a step (`transform_view_step`, which ignores the compare toggle). `state_ref` still holds the old source's rules there, as V2's hides-only branch uses.
+- If the sheet's record belongs to the action (`view_action_owns`), the window replaces it with a copy before the record is pushed to the overtaken list. The copy's baseline is the action's current baseline, and it carries `installed` when there is one. The baseline is replaced even with nothing installed: another window can move the action's baseline without a resend, when the recomposed target is unchanged (`view-action-model.ts:486`), and a step measured from the old baseline would hold that window's change (I3).
+- If the sheet has no record, the window adds one of its own: the action's worksheet, schema, and current baseline, with `installed` and no target. This happens when the newest request installed and is not settled, the newest was refused, or the newest is a cancel, which keeps no record.
+- A record the action doesn't own is left as it is.
+
+For each record, the settlement makes both tries in one pass:
+1. the request's own target, from the action's current baseline. When the snapshot shows it, that is one step for the whole action, since the target holds everything the action asked for (I6);
+2. otherwise what was installed, from the same baseline (as `end_view_action` uses), when the snapshot shows it. What was installed may be no rules at all, after a Clear sort, which is a step too.
+
+Each try is judged by the rule overtaken requests already follow: a step is recorded only if the snapshot shows it, and rows a request would hide are left out (V2). One helper does that for both tries, so what was installed is trimmed of its new hides as a target is. At most one step is recorded. The press is decided once, after both tries, from one flag:
+- a recorded step decides it as any recorded overtaken step does today;
+- a record the action already had that records nothing drops it, as today;
+- a record the window added never drops it, as today, when there was no record at all. A cancel that landed therefore keeps the press waiting behind it, as `end_view_action` does for a cancelled action.
+
+The `added` flag is set only on a record the window adds, and nothing reads it but this decision.
+
+So when the reload carries neither A nor B, the press is dropped if B was still out (the action had a record), and left alone if B had installed and was not settled (the window added one). Both are what happens today.
+
+**The cases, and what each records:**
+- The reload carries A: A's step.
+- The reload carries B, which had landed: one step from the baseline to B, as today.
+- The reload carries neither: nothing, and the press is dropped, as today.
+- Only "Only changed rows" was installed: no step, since the step ignores the toggle, as today.
+- A cancel is out. If it never landed, the reload carries A, and A's step is recorded: A is what the person sees, and Undo can then take it back. If it landed, the reload carries the baseline: nothing is recorded, and the press is left alone.
+- The newest request installed and is not settled: its rules are what was installed, so A's step is recorded if the reload carries them.
+- Another window moved the baseline before the reload: both tries are measured from the moved baseline, so the step holds only this window's change, and Undo keeps the other window's.
+- A hid rows beside its sort: only the sort is recorded (V2's rule).
+
+**Not changed:** a refresh on the same source, V2's branch for an action that has only hides left, replays, column and width writes, and how a step is judged against the snapshot.
+
+**Size.** About 40 lines in `app.tsx` by the estimate: two fields on `PendingViewTransform` (`installed`, and `added` for a record the window added), the hand-off in the new-source branch, and the second try in `settle_overtaken_view_requests`. As built it adds about 80 lines and deletes about 30, many of them comments and the move of V2's trimming of hidden rows into one helper that both tries use; the PR states the final counts.
+
+**Tests first, all in `src/test/app.test.ts`:**
+- the reload carrying A, B, or neither, pinning the order of the tries;
+- a cancel that landed and one that didn't, each with a press waiting;
+- a press waiting when A is recorded, with one step and one decision;
+- the newest request installed and not settled, and late install and settle messages for it after the reload, which record nothing more and decide no press;
+- an installed Clear sort, whose rules are none;
+- the newest refused, with the older request installed;
+- a toggle-only action;
+- another window's change before the reload, with no resend (B's target already held it), and Undo keeping that change;
+- a reload that reorders sheets, one that changes the columns, and one that removes the sheet, with A carried;
+- the reload carrying neither, with B still out and with B installed and not settled, each with a press waiting;
+- a cancel that never landed, with an Undo press waiting, which then undoes A;
+- a hide still resolving beside A installed and B out;
+- a refresh on the same source with A installed and B out, which records nothing yet and keeps the action;
+- Undo after A's step, back to the baseline;
+- what was installed holding a sort and newly hidden rows: one sort step, without the rows;
+- a sort beside a hide still composing (V2's case, which already records).
+
+**Proof:** the typecheck and the full unit suite; CI's unfocused smoke list; the undo and redo smoke set, 3 runs; the stress runs under load.
+
 ## Later stages
 
 Each of these gets its own plan, reviewed by both reviewers under the same rules, just before it is built. The text here is the direction and the exit test, not the design. The full drafts reviewed through round 10 are in commit `6768ac2a` (this file, "Design: the queue", "Other sheets", "Choices made during other work", and "Stages"). Findings deferred from review are listed in the ledger for each stage.
