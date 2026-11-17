@@ -13,6 +13,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { _electron as electron, expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
+import { CHANNEL_HOST_MESSAGE } from '../shared/ipc';
 import {
     cell_point,
     choose,
@@ -122,11 +123,20 @@ function write_small(file: string): void {
 
 // ---------------------------------------------------------------- page helpers
 
-/** Click a sort item; answers the click's time in the page. */
-async function click_sort(page: Page, column: number, direction: 'ascending' | 'descending'): Promise<number> {
+/**
+ * Click a sort item; answers the click's time in the page. `before_click` runs
+ * once the item is offered enabled, just before the click.
+ */
+async function click_sort(
+    page: Page,
+    column: number,
+    direction: 'ascending' | 'descending',
+    before_click?: () => Promise<void>,
+): Promise<number> {
     const menu = await open_column_menu(page, column);
     const entry = menu.getByRole('menuitemcheckbox', { name: `Sort ${direction}` });
     await expect(entry).not.toHaveAttribute('aria-disabled', 'true');
+    await before_click?.();
     await page.evaluate(() => {
         document.addEventListener('click', (event) => {
             (globalThis as unknown as Record<string, unknown>).__last_click = event.timeStamp;
@@ -143,6 +153,41 @@ async function post_history(page: Page, command: 'undo' | 'redo'): Promise<numbe
         window.postMessage({ type: 'editCommand', command: sent }, '*');
         return t;
     }, command);
+}
+
+/**
+ * Hold every message the host sends the window until `release_host_messages`,
+ * which delivers them in order. The host goes on working; only the window
+ * waits, so a request the window sends meanwhile is made with what it held.
+ */
+async function hold_host_messages(): Promise<void> {
+    await app!.evaluate(({ webContents }, channel) => {
+        const main = globalThis as typeof globalThis & {
+            __held_host_messages?: (() => void)[];
+            __host_send_wrapped?: WeakSet<object>;
+        };
+        main.__held_host_messages = [];
+        main.__host_send_wrapped ??= new WeakSet();
+        for (const contents of webContents.getAllWebContents()) {
+            if (main.__host_send_wrapped.has(contents)) continue;
+            main.__host_send_wrapped.add(contents);
+            const send = contents.send.bind(contents);
+            contents.send = (sent_channel: string, ...args: unknown[]) => {
+                const held = main.__held_host_messages;
+                if (sent_channel !== channel || held === undefined) return send(sent_channel, ...args);
+                held.push(() => send(sent_channel, ...args));
+            };
+        }
+    }, CHANNEL_HOST_MESSAGE);
+}
+
+async function release_host_messages(): Promise<void> {
+    await app!.evaluate(() => {
+        const main = globalThis as typeof globalThis & { __held_host_messages?: (() => void)[] };
+        const held = main.__held_host_messages ?? [];
+        main.__held_host_messages = undefined;
+        for (const deliver of held) deliver();
+    });
 }
 
 interface Mark { name: string; startTime: number; detail?: Record<string, unknown> }
@@ -396,8 +441,14 @@ test('a 1M-row sort: Undo before it installs, and a second sort during the first
     }
 
     // Recorded only: a filter composed onto a sort still computing, from its
-    // Apply to the end of the action.
-    await click_sort(page, 1, 'ascending');
+    // Apply to the end of the action. The host's messages are held from the sort
+    // until the filter is posted, so the sort is still in flight for the window
+    // however long the filter editor takes: the filter joins its action, and the
+    // one Undo below takes both back. The host checks a request's source
+    // generation only, so the filter is admitted even if the sort has installed.
+    // The hold starts once the sort is offered, so nothing the window was still
+    // waiting for before the sort is held.
+    await click_sort(page, 1, 'ascending', hold_host_messages);
     await expect(page.locator('.toolbar-progress')).toBeVisible();
     // Its accessible name carries the shortcut, so it is matched by its start.
     const column_menu = await open_column_menu(page, 0);
@@ -409,6 +460,8 @@ test('a 1M-row sort: Undo before it installs, and a second sort during the first
     await popover.getByLabel('Filter value').fill('7');
     const apply_at = await page.evaluate(() => performance.now());
     await popover.getByRole('button', { name: 'Apply' }).click();
+    await expect(popover).toHaveCount(0);
+    await release_host_messages();
     const late_filter = (await wait_mark(page, 'tv:view-action-ended', apply_at)).startTime - apply_at;
     await settled(page);
     since = await post_history(page, 'undo');
