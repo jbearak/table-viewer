@@ -26122,6 +26122,22 @@ describe('view steps in history', () => {
             expect(undo_labels()).toEqual(['Hide 2 rows', 'Sort']);
         });
 
+        it('records a sort that installed beside a hide when a reload overtakes the hide\'s composed request', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            const question = await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await install(sort!);
+            await answer_hide(question!, [1]);
+            const composed = latest_transform_request(post_message);
+            expect(composed.state).toMatchObject({ sort: SORT_ASC, hiddenRows: [1] });
+
+            // The sort was saved; the hide's request had not been.
+            await reload([SORTED]);
+
+            expect(undo_labels()).toEqual(['Sort']);
+        });
+
         it('moves a replay it overtook when the reload shows the replay\'s target', async () => {
             const { post_message } = await render_app();
             await open(post_message);
