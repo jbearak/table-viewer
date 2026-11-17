@@ -4069,6 +4069,8 @@ export function App(): React.JSX.Element {
             drop_press_behind_unrecorded_gesture();
         }
     }, [drop_press_behind_unrecorded_gesture, record_view_step, sync_view_request_pending]);
+    const end_view_action_ref = useRef(end_view_action);
+    end_view_action_ref.current = end_view_action;
 
     /**
      * The host settled one of the view action's requests. When it has settled
@@ -6305,8 +6307,37 @@ export function App(): React.JSX.Element {
                         // stops it (I3, `panel-core.ts` handle_set_transform). The
                         // action decides on this snapshot once it is applied.
                         if (source_changed && view_action_ref.current !== undefined) {
+                            const outgoing = view_action_ref.current;
                             view_action_ref.current = undefined;
-                            publish_history_menu_ref.current();
+                            // Its hides go with the source they were asked of.
+                            for (const resolution of outgoing.action.resolving) {
+                                const timer = resolution_timers_ref.current.get(resolution.requestId);
+                                if (timer !== undefined) window.clearTimeout(timer);
+                                resolution_timers_ref.current.delete(resolution.requestId);
+                            }
+                            if (outgoing.action.requests.every((request) => request.settled)) {
+                                // Held open only by hides (V2): every request it sent
+                                // was settled under the old source, so it ends by V1's
+                                // rule on what was installed there, as it would have
+                                // with no hide, and the hides came to nothing (I2, I5).
+                                // `state_ref` still holds the old source's rules here.
+                                end_view_action_ref.current(
+                                    {
+                                        ...outgoing,
+                                        action: { ...outgoing.action, resolving: [] },
+                                        hide_refused: true,
+                                    },
+                                    outgoing.action.baseline,
+                                    state_ref.current.transforms?.[outgoing.action.sheetIndex],
+                                    outgoing.action.requests.at(-1)?.requestId
+                                        ?? outgoing.action.resolving.at(-1)?.requestId
+                                        ?? '',
+                                );
+                            } else {
+                                // Its requests still out are overtaken, and settled
+                                // below by what this snapshot shows.
+                                publish_history_menu_ref.current();
+                            }
                         }
                         const kept_sheet = view_action_ref.current?.action.sheetIndex;
                         const kept = kept_sheet === undefined ? undefined : {
@@ -11566,7 +11597,11 @@ export function App(): React.JSX.Element {
         // otherwise). That is the net effect: a sort chosen and cleared again,
         // with the toggle on, has no step either. A cancel sent again already
         // asks for the toggle the first one chose.
-        const keep_toggle = pending.action.cancelled || transform_view_step(
+        // A hide still resolving is a choice too, which the cancel takes back
+        // while keeping the toggle (I4).
+        const keep_toggle = pending.action.cancelled
+            || pending.action.resolving.length > 0
+            || transform_view_step(
             pending.worksheet,
             pending.schema,
             pending.action.baseline,

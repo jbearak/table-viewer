@@ -24533,6 +24533,66 @@ describe('view steps in history', () => {
             expect(posted(post_message, 'setTransform').filter((sent) => sent.intent === 'user')).toEqual([]);
         });
 
+        it('records a sort that installed beside a hide still resolving when a new source arrives', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+
+            const sort = await ask(post_message, { sort: SORT_ASC, filters: [] });
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await install(sort!);
+            expect(undo_labels()).toEqual([]);
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: 3,
+                sourceGeneration: 2,
+                reason: 'fileReload',
+                capabilities: CSV,
+                state: { transforms: [{ sort: SORT_ASC, filters: [], schema: SCHEMA }] },
+            }));
+
+            expect(undo_labels()).toEqual(['Sort']);
+            // The hide went with the old source.
+            expect(posted(post_message, 'setTransform').some((sent) => sent.state.hiddenRows?.length)).toBe(false);
+        });
+
+        it('drops a Redo waiting behind a hide alone that a new source ends', async () => {
+            const { post_message } = await render_app();
+            await open(post_message);
+            await redo_available(post_message);
+
+            await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+            await redo();
+            expect(press_held()).toBe(true);
+            await dispatch_host_message(refresh_snapshot_message(table_meta(), {
+                generation: 3,
+                sourceGeneration: 2,
+                reason: 'fileReload',
+                capabilities: CSV,
+            }));
+
+            expect(press_held()).toBe(false);
+            expect(redo_labels()).toEqual(['Filter']);
+            expect(posted(post_message, 'setTransform').filter((sent) => sent.state.filters?.length)).toEqual([]);
+        });
+
+        for (const settled of [false, true]) {
+            it.each([
+                ['Undo', () => undo()],
+                ['Cancel', () => click_button('Cancel')],
+            ])(`keeps "Only changed rows" on %s of a hide still resolving${settled ? ', the toggle installed' : ''}`, async (_name, cancel) => {
+                const { post_message } = await render_app();
+                await open(post_message);
+
+                await hide_rows_unanswered(post_message, [{ start: 1, end: 1 }]);
+                const toggle = await ask(post_message, { sort: [], filters: [], onlyChangedRows: true });
+                if (settled) await install(toggle!);
+                await cancel();
+
+                const sent = latest_transform_request(post_message);
+                expect(sent.intent).toBe('cancel');
+                expect(sent.state.onlyChangedRows).toBe(true);
+            });
+        }
+
         it('ends a hide answered while a restore is out, saying to wait', async () => {
             const { post_message } = await render_app();
             await open(post_message);
