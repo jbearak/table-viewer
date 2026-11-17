@@ -333,6 +333,26 @@ describe('a hide resolving in a view action', () => {
         expect(action.delta.sort).toBeUndefined();
     });
 
+    it('keeps the rules of a cancel sent again onto a moved baseline when it is refused, a hide chosen after it', () => {
+        let action = begin_view_action(0, schema, undefined);
+        action = choose_in_view_action(action, by_a, 'R1');
+        action = cancel_view_action(action, 'R2');
+        action = refresh_view_action(action, filtered, undefined).action;
+        action = resend_in_view_action(action, 'R3');
+        // The sort R1 asked for installed onto the other window's filter, and
+        // R2 was superseded: what is installed is the sort the cancel takes back.
+        const sorted = rules({ sort: by_a.sort, filters: filtered.filters });
+        let settled = settle_view_action(action, 'R1', sorted, 'R1');
+        if (settled.kind !== 'pending') throw new Error('unreachable');
+        settled = settle_view_action(settled.action, 'R2', sorted, 'R1');
+        if (settled.kind !== 'pending') throw new Error('unreachable');
+        action = resolve_in_view_action(settled.action, 'H', 1);
+        action = refuse_in_view_action(action, 'R3', sorted);
+
+        expect(action.requested.sort).toEqual([]);
+        expect(action.requested.filters).toEqual(filtered.filters);
+    });
+
     it('keeps another window\'s change when the request sent again onto it is refused', () => {
         let action = begin_view_action(0, schema, undefined);
         action = choose_in_view_action(action, by_a, 'A');

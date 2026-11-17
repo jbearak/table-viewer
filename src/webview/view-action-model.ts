@@ -14,8 +14,8 @@
  *
  * A Hide rows in the action first asks the host which source rows it hides.
  * Until the answer, the hide is resolving: it is part of the action, though
- * not yet a request of it, and the action does not end. The answer joins the action
- * as a choice; a refusal, or no answer, drops it.
+ * not yet a request of it, and the action does not end. The answer joins
+ * the action as a choice; a refusal, or no answer, drops it.
  *
  * It ends when the host has settled every request it sent and no hide is
  * resolving (I3), and its step runs from the baseline to what is then
