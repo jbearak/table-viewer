@@ -101,6 +101,19 @@ function write_big(file: string): void {
     }
 }
 
+/** The first row a sort of `column` puts first in the large table. */
+function big_first_row(column: 1 | 2, direction: 'ascending' | 'descending'): string {
+    let best = big_cells(1);
+    for (let i = 2; i <= BIG_ROWS; i += 1) {
+        const candidate = big_cells(i);
+        const better = direction === 'ascending'
+            ? candidate[column] < best[column]
+            : candidate[column] > best[column];
+        if (better) best = candidate;
+    }
+    return best.join('|');
+}
+
 function write_small(file: string): void {
     const lines = ['Name,Value,Notes'];
     for (let i = 0; i < 60; i += 1) lines.push(`row${i},${i},note${i}`);
@@ -348,13 +361,12 @@ test('a 1M-row sort: Undo before it installs, and a second sort during the first
     // A second sort during the first, against the same sort alone.
     const lone: number[] = [];
     const second: number[] = [];
-    let sorted_desc = '';
+    const sorted_desc = big_first_row(2, 'descending');
     for (let round = 0; round < 3; round += 1) {
         const lone_click = await click_sort(page, 2, 'descending');
         lone.push((await wait_mark(page, 'tv:view-action-ended', lone_click)).startTime - lone_click);
         await settled(page);
-        await expect.poll(() => first_row(page), { timeout: 60_000 }).not.toBe(natural);
-        sorted_desc = await first_row(page);
+        await expect.poll(() => first_row(page), { timeout: 60_000 }).toBe(sorted_desc);
         since = await post_history(page, 'undo');
         await wait_mark(page, 'tv:history-changed', since);
         await settled(page);
