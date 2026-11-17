@@ -85,9 +85,23 @@ const redo_label = () => menu_label('redo');
 /**
  * Click an Edit menu item once the native menu has it. The capture above sees
  * the window's post before main.ts rebuilds the menu from it, so the label
- * there can be ahead of the menu's.
+ * there can be ahead of the menu's. main.ts rebuilds it only for the focused
+ * window, and routes the click to it, so the viewer is focused first, as
+ * desktop-smoke.spec.ts's `focus_viewer` does.
  */
 async function click_edit_item(label: string): Promise<void> {
+    const viewer = await app!.evaluate(({ BrowserWindow }) => {
+        const window = BrowserWindow.getAllWindows()
+            .find((candidate) => candidate.webContents.getURL().startsWith('tv-app://viewer'));
+        window?.show();
+        window?.focus();
+        return window?.id ?? null;
+    });
+    expect(viewer, 'a viewer window').not.toBeNull();
+    await expect.poll(
+        () => app!.evaluate(({ BrowserWindow }) => BrowserWindow.getFocusedWindow()?.id ?? null),
+        { message: 'the viewer is focused; is another app in front?', timeout: 15_000 },
+    ).toBe(viewer);
     await expect.poll(() => app!.evaluate(({ Menu }, wanted) => Menu.getApplicationMenu()
         ?.items.find((item) => item.label === 'Edit')
         ?.submenu?.items.some((item) => item.label === wanted) ?? false, label)).toBe(true);
