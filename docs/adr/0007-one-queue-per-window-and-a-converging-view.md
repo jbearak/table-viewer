@@ -12,7 +12,7 @@ Sort, filter, and Hide rows are the view the person asked for, which the host co
 - **The newest choice wins.** It composes onto the rules already asked for, slice by slice, and replaces the request in flight. Every control builds from, and shows, the rules asked for.
 - **A step records when its view installs,** on top, from the rules before the action to what installed. Nothing records before the view is on screen, and nothing is placed below another step.
 - **An action ends when the host has settled every request it sent,** after any durable reconciliation that follows. The settlement carries what is installed and which of the window's requests committed it, so rules written by another window are not recorded as the action's. The record of which request committed the rules is kept in the process, which leaves one case. Another process that writes exactly the rules this window committed, between that commit and its reconciliation, is taken for this window. The step it records is then one this window also chose, and its Undo goes back over both. Every answer and refresh is applied, so every install the host makes for the window is either recorded or undone by the action's cancel. A refresh ends the action only when the source is new. A refresh that changes the sheet's rules from elsewhere moves the action's baseline, and its request is sent again onto them.
-- **Undo of the pending action, and Cancel, go back to the rules from before it.** That cancel is the action's newest request. A choice made before it is answered stays in the same action.
+- **Undo of the pending action, and Cancel, go back to the action's baseline:** the rules from before it, or the rules a refresh from elsewhere moved it onto. That cancel is the action's newest request. A choice made before it is answered stays in the same action.
 - **Presses wait for the pending action, as today,** and today's rules decide them when it ends. A new choice drops a press waiting behind it.
 - **Hide rows** first asks the host to turn its display rows into source rows. The hide then composes onto the rules asked for, unless a sort installed first and moved its rows, in which case it is refused.
 
@@ -34,7 +34,7 @@ A session release does not hold the slot. It blocks only what needs the host's t
 
 A gesture made while the slot is held is refused with today's message, as it is today. A Header Row run waits for the slot, as the header queue waits today, and a paste joins its run.
 
-Undo and Redo are queue items. Undo or Cancel of a sheet's pending action goes back to the rules installed when the action began. A press waits for the slot holder, then runs against the stack as it then is. It is removed with a message only if the work it was made for fails. Work that succeeds and changes nothing lets it run. Save, Discard, a session hand-off, and an owed Auto-fit block a press but are never what it was made for.
+Undo and Redo are queue items. Undo or Cancel of a sheet's pending action goes back to the action's baseline: the rules installed when it began, or those a refresh from elsewhere moved it onto. A press waits for the slot holder, then runs against the stack as it then is. It is removed with a message only if the work it was made for fails. Work that succeeds and changes nothing lets it run. Save, Discard, a session hand-off, and an owed Auto-fit block a press but are never what it was made for.
 
 ### Events and drafts
 
