@@ -12325,13 +12325,6 @@ export function App(): React.JSX.Element {
                 // not just its projection. A stale terminal must not clear or replace
                 // the verdict installed by a later accepted result.
                 const authoritative = transition.next.authoritative;
-                // Saved, the values a Reapply read are the file's own, so an order
-                // computed from them is no longer stale for edits the save consumed.
-                if (
-                    msg.lifecycle.state === 'succeeded'
-                    && authoritative.state === 'succeeded'
-                    && authoritative.revision === msg.lifecycle.revision
-                ) set_installed_read_values([]);
                 const receipt_operation = msg.lifecycle.state === 'succeeded'
                     && msg.receipt !== undefined
                     && authoritative.state === 'succeeded'
@@ -12364,6 +12357,15 @@ export function App(): React.JSX.Element {
                         || save_lifecycle_correlation(msg.lifecycle)?.editSessionId
                             === current_session_id);
                 if (!matching) return;
+                // Saved, the values a Reapply read are the file's own, so an order
+                // computed from them is no longer stale for edits the save consumed.
+                // Below the guards above, so a repeated result for a save already
+                // settled cannot clear what a later Reapply recorded.
+                if (
+                    msg.lifecycle.state === 'succeeded'
+                    && authoritative.state === 'succeeded'
+                    && authoritative.revision === msg.lifecycle.revision
+                ) set_installed_read_values([]);
                 const pending_grid_focus = pending_save_grid_focus_ref.current;
                 const restore_rejected_grid_focus = operation !== undefined
                     && pending_grid_focus?.editSessionId === operation.editSessionId
