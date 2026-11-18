@@ -12406,7 +12406,7 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         await render_columns({ structural_support: undefined });
         expect(grid_mock.props!.onColumnMoved).toBeUndefined();
         await open_header_menu(0);
-        expect(menu_button_labels()).not.toContain('Insert column left');
+        expect(menu_button_labels()).toEqual(expect.not.arrayContaining(['Insert›', 'Delete column', 'Move›']));
     });
 });
 
