@@ -16,12 +16,12 @@ import type { ElectronApplication, Page } from '@playwright/test';
 import { build_fixture_xlsx, cell, row } from '../../src/test/helpers/xlsx-structure-fixture';
 import { isolated_user_data, read_workbook } from './smoke-helpers';
 import {
-    choose,
     exit_app,
     grid_rows,
     install_dialog_capture,
     launch_structural_viewer,
     open_row_menu,
+    choose_from_submenu,
     save_button,
     save_changes,
     take_dialogs,
@@ -182,7 +182,7 @@ for (const added of ['appended', 'inserted'] as const) {
             await page.getByRole('button', { name: 'Add rows' }).click();
             await page.getByRole('button', { name: 'Add row', exact: true }).click();
         } else {
-            await choose(await open_row_menu(page, 1), 'Insert row above');
+            await choose_from_submenu(await open_row_menu(page, 1), 'Insert', 'Insert row above');
         }
         await expect.poll(() => body(page)).toEqual(with_row);
 

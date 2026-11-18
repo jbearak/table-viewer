@@ -32,6 +32,7 @@ import {
     launch_structural_viewer,
     open_column_menu,
     open_row_menu,
+    choose_from_submenu,
     save_button,
     take_dialogs,
     type_into_cell,
@@ -569,7 +570,7 @@ test('a row inserted above a taller row is drawn at the default height', async (
         redo: 'Redo',
     });
 
-    await choose(await open_row_menu(page, 2), 'Insert row above');
+    await choose_from_submenu(await open_row_menu(page, 2), 'Insert', 'Insert row above');
     await expect.poll(async () => (await body(page)).length).toBe(5);
 
     // Alice, Bob, the new row, then Charlie: still the one tall row. The new

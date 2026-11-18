@@ -22,6 +22,7 @@ import {
     save_changes,
     open_column_menu,
     open_row_menu,
+    choose_from_submenu,
     save_screenshot,
     recorded_dialogs,
     type_into_cell,
@@ -56,7 +57,7 @@ test('unsaved row and column changes survive closing the window and relaunching,
             const page = first.page;
             await install_dialog_capture(first.app, close_dialogs);
             await wait_for_grid(page);
-            await choose(await open_row_menu(page, 1), 'Insert row above');
+            await choose_from_submenu(await open_row_menu(page, 1), 'Insert', 'Insert row above');
             await expect.poll(async () => (await grid_rows(page))[1]).toBe('Row 2, inserted||');
             await type_into_cell(page, 1, 1, 'kiwi');
             await choose(await open_row_menu(page, 3), 'Delete row');

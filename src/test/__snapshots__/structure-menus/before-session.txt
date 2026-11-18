@@ -1,38 +1,50 @@
 ## row menu, source row 2 (Row actions for row 2)
-Insert row above  [disabled: Wait for the current change to finish.]
-Insert row below  [disabled: Wait for the current change to finish.]
-Delete row  [disabled: Wait for the current change to finish.]
-Move rows up  [disabled: Wait for the current change to finish.]
-Move rows down  [disabled: Wait for the current change to finish.]
 Hide row
 Copy row
+---
+Insert >
+    Insert row above  [disabled: Wait for the current change to finish.]
+    Insert row below  [disabled: Wait for the current change to finish.]
+Delete row  [disabled: Wait for the current change to finish.]
+Move >
+    Move rows up  [disabled: Wait for the current change to finish.]
+    Move rows down  [disabled: Wait for the current change to finish.]
 
 ## row menu, first row (Row actions for row 1)
-Insert row above  [disabled: Wait for the current change to finish.]
-Insert row below  [disabled: Wait for the current change to finish.]
-Delete row  [disabled: Wait for the current change to finish.]
-Move rows up  [disabled: Wait for the current change to finish.]
-Move rows down  [disabled: Wait for the current change to finish.]
 Hide row
 Copy row
+---
+Insert >
+    Insert row above  [disabled: Wait for the current change to finish.]
+    Insert row below  [disabled: Wait for the current change to finish.]
+Delete row  [disabled: Wait for the current change to finish.]
+Move >
+    Move rows up  [disabled: Wait for the current change to finish.]
+    Move rows down  [disabled: Wait for the current change to finish.]
 
 ## row menu, rows 1-2 selected (Row actions for 2 selected rows)
-Insert 2 rows above  [disabled: Wait for the current change to finish.]
-Insert 2 rows below  [disabled: Wait for the current change to finish.]
-Delete 2 rows  [disabled: Wait for the current change to finish.]
-Move rows up  [disabled: Wait for the current change to finish.]
-Move rows down  [disabled: Wait for the current change to finish.]
 Hide 2 rows
 Copy 2 rows
+---
+Insert >
+    Insert 2 rows above  [disabled: Wait for the current change to finish.]
+    Insert 2 rows below  [disabled: Wait for the current change to finish.]
+Delete 2 rows  [disabled: Wait for the current change to finish.]
+Move >
+    Move rows up  [disabled: Wait for the current change to finish.]
+    Move rows down  [disabled: Wait for the current change to finish.]
 
 ## row menu, rows 1 and 3 selected (Row actions for 2 selected rows)
-Insert 2 rows above  [disabled: Wait for the current change to finish.]
-Insert 2 rows below  [disabled: Wait for the current change to finish.]
-Delete 2 rows  [disabled: Wait for the current change to finish.]
-Move rows up  [disabled: Wait for the current change to finish.]
-Move rows down  [disabled: Wait for the current change to finish.]
 Hide 2 rows
 Copy 2 rows
+---
+Insert >
+    Insert 2 rows above  [disabled: Wait for the current change to finish.]
+    Insert 2 rows below  [disabled: Wait for the current change to finish.]
+Delete 2 rows  [disabled: Wait for the current change to finish.]
+Move >
+    Move rows up  [disabled: Wait for the current change to finish.]
+    Move rows down  [disabled: Wait for the current change to finish.]
 
 ## cell menu, cell B2 (Context menu)
 Highlight yellow

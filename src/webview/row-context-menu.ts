@@ -55,6 +55,11 @@ export function hide_rows_menu_item(
     };
 }
 
+/**
+ * The row menu, most-used first: "Use row as header", Hide, Reset height, and
+ * Copy; then, past a separator, the structure items, with Insert and Move
+ * folded into submenus so the menu stays short.
+ */
 export function row_context_menu_items(props: RowContextMenuModelProps): MenuItem[] {
     const selected_row_count = Math.max(1, props.selected_row_count);
     const items: MenuItem[] = [];
@@ -63,30 +68,6 @@ export function row_context_menu_items(props: RowContextMenuModelProps): MenuIte
             label: 'Use row as header',
             on_click: () => props.on_promote_row_to_header(),
             ...(props.promote_row_disabled ? { disabled: true } : {}),
-        });
-    }
-    const { structure } = props;
-    if (structure !== undefined) {
-        items.push(...structure.insert, ...structure.delete, ...structure.move);
-    } else if (props.on_remove_pending_rows || props.show_disabled_remove_pending_rows) {
-        const pending_row_count = Math.max(
-            1,
-            props.pending_row_count ?? selected_row_count,
-        );
-        items.push({
-            label: pending_row_count === 1
-                ? 'Remove pending row'
-                : `Remove ${pending_row_count} pending rows`,
-            on_click: () => props.on_remove_pending_rows?.(),
-            ...(props.on_remove_pending_rows === undefined ? { disabled: true } : {}),
-        });
-    }
-    if (props.on_cancel_row_removals) {
-        items.push({
-            label: selected_row_count === 1
-                ? 'Cancel row removal'
-                : `Cancel ${selected_row_count} row removals`,
-            on_click: () => props.on_cancel_row_removals?.(),
         });
     }
     if (props.can_hide_rows || props.show_disabled_hide_rows) {
@@ -110,5 +91,38 @@ export function row_context_menu_items(props: RowContextMenuModelProps): MenuIte
         label: selected_row_count === 1 ? 'Copy row' : `Copy ${selected_row_count} rows`,
         on_click: () => props.on_copy_rows(),
     });
+
+    const edits: MenuItem[] = [];
+    const { structure } = props;
+    if (structure !== undefined) {
+        if (structure.insert.length > 0) {
+            edits.push({ kind: 'submenu', label: 'Insert', items: [...structure.insert] });
+        }
+        edits.push(...structure.delete);
+        if (structure.move.length > 0) {
+            edits.push({ kind: 'submenu', label: 'Move', items: [...structure.move] });
+        }
+    } else if (props.on_remove_pending_rows || props.show_disabled_remove_pending_rows) {
+        const pending_row_count = Math.max(
+            1,
+            props.pending_row_count ?? selected_row_count,
+        );
+        edits.push({
+            label: pending_row_count === 1
+                ? 'Remove pending row'
+                : `Remove ${pending_row_count} pending rows`,
+            on_click: () => props.on_remove_pending_rows?.(),
+            ...(props.on_remove_pending_rows === undefined ? { disabled: true } : {}),
+        });
+    }
+    if (props.on_cancel_row_removals) {
+        edits.push({
+            label: selected_row_count === 1
+                ? 'Cancel row removal'
+                : `Cancel ${selected_row_count} row removals`,
+            on_click: () => props.on_cancel_row_removals?.(),
+        });
+    }
+    if (edits.length > 0) items.push({ kind: 'separator' }, ...edits);
     return items;
 }

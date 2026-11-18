@@ -44,9 +44,9 @@ describe('row context menu model', () => {
             label: item.label,
             disabled: item.kind === 'submenu' ? false : item.disabled === true,
         }))).toEqual([
-            { label: 'Remove 2 pending rows', disabled: false },
             { label: 'Hide 2 rows', disabled: true },
             { label: 'Copy 2 rows', disabled: false },
+            { label: 'Remove 2 pending rows', disabled: false },
         ]);
     });
 
@@ -64,10 +64,10 @@ describe('row context menu model', () => {
         });
         expect(items.flatMap((item) => item.kind === 'separator' ? [] : [item.label]))
             .toEqual([
-                'Remove pending row',
-                'Cancel row removal',
                 'Hide row',
                 'Copy row',
+                'Remove pending row',
+                'Cancel row removal',
             ]);
     });
 
@@ -87,9 +87,9 @@ describe('row context menu model', () => {
             label: item.label,
             disabled: item.kind === 'submenu' ? false : item.disabled === true,
         }))).toEqual([
-            { label: 'Remove pending row', disabled: true },
             { label: 'Hide 2 rows', disabled: true },
             { label: 'Copy 2 rows', disabled: false },
+            { label: 'Remove pending row', disabled: true },
         ]);
     });
 
@@ -166,16 +166,29 @@ describe('row structure items', () => {
         delete: [item('Delete 2 rows'), { ...item('Restore row'), disabled: true, disabled_reason: 'Not yet' }],
         move: [item('Move rows up'), item('Move rows down')],
     };
-    const labels_of = (items: ReturnType<typeof row_context_menu_items>) =>
-        items.flatMap((entry) => entry.kind === 'separator' || entry.kind === 'submenu' ? [] : [entry.label]);
+    /** One line per item: a separator as "---", a submenu as its label and its items. */
+    const labels_of = (items: ReturnType<typeof row_context_menu_items>): string[] =>
+        items.flatMap((entry) => entry.kind === 'separator'
+            ? ['---']
+            : entry.kind === 'submenu'
+                ? [`${entry.label} >`, ...labels_of(entry.items).map((label) => `  ${label}`)]
+                : [entry.label]);
 
-    it('places Insert, Delete, Restore, and Move as given, replacing Remove pending rows', () => {
+    it('leads with Hide and Copy, then folds Insert and Move into submenus around Delete and Restore', () => {
         const items = row_context_menu_items({ ...base, on_remove_pending_rows: vi.fn(), structure });
         expect(labels_of(items)).toEqual([
-            'Insert 2 rows above', 'Insert 2 rows below', 'Delete 2 rows', 'Restore row',
-            'Move rows up', 'Move rows down', 'Hide 2 rows', 'Copy 2 rows',
+            'Hide 2 rows', 'Copy 2 rows',
+            '---',
+            'Insert >', '  Insert 2 rows above', '  Insert 2 rows below',
+            'Delete 2 rows', 'Restore row',
+            'Move >', '  Move rows up', '  Move rows down',
         ]);
-        expect(items[3]).toBe(structure.delete[1]);
+        expect(items[5]).toBe(structure.delete[1]);
+    });
+
+    it('puts "Use row as header" first, ahead of Hide', () => {
+        expect(labels_of(row_context_menu_items({ ...base, can_promote_row_to_header: true, structure }))
+            .slice(0, 3)).toEqual(['Use row as header', 'Hide 2 rows', 'Copy 2 rows']);
     });
 
     it('keeps Cancel row removal for tail removals beside the structure items', () => {
@@ -184,6 +197,6 @@ describe('row structure items', () => {
             selected_row_count: 1,
             on_cancel_row_removals: vi.fn(),
             structure: { insert: [], delete: [item('Delete row')], move: [] },
-        }))).toEqual(['Delete row', 'Cancel row removal', 'Hide row', 'Copy row']);
+        }))).toEqual(['Hide row', 'Copy row', '---', 'Delete row', 'Cancel row removal']);
     });
 });

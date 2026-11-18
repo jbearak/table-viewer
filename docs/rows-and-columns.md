@@ -6,7 +6,7 @@ These actions are not available for `.xls`, `.dta`, or Parquet files, in a compa
 
 ## Rows
 
-Right-click a row number to open the row menu. In a file you can edit, it has these items:
+Right-click a row number to open the row menu. It starts with the items you use most, such as **Hide row** and **Copy row**. In a file you can edit, these items follow, with Insert and Move in **Insert** and **Move** submenus:
 
 | Item | What it does |
 |---|---|

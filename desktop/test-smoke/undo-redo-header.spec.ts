@@ -30,6 +30,7 @@ import {
     launch_structural_viewer,
     open_column_menu,
     open_row_menu,
+    choose_from_submenu,
     save_button,
     save_changes,
     take_dialogs,
@@ -173,7 +174,7 @@ test('changes made with the header on, and one made with it off, are each undone
     await expect.poll(() => headers(page)).toEqual(['name', 'qty']);
 
     await type_into_cell(page, 1, 0, 'pear');
-    await choose(await open_row_menu(page, 1), 'Insert row above');
+    await choose_from_submenu(await open_row_menu(page, 1), 'Insert', 'Insert row above');
     await expect.poll(() => body(page)).toEqual(['pear|10', '|', 'banana|20', 'cherry|30']);
     await choose(await open_row_menu(page, 3), 'Delete row');
     const with_header = ['pear|10', '|', 'banana|20', '-cherry|30'];

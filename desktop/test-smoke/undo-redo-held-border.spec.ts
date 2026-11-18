@@ -31,6 +31,7 @@ import {
     launch_structural_viewer,
     open_column_menu,
     open_row_menu,
+    choose_from_submenu,
     select_column,
     take_dialogs,
     wait_for_grid,
@@ -196,7 +197,7 @@ for (const kind of ['csv', 'xlsx'] as const) {
     test(`${kind}: a new row made taller is taken away by Undo and brought back by Redo`, async () => {
         const page = await open_file(`taller.${kind}`, fixture(kind));
         await expect_shown(page, { body: NATURAL, undo: 'Undo', redo: 'Redo' });
-        await choose(await open_row_menu(page, 1), 'Insert row above');
+        await choose_from_submenu(await open_row_menu(page, 1), 'Insert', 'Insert row above');
         await expect_shown(page, { body: WITH_ROW, undo: 'Undo Insert row' });
 
         await drag_row_border(page, 1, 30);
@@ -290,7 +291,7 @@ test('the border of a new last column held while its insert is undone resizes no
 
 test('a row border held while a row insert is undone resizes nothing', async () => {
     const page = await open_file('row-border.csv', CSV);
-    await choose(await open_row_menu(page, 1), 'Insert row above');
+    await choose_from_submenu(await open_row_menu(page, 1), 'Insert', 'Insert row above');
     await expect_shown(page, { body: WITH_ROW, undo: 'Undo Insert row' });
 
     // Hold Bob's bottom border, and undo the insert with it held.
