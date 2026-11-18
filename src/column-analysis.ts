@@ -222,7 +222,12 @@ export async function acquire_column_analysis(
     identity_requirement: ColumnIdentityRequirement,
     cache: ColumnAnalysisCache | undefined,
     is_cancelled: () => boolean,
+    /** Cells to read in place of the source's, keyed by projected row: the unsaved
+     *  values a Reapply sorts and filters by. An analysis built from them describes
+     *  no saved column, so it neither comes from the cache nor goes into it. */
+    overrides?: ReadonlyMap<number, RawCell | null>,
 ): Promise<ColumnAnalysis> {
+    if (overrides !== undefined && overrides.size > 0) cache = undefined;
     const cached = cache?.get(
         sheet_index,
         column_index,
@@ -264,7 +269,9 @@ export async function acquire_column_analysis(
 
         for (let offset = 0; offset < rows.length; offset += 1) {
             const row = start + offset;
-            const source_cell = rows[offset]?.[0] ?? null;
+            const source_cell = overrides?.has(row)
+                ? overrides.get(row) ?? null
+                : rows[offset]?.[0] ?? null;
             const raw = raw_value(source_cell);
             values[row] = raw;
 

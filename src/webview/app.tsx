@@ -127,7 +127,10 @@ import {
     compile_a1_formula_move_retargeter,
     retarget_renamed_structured_formula,
 } from '../xlsx-formula';
-import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
+import {
+    classify_xlsx_cell_value,
+    xlsx_edit_writes_formula,
+} from '../xlsx-cell-value';
 import {
     MAX_SHEET_ROWS,
     MAX_WORKBOOK_FORMULAS,
@@ -174,8 +177,10 @@ import { Toolbar, type ToolbarFocusHandle } from './toolbar';
 import { FilterPopover } from './filter-popover';
 import {
     order_relevant_dirty_keys,
+    stale_dirty_keys,
     stale_view_signature,
     transform_progress_label,
+    transform_read_values,
     upsert_filter,
     type FilterHistogramReady,
     type FilterHistogramStatus,
@@ -1325,6 +1330,8 @@ export function App(): React.JSX.Element {
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
     // 'markdown' on xlsx: cell text edits as inline markup (see cell-edit-model).
     const [edit_syntax, set_edit_syntax] = useState<'plain' | 'markdown'>('plain');
+    const edit_syntax_ref = useRef(edit_syntax);
+    edit_syntax_ref.current = edit_syntax;
     // The source's append row ceiling, resolved host-side by
     // `append_row_ceiling_for`. `null` on the wire means "no ceiling" and is
     // widened to Infinity here; absent means an older host, which reads as the
@@ -3030,13 +3037,34 @@ export function App(): React.JSX.Element {
     // cleared by an intermediate native-message render before the target sheet
     // has mounted.
     const rejected_sheet_grid_focus_ref = useRef<GridFocusRestoreState | null>(null);
-    // Stale-view signature the user acknowledged ("Dismiss"). Purely informational:
-    // the banner it silences states that the displayed order does not recompute
-    // mid-edit, which is intended, so acknowledging it must not touch the view. It
-    // reappears once a *different* set of order-relevant edits — or a different
-    // installed sort or filter — makes that statement a new fact.
+    // Stale-view signature the user acknowledged ("Dismiss"). The banner it silences
+    // states that the displayed order does not recompute as the user types, which is
+    // intended, so acknowledging it must not touch the view; Reapply is the separate
+    // action that does. It reappears once a *different* set of order-relevant edits —
+    // or a different installed sort or filter — makes that statement a new fact.
     const [acknowledged_stale_signature, set_acknowledged_stale_signature] =
         useState<string | undefined>(undefined);
+    // Per sheet, the unsaved values the installed order was computed from: what the
+    // request that installed it read (`transform_read_values`). An edit whose value is
+    // here is one the rows on screen already reflect, so the notice leaves it out.
+    // Kept per sheet until that sheet's next recomputing install. Outlives the
+    // session on purpose: after a Discard the order still reflects the values it
+    // read, and the notice must be able to say so. Stamped with the source generation
+    // and rules it was computed over: a Save reloads the source, and a view replaced
+    // some other way read saved values, so the stamp no longer matches and nothing
+    // counts as read.
+    const [installed_read_values, set_installed_read_values] = useState<
+        readonly ({
+            readonly sourceGeneration: number;
+            readonly rules: string;
+            readonly values: Readonly<Record<string, string>>;
+        } | undefined)[]
+    >([]);
+    // What each transform request in flight read, by request id, so an install
+    // records its own request's values even when a newer request has replaced it.
+    const transform_request_read_values_ref = useRef(
+        new Map<string, Readonly<Record<string, string>>>(),
+    );
     // Keys the *host* refused a save over, from a saveResult's `rejection`. These
     // exist because the webview cannot inspect a filtered-out row, an evicted page,
     // or a row past the current row count. Without this state the review could not
@@ -4016,6 +4044,10 @@ export function App(): React.JSX.Element {
         // Given for a gesture that records a step and for a replay; a restore
         // and a cancel give none.
         view?: Omit<PendingViewTransform, 'requestId'>,
+        // Reapply only: the install reads the unsaved values on screen. Every other
+        // request reads saved values, so a hide, a replay or a new sort moves no row
+        // by an edit the person did not ask to apply.
+        read_unsaved = false,
     ): string => {
         const request_id = [
             'transform',
@@ -4023,9 +4055,49 @@ export function App(): React.JSX.Element {
             sheet_index,
             ++transform_request_seq_ref.current,
         ].join(':');
+        const previous_request_id = pending_transform_request_ids_ref.current[sheet_index];
         pending_transform_request_ids_ref.current[sheet_index] = request_id;
         pending_transform_states_ref.current[sheet_index] = state;
         pending_transform_origins_ref.current[sheet_index] = origin;
+        // A Reapply replaced by the next request on its sheet (a Cancel, say) is
+        // superseded: its install is not taken, so neither are its read values.
+        if (previous_request_id !== undefined) {
+            transform_request_read_values_ref.current.delete(previous_request_id);
+        }
+        // Only a Reapply reads unsaved values. An XLSX formula has no result the
+        // host can read before Save, so it is not sent, and the notice keeps counting
+        // it as stale. An unstyled XLSX number is sent as the reload would read it
+        // (`1.` as `1`); a styled one saves as text, and dates and booleans, which
+        // need the cell's style, are sent as typed.
+        let cell_values: Record<string, string> = {};
+        if (read_unsaved) {
+            const xlsx = edit_syntax_ref.current === 'markdown';
+            const runs_of = (entry: CsvDirtyEntry) => {
+                const runs = entry.valueRuns?.runs;
+                return runs && runs.length > 0 ? runs : undefined;
+            };
+            const entries = [...edit_session_registry_ref.current!.for_sheet(sheet_index).snapshot()]
+                .filter(([, entry]) => !xlsx || !xlsx_edit_writes_formula(entry.value, runs_of(entry)));
+            const read_values = transform_read_values(
+                state,
+                entries,
+                header_body_start(meta_ref.current?.sheets[sheet_index]?.excelFirstRowHeader),
+            );
+            const by_key = new Map(entries);
+            cell_values = xlsx
+                ? Object.fromEntries(Object.entries(read_values).map(([key, value]) => {
+                    if (runs_of(by_key.get(key)!) !== undefined) return [key, value];
+                    const classified = classify_xlsx_cell_value(value, {
+                        datemode: 0,
+                        is_date_style: () => false,
+                    });
+                    return [key, classified.kind === 'number'
+                        ? String(Number(classified.text))
+                        : value];
+                }))
+                : read_values;
+            transform_request_read_values_ref.current.set(request_id, read_values);
+        }
         // Replaces whatever was pending on this sheet. A replaced request of the
         // person's view action is still answered, and the action keeps its id for
         // that answer and records once the host has settled all it sent; a replaced
@@ -4056,6 +4128,7 @@ export function App(): React.JSX.Element {
             generation: generation_ref.current,
             sourceGeneration: source_generation_ref.current,
             intent,
+            ...(Object.keys(cell_values).length > 0 ? { cellValues: cell_values } : {}),
         });
         return request_id;
     }, [sync_view_request_pending]);
@@ -6454,6 +6527,11 @@ export function App(): React.JSX.Element {
                             [],
                             kept?.id === undefined || kept_sheet === undefined ? undefined : previous[kept_sheet],
                         ));
+                        for (const dropped of pending_transform_request_ids_ref.current) {
+                            if (dropped !== undefined && dropped !== kept?.id) {
+                                transform_request_read_values_ref.current.delete(dropped);
+                            }
+                        }
                         pending_transform_request_ids_ref.current = keep([], kept?.id);
                         pending_transform_states_ref.current = keep([], kept?.state);
                         pending_transform_origins_ref.current = keep([], kept?.origin);
@@ -6972,6 +7050,7 @@ export function App(): React.JSX.Element {
             }
 
             if (msg.type === 'transformRefused') {
+                transform_request_read_values_ref.current.delete(msg.requestId);
                 if (
                     pending_transform_request_ids_ref.current[msg.sheetIndex]
                     !== msg.requestId
@@ -7019,8 +7098,8 @@ export function App(): React.JSX.Element {
                 // queue: a sort or filter replayed seconds later — when a sibling's
                 // session releases or a save finishes — would move rows under a user
                 // who is mid-edit and has moved on, which is the one thing this whole
-                // design exists to prevent, and it would amount to the deferred
-                // "Resort/Refilter" action the design forbids. A refused user request
+                // design exists to prevent. Rows move only when the person asks, as
+                // with Reapply. A refused user request
                 // fails visibly (the warning below names the reason) and stays failed;
                 // the user asks again if they still want it.
                 const refusal_origin =
@@ -7247,6 +7326,13 @@ export function App(): React.JSX.Element {
                         wake_header_drain();
                     }
                 }
+                // Only an install that moved the generation computed anything: the
+                // host answers a restore or cancel whose rules it already holds with a
+                // no-op ack, which read no values, so what the view reflects stays.
+                const recomputed = view.basis.generation !== generation_ref.current;
+                const request_read_values =
+                    transform_request_read_values_ref.current.get(msg.requestId);
+                transform_request_read_values_ref.current.delete(msg.requestId);
                 if (view.basis.generation !== generation_ref.current) {
                     // An action's request folded the open editor when it was made,
                     // and cells have offered none since, like any view request's.
@@ -7292,6 +7378,27 @@ export function App(): React.JSX.Element {
                 }
                 set_generation(view.basis.generation);
                 generation_ref.current = view.basis.generation;
+                if (recomputed) {
+                    // Every install that recomputed replaces it: what a Reapply read,
+                    // or nothing for any other request, which read saved values.
+                    set_installed_read_values((prev) => {
+                        const next = [...prev];
+                        next[msg.sheetIndex] = view.permuted
+                            ? {
+                                sourceGeneration: view.basis.sourceGeneration,
+                                rules: JSON.stringify(view.rules),
+                                values: request_read_values ?? {},
+                            }
+                            : undefined;
+                        return next;
+                    });
+                    // A dismissal named edits this install has now sorted by; one of
+                    // them going stale again is news, so the notice may say it.
+                    if (
+                        request_read_values !== undefined
+                        && Object.keys(request_read_values).length > 0
+                    ) set_acknowledged_stale_signature(undefined);
+                }
                 // Something installed, so whatever was refusing has cleared: the next
                 // restore is free to ask again.
                 restore_request_blockers_ref.current[msg.sheetIndex] = undefined;
@@ -10975,6 +11082,62 @@ export function App(): React.JSX.Element {
     );
 
     /**
+     * The stale-view banner's Reapply: the installed rules again, computed over the
+     * unsaved values on screen. Not a view choice: it records no step (Undo keeps
+     * taking back edits) and joins no action. Offered only while the sheet's view is
+     * idle, since sent beside a choice in flight it would replace that choice with
+     * the older rules. The fold in `view_gesture_may_start` runs before the store is
+     * read, so a value still in an open editor is applied too.
+     */
+    const reapply_view = useCallback((): void => {
+        const sheet_index = active_sheet_index;
+        if (
+            view_action_ref.current !== undefined
+            || pending_transform_request_ids_ref.current[sheet_index] !== undefined
+        ) {
+            show_warning(VIEW_GESTURE_WAIT_MESSAGE);
+            return;
+        }
+        // The rules the view on screen was built from. While the durable rules say
+        // otherwise a restore is on its way to install them, and Reapply would write
+        // the older rules back over them, so it waits for that too.
+        const installed = sheet_views_ref.current[sheet_index];
+        const sheet = meta_ref.current?.sheets[sheet_index];
+        if (!installed?.permuted || sheet === undefined) return;
+        const schema = transform_schema_for_sheet(sheet);
+        if (!transforms_semantically_equal(
+            installed_rules_on_screen(sheet_index),
+            installed.rules,
+        )) {
+            show_warning(VIEW_GESTURE_WAIT_MESSAGE);
+            return;
+        }
+        if (
+            !view_gesture_may_start(sheet_index)
+            || inserted_rows_refuse_transform(sheet_index)
+        ) return;
+        // A view request like any sort, so editors, Save and history wait for it
+        // as they do for one, with a baseline equal to its target: the install
+        // records no step.
+        request_transform(sheet_index, installed.rules, 'user', 'grid', {
+            worksheet: {
+                sheetIndex: sheet_index,
+                sheetName: sheet.name,
+                ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+            },
+            schema,
+            baseline: installed.rules,
+            target: installed.rules,
+        }, true);
+    }, [
+        active_sheet_index,
+        inserted_rows_refuse_transform,
+        request_transform,
+        show_warning,
+        view_gesture_may_start,
+    ]);
+
+    /**
      * A resolving hide is over without a choice: refused, unanswered, or its
      * composed choice not admitted. Says nothing itself. The action ends with
      * it when nothing else of it is out, by the same rule as a settlement:
@@ -11733,9 +11896,15 @@ export function App(): React.JSX.Element {
         const pending_state = pending_transform_states_ref.current[active_sheet_index];
         const current = pending_state
             ?? state_ref.current.transforms?.[active_sheet_index];
+        // A Reapply asks for the rules already installed, and is still worth
+        // stopping: its order is not the one on screen.
+        const reapply_pending = transform_request_read_values_ref.current.has(
+            pending_transform_request_ids_ref.current[active_sheet_index] ?? '',
+        );
         if (
             pending_state !== undefined
             && transforms_semantically_equal(current, previous)
+            && !reapply_pending
         ) return;
         // A press of Undo or Redo waiting behind what is cancelled is dropped
         // with it, and nothing is said. The cancel replaces the pending
@@ -12156,6 +12325,13 @@ export function App(): React.JSX.Element {
                 // not just its projection. A stale terminal must not clear or replace
                 // the verdict installed by a later accepted result.
                 const authoritative = transition.next.authoritative;
+                // Saved, the values a Reapply read are the file's own, so an order
+                // computed from them is no longer stale for edits the save consumed.
+                if (
+                    msg.lifecycle.state === 'succeeded'
+                    && authoritative.state === 'succeeded'
+                    && authoritative.revision === msg.lifecycle.revision
+                ) set_installed_read_values([]);
                 const receipt_operation = msg.lifecycle.state === 'succeeded'
                     && msg.receipt !== undefined
                     && authoritative.state === 'succeeded'
@@ -14265,13 +14441,33 @@ export function App(): React.JSX.Element {
         ? installed_view.hiddenEditedCellKeys
         : []).filter((key) => live_edits?.[key] !== undefined);
     const hidden_edited_cells = hidden_edited_cell_keys.length;
-    const dirty_keys = Object.keys(live_edits ?? {});
+    // Only edits where the installed order and the screen disagree: a Reapply reads
+    // the unsaved values on screen, and those edits are then reflected until they
+    // change again or are undone.
+    const dirty_keys = stale_dirty_keys(
+        installed_rules,
+        live_edits,
+        installed_view?.permuted
+            && installed_read_values[active_sheet_index]?.sourceGeneration
+                === installed_view.basis.sourceGeneration
+            && installed_read_values[active_sheet_index]?.rules
+                === JSON.stringify(installed_view.rules)
+            ? installed_read_values[active_sheet_index]?.values
+            : undefined,
+        header_body_start(current_sheet?.excelFirstRowHeader),
+    );
     // The first sentence's own reason, from the same list the signature folds in.
     const order_relevant_edits = order_relevant_dirty_keys(
         installed_rules,
         dirty_keys,
     );
-    const stale_view_current_signature = editing_session_held
+    // Also outside a session for an edit a Reapply applied and that is gone again: the
+    // last edit undone or a Discard releases the session, and the row can still sit
+    // where its unsaved value put it, or be filtered out by it, until reapplied.
+    const reapplied_edit_reverted = editing_status_is_for_active_sheet
+        && editing_status !== null
+        && dirty_keys.some((key) => live_edits?.[key] === undefined);
+    const stale_view_current_signature = editing_session_held || reapplied_edit_reverted
         ? stale_view_signature(
             installed_rules,
             dirty_keys,
@@ -14288,8 +14484,8 @@ export function App(): React.JSX.Element {
     // reads, which is the only case in which the displayed order can disagree with the
     // values.
     //
-    // Both are statements, not prompts: they say what the view is doing and where the
-    // unsaved work is, and nothing about doing anything with either. Noun and verb in
+    // Both are statements: they say what the view is doing and where the unsaved work
+    // is. The banner's Reapply button is the one action offered. Noun and verb in
     // the second are pluralized as one phrase, as in the file-change notice, so
     // "1 edited cells are" cannot be written.
     //
@@ -14299,7 +14495,7 @@ export function App(): React.JSX.Element {
     // for the user: unsaved work they cannot see.
     const stale_view_message = [
         ...(order_relevant_edits.length > 0
-            ? ['Sorting and filters don\'t update while you\'re editing.']
+            ? ['Rows stay in place as you edit, so sorting and filters may be out of date.']
             : []),
         ...(hidden_edited_cells > 0
             ? [hidden_edited_cells === 1
@@ -14923,9 +15119,11 @@ export function App(): React.JSX.Element {
                 </div>
             )}
             {show_stale_view_banner && (
-                // Informational only. Deliberately no "Resort"/"Refilter"/"Refresh"
-                // action: rows staying where the user left them is the feature, so
-                // there is nothing to fix and nothing to apply. Dismiss records the
+                // Rows stay where the person left them while they edit, which is
+                // the feature, so nothing moves on its own. Reapply is the explicit
+                // way to sort and filter again by the values now on screen; it is
+                // offered only while the first sentence speaks, since a hidden
+                // edited cell alone has no stale order to redo. Dismiss records the
                 // acknowledgement and touches nothing else. Rendered outside the
                 // content area holding the grid so it never joins GridShell's
                 // remount key.
@@ -14937,6 +15135,14 @@ export function App(): React.JSX.Element {
                 <div className="stale-view-banner" role="status">
                     {stale_view_message}
                     <div className="stale-view-banner-actions">
+                        {order_relevant_edits.length > 0 && (
+                            <button
+                                disabled={pending_transforms[active_sheet_index] === true}
+                                onClick={reapply_view}
+                            >
+                                Reapply
+                            </button>
+                        )}
                         <button
                             onClick={() => set_acknowledged_stale_signature(
                                 stale_view_current_signature,

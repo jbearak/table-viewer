@@ -1,4 +1,4 @@
-import type { DataSource, RenderedCell } from './data-source/interface';
+import type { DataSource, RawCell, RenderedCell } from './data-source/interface';
 import {
     read_source_row_indices,
     read_source_rows_indexed,
@@ -85,6 +85,12 @@ export interface TransformSortInstrumentation {
     peakSurvivorMaskBytes?: number;
 }
 
+/** Column index → projected row → the cell to read there instead of the source's. */
+export type TransformCellOverrides = ReadonlyMap<
+    number,
+    ReadonlyMap<number, RawCell | null>
+>;
+
 export async function compute_transform(
     source: DataSource,
     sheet_index: number,
@@ -96,6 +102,9 @@ export async function compute_transform(
      *  caller because only a compare source can answer it, and this module is
      *  deliberately ignorant of compare mode. */
     changed_rows?: readonly number[],
+    /** Per column, cells read in place of the source's, keyed by projected row:
+     *  the unsaved values a Reapply reads. */
+    cell_overrides?: TransformCellOverrides,
 ): Promise<TransformResult> {
     const sheet = source.meta().sheets[sheet_index];
     if (!sheet) {
@@ -174,12 +183,17 @@ export async function compute_transform(
                     column_cache,
                     is_cancelled,
                     sort_instrumentation,
+                    cell_overrides?.get(column_index),
                 );
                 try {
                     const compiled = compile_filter_group(
                         filters,
                         column.columnKind === 'numeric',
-                        true,
+                        // Strict for rules being chosen. Unsaved values only ever
+                        // accompany a Reapply of installed rules, and an edit that
+                        // turns a text column numeric must not refuse the filter
+                        // the person already has.
+                        cell_overrides?.has(column_index) !== true,
                         sort_instrumentation,
                         await present_special_filter_identities(
                             column,
@@ -268,6 +282,7 @@ export async function compute_transform(
                 column_cache,
                 is_cancelled,
                 sort_instrumentation,
+                cell_overrides?.get(key.colIndex),
             );
             let numeric_keys: NumericColumnKeys | undefined;
             try {
@@ -399,6 +414,7 @@ async function acquire_transform_column(
     column_cache: TransformColumnCache | undefined,
     is_cancelled: () => boolean,
     instrumentation?: TransformSortInstrumentation,
+    overrides?: ReadonlyMap<number, RawCell | null>,
 ): Promise<ColumnAnalysis> {
     const column = await acquire_column_analysis(
         source,
@@ -408,6 +424,7 @@ async function acquire_transform_column(
         include_filter_identity ? 'complete' : 'bounded',
         column_cache,
         is_cancelled,
+        overrides,
     );
     track_transform_column(column, instrumentation);
     return column;
@@ -698,6 +715,13 @@ function compile_filter(
             strict_numeric_operands,
             instrumentation,
         );
+        // Lenient compilation (a Reapply over unsaved values) can read one bound as
+        // a number and not the other; a range compares both bounds one way, so it
+        // falls back to text for both.
+        if ((lower.numeric === undefined) !== (upper.numeric === undefined)) {
+            lower = { ...lower, numeric: undefined };
+            upper = { ...upper, numeric: undefined };
+        }
         // Reversed bounds still describe the same inclusive interval.
         if (compare_compiled_filter_operand(
             upper.text,
@@ -897,9 +921,12 @@ function numeric_operand_is_usable(
     value: string,
     strict: boolean,
 ): boolean {
+    // Lenient still needs text: `Number(' ')` is 0, which would compare a blank
+    // operand as zero.
     return strict
         ? numeric_operand_text(value)
-        : Number.isFinite(Number(value)) || stata_missing_rank(value) !== undefined;
+        : value.trim() !== ''
+            && (Number.isFinite(Number(value)) || stata_missing_rank(value) !== undefined);
 }
 
 function compile_numeric_filter_operand(
