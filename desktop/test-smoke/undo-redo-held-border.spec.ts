@@ -216,7 +216,7 @@ for (const kind of ['csv', 'xlsx'] as const) {
     test(`${kind}: a new column made wider is taken away by Undo and brought back by Redo`, async () => {
         const page = await open_file(`wider.${kind}`, fixture(kind));
         await expect_shown(page, { headers: ['Name', 'Age', 'City'], undo: 'Undo', redo: 'Redo' });
-        await choose(await open_column_menu(page, 0), 'Insert column right');
+        await choose_from_submenu(await open_column_menu(page, 0), 'Insert', 'Insert column right');
         const with_column = ['Name', 'New column', 'Age', 'City'];
         await expect_shown(page, { headers: with_column, undo: 'Undo Insert column' });
 
@@ -270,7 +270,7 @@ test('the border of a new last column held while its insert is undone resizes no
     const page = await open_file('last-column.csv', CSV);
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
-    await choose(await open_column_menu(page, 2), 'Insert column right');
+    await choose_from_submenu(await open_column_menu(page, 2), 'Insert', 'Insert column right');
     await expect_shown(page, { headers: ['Name', 'Age', 'City', 'New column'], undo: 'Undo Insert column' });
 
     // Hold the new column's right border, and undo the insert with it held.

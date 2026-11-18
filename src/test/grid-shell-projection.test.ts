@@ -11532,9 +11532,7 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
     };
     const insert_right_of_first = async () => {
         await open_header_menu(0);
-        expect(menu_button_labels()).toEqual(expect.arrayContaining([
-            'Insert column left', 'Insert column right', 'Delete column', 'Move columns left', 'Move columns right',
-        ]));
+        expect(menu_button_labels()).toEqual(expect.arrayContaining(['Insert›', 'Delete column', 'Move›']));
         await act(async () => menu_item('Insert column right')!.click());
     };
 
@@ -11556,9 +11554,9 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
     it('keeps a column menu\'s editing items listed, disabled, while a view request is in flight', async () => {
         const { on_insert_columns, rerender } = await render_columns();
         await open_header_menu(0);
+        expect(menu_item('Insert column right')!.getAttribute('aria-disabled')).not.toBe('true');
         const settled = menu_button_labels();
         expect(settled).toEqual(expect.arrayContaining(['Insert column right', 'Delete column']));
-        expect(menu_item('Insert column right')!.getAttribute('aria-disabled')).not.toBe('true');
 
         // This window's own sort, hide, or column change goes out with the menu open.
         await rerender({ view_request_in_flight: true });
@@ -12408,7 +12406,8 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         await render_columns({ structural_support: undefined });
         expect(grid_mock.props!.onColumnMoved).toBeUndefined();
         await open_header_menu(0);
-        expect(menu_button_labels()).not.toContain('Insert column left');
+        const labels = menu_button_labels();
+        for (const label of ['Insert›', 'Delete column', 'Move›']) expect(labels).not.toContain(label);
     });
 });
 

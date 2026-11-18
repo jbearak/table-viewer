@@ -2,7 +2,7 @@ import React from 'react';
 import {
     ContextMenu,
     type ActionMenuItem,
-    type MenuSeparator,
+    type MenuItem,
 } from './context-menu';
 import type { SortDirection } from '../types';
 import type { SheetMeta } from '../data-source/interface';
@@ -61,15 +61,38 @@ export interface ColumnContextMenuProps {
     restore_focus: () => void;
 }
 
-/** The structure items, in menu order: Insert, Delete, Restore, Move. */
-function structure_items(structure: StructureMenuItems): ActionMenuItem[] {
-    return [...structure.insert, ...structure.delete, ...structure.move];
+/**
+ * The structure section, last in the column menus so the everyday items lead:
+ * a separator, then Insert and Move folded into submenus around Delete and
+ * Restore, as in the row menu.
+ */
+function structure_section(structure: StructureMenuItems | undefined): MenuItem[] {
+    if (structure === undefined) return [];
+    const items: MenuItem[] = [];
+    if (structure.insert.length > 0) {
+        items.push({ kind: 'submenu', label: 'Insert', items: [...structure.insert] });
+    }
+    items.push(...structure.delete);
+    if (structure.move.length > 0) {
+        items.push({ kind: 'submenu', label: 'Move', items: [...structure.move] });
+    }
+    return items.length > 0 ? [{ kind: 'separator' }, ...items] : [];
 }
 
+/**
+ * The column menu, most-used first: Copy, Hide, and Rename; then Sort and
+ * Filter; then, past a separator, the structure items.
+ */
 export function column_context_menu_items(
     props: Omit<ColumnContextMenuProps, 'x' | 'y' | 'on_dismiss' | 'restore_focus'>,
-): (ActionMenuItem | MenuSeparator)[] {
-    const items: (ActionMenuItem | MenuSeparator)[] = [
+): MenuItem[] {
+    return [...column_menu_lead_and_transforms(props), ...structure_section(props.structure)];
+}
+
+function column_menu_lead_and_transforms(
+    props: Omit<ColumnContextMenuProps, 'x' | 'y' | 'on_dismiss' | 'restore_focus'>,
+): MenuItem[] {
+    const items: MenuItem[] = [
         { label: 'Copy column', on_click: () => props.on_copy() },
         {
             label: 'Hide column',
@@ -87,9 +110,6 @@ export function column_context_menu_items(
             ? { disabled_reason: props.rename_disabled_reason }
             : {}),
     });
-    if (props.structure !== undefined) {
-        items.push({ kind: 'separator' }, ...structure_items(props.structure));
-    }
     if (!props.transform_sections) return items;
     items.push(
         { kind: 'separator' },
@@ -199,32 +219,31 @@ export interface MultiColumnContextMenuProps {
 
 export function multi_column_context_menu_items(
     props: Omit<MultiColumnContextMenuProps, 'x' | 'y' | 'on_dismiss' | 'restore_focus'>,
-): (ActionMenuItem | MenuSeparator)[] {
+): MenuItem[] {
     const count = Math.max(2, props.column_count);
     const hide = hide_columns_menu_item(count, props.on_hide);
-    const items: (ActionMenuItem | MenuSeparator)[] = [
+    const items: MenuItem[] = [
         { label: `Copy ${count} columns`, on_click: () => props.on_copy() },
         props.hide_disabled_reason === undefined
             ? hide
             : { ...hide, disabled: true, disabled_reason: props.hide_disabled_reason },
     ];
-    if (props.structure !== undefined) {
-        items.push({ kind: 'separator' }, ...structure_items(props.structure));
+    if (props.transform_sections) {
+        items.push(
+            { kind: 'separator' },
+            {
+                label: 'Sort ascending',
+                ...transform_item_state(props),
+                on_click: () => props.on_sort('asc'),
+            },
+            {
+                label: 'Sort descending',
+                ...transform_item_state(props),
+                on_click: () => props.on_sort('desc'),
+            },
+        );
     }
-    if (!props.transform_sections) return items;
-    items.push(
-        { kind: 'separator' },
-        {
-            label: 'Sort ascending',
-            ...transform_item_state(props),
-            on_click: () => props.on_sort('asc'),
-        },
-        {
-            label: 'Sort descending',
-            ...transform_item_state(props),
-            on_click: () => props.on_sort('desc'),
-        },
-    );
+    items.push(...structure_section(props.structure));
     return items;
 }
 

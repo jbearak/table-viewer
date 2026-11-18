@@ -237,7 +237,7 @@ test('a cell in a Pending Column, a Pending Row, or a Pending Appended Row has a
     const { page } = await open_file('fruit.csv', 'name,qty\napple,1\nbanana,2\n');
     await wait_for_grid(page);
 
-    await choose(await open_column_menu(page, 0), 'Insert column right');
+    await choose_from_submenu(await open_column_menu(page, 0), 'Insert', 'Insert column right');
     await expect.poll(() => grid_headers(page)).toEqual([
         '|name',
         'Column B, inserted|New column',
@@ -331,7 +331,7 @@ test('TSV columns: insert, rename, delete, restore, move, then save', async () =
     );
     await wait_for_grid(page);
 
-    await choose(await open_column_menu(page, 1), 'Insert column right');
+    await choose_from_submenu(await open_column_menu(page, 1), 'Insert', 'Insert column right');
     await expect.poll(() => grid_headers(page)).toEqual([
         '|name',
         '|qty',
@@ -396,7 +396,7 @@ test('XLSX rows and columns: insert, delete, move, then save', async () => {
     await expect.poll(() => grid_headers(page)).toContain('Column removed, was Active|Active');
     await expect_undo_label('Delete column');
 
-    await choose(await open_column_menu(page, 0), 'Insert column left');
+    await choose_from_submenu(await open_column_menu(page, 0), 'Insert', 'Insert column left');
     await expect.poll(async () => (await grid_headers(page))[0]).toBe('Column A, inserted|New column');
     await expect_undo_label('Insert column');
 
@@ -689,9 +689,9 @@ test('a number in a Pending Column shows the format and digits it has after Save
     const { file, page } = await open_file('ninths-pending.xlsx', book);
     await wait_for_grid(page);
     // A column right of B takes B's 0%; then one right of A takes A's General.
-    await choose(await open_column_menu(page, 1), 'Insert column right');
+    await choose_from_submenu(await open_column_menu(page, 1), 'Insert', 'Insert column right');
     await expect.poll(async () => (await grid_headers(page)).length).toBe(3);
-    await choose(await open_column_menu(page, 0), 'Insert column right');
+    await choose_from_submenu(await open_column_menu(page, 0), 'Insert', 'Insert column right');
     await expect.poll(async () => (await grid_headers(page)).length).toBe(4);
     await type_into_cell(page, 2, 0, '=A1/9');
     await type_into_cell(page, 4, 0, '=A1/9');
@@ -742,7 +742,7 @@ test('a 16-digit integer shows as General shows it, and auto-fit measures what c
     }));
     const { file, page } = await open_file('large-integers.xlsx', book);
     await wait_for_grid(page);
-    await choose(await open_column_menu(page, 0), 'Insert column right');
+    await choose_from_submenu(await open_column_menu(page, 0), 'Insert', 'Insert column right');
     await expect.poll(async () => (await grid_headers(page)).length).toBe(3);
     // 1E+15 and 12 * 102880657510288 = 1234567890123456, 1.23457E+15 to 15 digits.
     await type_into_cell(page, 2, 0, '=A1*1000000000000000');
@@ -873,7 +873,7 @@ test('an external change conflicts, and both salvage actions resolve it', async 
     await choose_from_submenu(await open_row_menu(page, 1), 'Insert', 'Insert row above');
     await expect.poll(async () => (await grid_rows(page))[1]).toBe('Row 2, inserted||');
     await type_into_cell(page, 1, 1, 'kiwi');
-    await choose(await open_column_menu(page, 1), 'Insert column right');
+    await choose_from_submenu(await open_column_menu(page, 1), 'Insert', 'Insert column right');
     await expect.poll(() => grid_headers(page)).toContain('Column C, inserted|New column');
     await type_into_cell(page, 3, 0, 'crisp');
     await choose(await open_row_menu(page, 3), 'Delete row');
@@ -997,7 +997,7 @@ test('a conflict notice counts a formula that catches the #REF! a salvage action
     await wait_for_grid(page);
 
     // A new column B, and two formulas in C that use it: one catches errors.
-    await choose(await open_column_menu(page, 0), 'Insert column right');
+    await choose_from_submenu(await open_column_menu(page, 0), 'Insert', 'Insert column right');
     await expect.poll(async () => (await grid_headers(page)).length).toBe(3);
     await type_into_cell(page, 2, 0, '10');
     await type_into_cell(page, 3, 0, '=IFERROR(B1*2,0)');

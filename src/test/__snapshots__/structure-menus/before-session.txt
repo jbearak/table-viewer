@@ -150,55 +150,63 @@ Copy column
 Hide column
 Rename column…  [disabled: Only new columns can be renamed on this sheet.]
 ---
-Insert column left  [disabled: Wait for the current change to finish.]
-Insert column right  [disabled: Wait for the current change to finish.]
-Delete column  [disabled: Wait for the current change to finish.]
-Move columns left  [disabled: Wait for the current change to finish.]
-Move columns right  [disabled: Wait for the current change to finish.]
----
 Sort ascending
 Sort descending
 ---
 Filter…
+---
+Insert >
+    Insert column left  [disabled: Wait for the current change to finish.]
+    Insert column right  [disabled: Wait for the current change to finish.]
+Delete column  [disabled: Wait for the current change to finish.]
+Move >
+    Move columns left  [disabled: Wait for the current change to finish.]
+    Move columns right  [disabled: Wait for the current change to finish.]
 
 ## header menu, first column (Column actions for A name)
 Copy column
 Hide column
 Rename column…  [disabled: Only new columns can be renamed on this sheet.]
 ---
-Insert column left  [disabled: Wait for the current change to finish.]
-Insert column right  [disabled: Wait for the current change to finish.]
-Delete column  [disabled: Wait for the current change to finish.]
-Move columns left  [disabled: Wait for the current change to finish.]
-Move columns right  [disabled: Wait for the current change to finish.]
----
 Sort ascending
 Sort descending
 ---
 Filter…
+---
+Insert >
+    Insert column left  [disabled: Wait for the current change to finish.]
+    Insert column right  [disabled: Wait for the current change to finish.]
+Delete column  [disabled: Wait for the current change to finish.]
+Move >
+    Move columns left  [disabled: Wait for the current change to finish.]
+    Move columns right  [disabled: Wait for the current change to finish.]
 
 ## header menu, columns A-B selected (Column actions for 2 selected columns)
 Copy 2 columns
 Hide 2 columns
 ---
-Insert 2 columns left  [disabled: Wait for the current change to finish.]
-Insert 2 columns right  [disabled: Wait for the current change to finish.]
-Delete 2 columns  [disabled: Wait for the current change to finish.]
-Move columns left  [disabled: Wait for the current change to finish.]
-Move columns right  [disabled: Wait for the current change to finish.]
----
 Sort ascending
 Sort descending
+---
+Insert >
+    Insert 2 columns left  [disabled: Wait for the current change to finish.]
+    Insert 2 columns right  [disabled: Wait for the current change to finish.]
+Delete 2 columns  [disabled: Wait for the current change to finish.]
+Move >
+    Move columns left  [disabled: Wait for the current change to finish.]
+    Move columns right  [disabled: Wait for the current change to finish.]
 
 ## header menu, columns A and C selected (Column actions for 2 selected columns)
 Copy 2 columns
 Hide 2 columns
 ---
-Insert 2 columns left  [disabled: Wait for the current change to finish.]
-Insert 2 columns right  [disabled: Wait for the current change to finish.]
-Delete 2 columns  [disabled: Wait for the current change to finish.]
-Move columns left  [disabled: Wait for the current change to finish.]
-Move columns right  [disabled: Wait for the current change to finish.]
----
 Sort ascending
 Sort descending
+---
+Insert >
+    Insert 2 columns left  [disabled: Wait for the current change to finish.]
+    Insert 2 columns right  [disabled: Wait for the current change to finish.]
+Delete 2 columns  [disabled: Wait for the current change to finish.]
+Move >
+    Move columns left  [disabled: Wait for the current change to finish.]
+    Move columns right  [disabled: Wait for the current change to finish.]

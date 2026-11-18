@@ -150,12 +150,6 @@ Copy column
 Hide column
 Rename column…  [disabled: Only new columns can be renamed on this sheet.]
 ---
-Insert column left
-Insert column right
-Delete column
-Move columns left
-Move columns right
----
 Sort ascending
 Sort descending
 ---
@@ -164,17 +158,19 @@ Add descending to sort
 Clear all sorts
 ---
 Filter…
+---
+Insert >
+    Insert column left
+    Insert column right
+Delete column
+Move >
+    Move columns left
+    Move columns right
 
 ## header menu, first column (Column actions for A name)
 Copy column
 Hide column
 Rename column…  [disabled: Only new columns can be renamed on this sheet.]
----
-Insert column left
-Insert column right
-Delete column
-Move columns left  [disabled: The selected columns are already at the left edge.]
-Move columns right
 ---
 Sort ascending
 Sort descending
@@ -182,29 +178,41 @@ Clear sort on this column
 Clear all sorts
 ---
 Filter…
+---
+Insert >
+    Insert column left
+    Insert column right
+Delete column
+Move >
+    Move columns left  [disabled: The selected columns are already at the left edge.]
+    Move columns right
 
 ## header menu, columns A-B selected (Column actions for 2 selected columns)
 Copy 2 columns
 Hide 2 columns
 ---
-Insert 2 columns left
-Insert 2 columns right
-Delete 2 columns
-Move columns left  [disabled: The selected columns are already at the left edge.]
-Move columns right
----
 Sort ascending
 Sort descending
+---
+Insert >
+    Insert 2 columns left
+    Insert 2 columns right
+Delete 2 columns
+Move >
+    Move columns left  [disabled: The selected columns are already at the left edge.]
+    Move columns right
 
 ## header menu, columns A and C selected (Column actions for 2 selected columns)
 Copy 2 columns
 Hide 2 columns
 ---
-Insert 2 columns left  [disabled: Select adjacent columns to insert or move them.]
-Insert 2 columns right  [disabled: Select adjacent columns to insert or move them.]
-Delete 2 columns
-Move columns left  [disabled: Select adjacent columns to insert or move them.]
-Move columns right  [disabled: Select adjacent columns to insert or move them.]
----
 Sort ascending
 Sort descending
+---
+Insert >
+    Insert 2 columns left  [disabled: Select adjacent columns to insert or move them.]
+    Insert 2 columns right  [disabled: Select adjacent columns to insert or move them.]
+Delete 2 columns
+Move >
+    Move columns left  [disabled: Select adjacent columns to insert or move them.]
+    Move columns right  [disabled: Select adjacent columns to insert or move them.]

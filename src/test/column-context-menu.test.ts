@@ -6,6 +6,11 @@ import {
 } from '../webview/column-context-menu';
 import { column_rename_error } from '../webview/rename-column-dialog';
 import { committed_column_name } from '../column-name';
+import type { ActionMenuItem, MenuItem } from '../webview/context-menu';
+
+function is_action(item: MenuItem): item is ActionMenuItem {
+    return item.kind !== 'separator' && item.kind !== 'submenu';
+}
 
 function labels(items: ReturnType<typeof column_context_menu_items>): string[] {
     return items.flatMap((item) => item.kind === 'separator' ? [] : [item.label]);
@@ -57,9 +62,8 @@ describe('column context menu model', () => {
             on_rename: vi.fn(),
             rename_disabled: !header_column_can_be_renamed(sheet, 0),
         });
-        const rename = items.find((item) => item.kind !== 'separator'
-            && item.label === 'Rename column…');
-        expect(rename && rename.kind !== 'separator' ? rename.disabled : undefined).toBe(true);
+        const rename = items.filter(is_action).find((item) => item.label === 'Rename column…');
+        expect(rename?.disabled).toBe(true);
     });
 
     it('offers a column rename only when the caller admits it', () => {
@@ -70,9 +74,8 @@ describe('column context menu model', () => {
             on_rename,
         });
         expect(labels(items)).toEqual(['Copy column', 'Hide column', 'Rename column…']);
-        const rename = items.find((item) => item.kind !== 'separator'
-            && item.label === 'Rename column…');
-        if (!rename || rename.kind === 'separator') throw new Error('missing rename action');
+        const rename = items.filter(is_action).find((item) => item.label === 'Rename column…');
+        if (!rename) throw new Error('missing rename action');
         rename.on_click({} as never);
         expect(on_rename).toHaveBeenCalledOnce();
     });
@@ -109,18 +112,15 @@ describe('column context menu model', () => {
             'Filter…',
             'Clear all filters',
         ]);
-        expect(items.some((item) => item.kind !== 'separator'
-            && item.shortcut === 'Shift+Alt+A')).toBe(true);
+        expect(items.filter(is_action).some((item) => item.shortcut === 'Shift+Alt+A')).toBe(true);
     });
 
     it('plain sort replaces while Shift-click and explicit Add append', () => {
         const props = { ...base(), any_sorted: true, other_columns_sorted: true };
         const items = column_context_menu_items(props);
-        const ascending = items.find((item) => item.kind !== 'separator'
-            && item.label === 'Sort ascending');
-        const add = items.find((item) => item.kind !== 'separator'
-            && item.label === 'Add descending to sort');
-        if (!ascending || ascending.kind === 'separator' || !add || add.kind === 'separator') {
+        const ascending = items.filter(is_action).find((item) => item.label === 'Sort ascending');
+        const add = items.filter(is_action).find((item) => item.label === 'Add descending to sort');
+        if (!ascending || !add) {
             throw new Error('missing sort actions');
         }
         ascending.on_click({ shiftKey: false } as never);
@@ -158,19 +158,53 @@ describe('column structure items', () => {
         move: [item('Move columns left'), item('Move columns right')],
     };
 
-    it('places Insert, Delete, Restore, and Move after Copy and Hide, in both header menus', () => {
+    const shape = (items: MenuItem[]) => items.map((entry) => entry.kind === 'separator'
+        ? '|'
+        : entry.kind === 'submenu'
+            ? `${entry.label} > ${entry.items.map((sub) => sub.kind === 'separator' ? '|' : sub.label).join(', ')}`
+            : entry.label);
+
+    it('puts the structure items last, with Insert and Move in submenus, in both header menus', () => {
         const single = column_context_menu_items({
             ...base(),
-            transform_sections: false,
             hide_disabled_reason: 'Save the new column to hide it.',
             structure,
         });
-        expect(single.map((entry) => entry.kind === 'separator' ? '|' : entry.label)).toEqual([
-            'Copy column', 'Hide column', '|', 'Insert 2 columns left', 'Insert 2 columns right',
-            'Delete 2 columns', 'Restore column', 'Move columns left', 'Move columns right',
+        expect(shape(single)).toEqual([
+            'Copy column', 'Hide column', '|', 'Sort ascending', 'Sort descending', '|', 'Filter…',
+            '|', 'Insert > Insert 2 columns left, Insert 2 columns right',
+            'Delete 2 columns', 'Restore column',
+            'Move > Move columns left, Move columns right',
         ]);
         expect(single[1]).toMatchObject({ disabled: true, disabled_reason: 'Save the new column to hide it.' });
         const multi = multi_column_context_menu_items({
+            column_count: 2,
+            transform_sections: true,
+            transform_disabled: false,
+            on_copy: vi.fn(),
+            on_hide: vi.fn(),
+            structure,
+            on_sort: vi.fn(),
+        });
+        expect(shape(multi)).toEqual([
+            'Copy 2 columns', 'Hide 2 columns', '|', 'Sort ascending', 'Sort descending',
+            '|', 'Insert > Insert 2 columns left, Insert 2 columns right',
+            'Delete 2 columns', 'Restore column',
+            'Move > Move columns left, Move columns right',
+        ]);
+        const insert = multi.at(-4);
+        expect(insert?.kind === 'submenu' ? insert.items : undefined).toEqual(structure.insert);
+    });
+
+    it('keeps the structure items where the sort and filter sections are left out', () => {
+        const props = { ...base(), transform_sections: false, structure };
+        expect(shape(column_context_menu_items(props))).toEqual([
+            'Copy column', 'Hide column',
+            '|', 'Insert > Insert 2 columns left, Insert 2 columns right',
+            'Delete 2 columns', 'Restore column',
+            'Move > Move columns left, Move columns right',
+        ]);
+        expect(shape(multi_column_context_menu_items({
             column_count: 2,
             transform_sections: false,
             transform_disabled: false,
@@ -178,7 +212,17 @@ describe('column structure items', () => {
             on_hide: vi.fn(),
             structure,
             on_sort: vi.fn(),
+        })).slice(2)).toEqual(shape(column_context_menu_items(props)).slice(2));
+    });
+
+    it('leaves out an empty Insert or Move submenu', () => {
+        const items = column_context_menu_items({
+            ...base(),
+            transform_sections: false,
+            structure: { insert: [], delete: structure.delete, move: [] },
         });
-        expect(multi.slice(3)).toEqual([...structure.insert, ...structure.delete, ...structure.move]);
+        expect(shape(items)).toEqual([
+            'Copy column', 'Hide column', '|', 'Delete 2 columns', 'Restore column',
+        ]);
     });
 });
