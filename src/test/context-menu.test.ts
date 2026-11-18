@@ -227,6 +227,27 @@ describe('ContextMenu keyboard behavior', () => {
         expect(on_dismiss).not.toHaveBeenCalled();
     });
 
+    it('leaves Enter and Space on a submenu item to that item, so its click still runs', () => {
+        vi.useFakeTimers();
+        render_menu([
+            {
+                kind: 'submenu',
+                label: 'Insert',
+                items: [{ label: 'Insert row above', on_click: vi.fn() }],
+            },
+        ]);
+        const trigger = document.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]')!;
+        act(() => trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
+        act(() => vi.runAllTimers());
+        expect(document.activeElement?.textContent).toBe('Insert row above');
+        for (const key of ['Enter', ' ']) {
+            const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
+            act(() => document.activeElement!.dispatchEvent(event));
+            // A cancelled keydown would stop the browser clicking the item.
+            expect(event.defaultPrevented, key).toBe(false);
+        }
+    });
+
     it('opens on hover and closes when hovering a sibling action', () => {
         render_menu([
             {

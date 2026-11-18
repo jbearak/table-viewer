@@ -201,7 +201,11 @@ function MenuLevel({
             event.stopPropagation();
             move_focus('last');
         } else if (
-            (event.key === 'ArrowRight' || event.key === 'Enter' || event.key === ' ')
+            (event.key === 'ArrowRight'
+                // Enter and Space from an open submenu's item bubble here; leave
+                // them to that item, whose click they make.
+                || ((event.key === 'Enter' || event.key === ' ')
+                    && (event.target as HTMLElement).parentElement === menu_ref.current))
             && item?.kind === 'submenu'
         ) {
             event.preventDefault();
