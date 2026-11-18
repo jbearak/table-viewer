@@ -36,6 +36,7 @@ import {
     launch_structural_viewer,
     open_column_menu,
     open_row_menu,
+    choose_from_submenu,
     save_and_reread,
     save_button,
     save_changes,
@@ -712,7 +713,7 @@ test('a new column undone after a header was chosen does not stop the header ste
     const { page } = await open_file('column.xlsx', workbook(sheet('Data', TITLED)));
     await use_row_as_header(page, 1);
     await expect_shown(page, { headers: ['name', 'qty'], body: FRUIT });
-    await choose(await open_column_menu(page, 0), 'Insert column right');
+    await choose_from_submenu(await open_column_menu(page, 0), 'Insert', 'Insert column right');
     await expect_shown(page, { headers: ['name', 'New column', 'qty'] });
 
     await history(page, 'undo');

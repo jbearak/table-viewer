@@ -32,7 +32,7 @@ Rows you add with **Append row** stay at the end, after every other row, until y
 
 ## Columns
 
-Right-click a column header to open the column menu, or select several columns and right-click one of them. In a file you can edit, it has these items:
+Right-click a column header to open the column menu, or select several columns and right-click one of them. It starts with the items you use most, such as **Hide column**, **Copy column**, and the sort and filter items. In a file you can edit, these items follow, with Insert and Move in **Insert** and **Move** submenus:
 
 | Item | What it does |
 |---|---|

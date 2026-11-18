@@ -553,7 +553,7 @@ test('csv: two rows pasted onto the last row with no session yet, and Undo in th
 
 test('xlsx: two rows pasted onto the last row across a new column and a saved one, with Undo in the same instant, write every destination before they are undone', async () => {
     const { page } = await open_file('paste.xlsx', fixture('xlsx'));
-    await choose(await open_column_menu(page, 0), 'Insert column right');
+    await choose_from_submenu(await open_column_menu(page, 0), 'Insert', 'Insert column right');
     const inserted = ['Alice||30|New York', 'Bob||25|London', 'Charlie||35|Paris', 'Dora||28|Oslo'];
     await expect_shown(page, { body: inserted, undo: 'Undo Insert column' });
     await select_cell(page, 2, 3);

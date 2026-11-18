@@ -62,7 +62,7 @@ test('unsaved row and column changes survive closing the window and relaunching,
             await type_into_cell(page, 1, 1, 'kiwi');
             await choose(await open_row_menu(page, 3), 'Delete row');
             await expect.poll(() => grid_rows(page)).toContain('Row removed, was row 3|cherry|3');
-            await choose(await open_column_menu(page, 1), 'Insert column right');
+            await choose_from_submenu(await open_column_menu(page, 1), 'Insert', 'Insert column right');
             await expect.poll(() => grid_headers(page)).toContain('Column C, inserted|New column');
             await type_into_cell(page, 3, 0, 'crisp');
             await expect

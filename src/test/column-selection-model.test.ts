@@ -200,7 +200,7 @@ describe('multi column context menu model', () => {
         const click = (label: string) => {
             const item = items.find((entry) =>
                 entry.kind !== 'separator' && entry.label === label);
-            if (item && item.kind !== 'separator') {
+            if (item && item.kind !== 'separator' && item.kind !== 'submenu') {
                 item.on_click({} as React.MouseEvent<HTMLButtonElement>);
             }
         };

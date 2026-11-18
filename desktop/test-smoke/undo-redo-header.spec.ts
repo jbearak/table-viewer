@@ -240,7 +240,7 @@ test('a new column, its name and a cell in it are undone and redone above a head
     await toggle_header(page);
     await expect.poll(() => headers(page)).toEqual(['name', 'qty']);
 
-    await choose(await open_column_menu(page, 0), 'Insert column right');
+    await choose_from_submenu(await open_column_menu(page, 0), 'Insert', 'Insert column right');
     await expect.poll(() => headers(page)).toEqual(['name', 'New column', 'qty']);
     await choose(await open_column_menu(page, 1), 'Rename column…');
     const dialog = page.getByRole('dialog', { name: 'Rename column' });

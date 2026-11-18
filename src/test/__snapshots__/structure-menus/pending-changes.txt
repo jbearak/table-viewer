@@ -229,73 +229,83 @@ Copy column
 Hide column  [disabled: Save the new column to hide it.]
 Rename column…
 ---
-Insert column left
-Insert column right
-Delete column
-Move columns left
-Move columns right
----
 Sort ascending  [disabled: Save the new column to sort or filter by it.]
 Sort descending  [disabled: Save the new column to sort or filter by it.]
 ---
 Filter…  [disabled: Save the new column to sort or filter by it.]
+---
+Insert >
+    Insert column left
+    Insert column right
+Delete column
+Move >
+    Move columns left
+    Move columns right
 
 ## header menu, deleted column (Column actions for C name)
 Copy column
 Hide column
 Rename column…  [disabled: Only new columns can be renamed on this sheet.]
 ---
-Insert column left  [disabled: Select a column that isn't deleted to insert columns beside it.]
-Insert column right  [disabled: Select a column that isn't deleted to insert columns beside it.]
-Delete column  [disabled: Select at least one column that isn't deleted.]
-Restore column
-Move columns left  [disabled: Select a column that isn't deleted to move it.]
-Move columns right  [disabled: Select a column that isn't deleted to move it.]
----
 Sort ascending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
 Sort descending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
 ---
 Filter…  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+---
+Insert >
+    Insert column left  [disabled: Select a column that isn't deleted to insert columns beside it.]
+    Insert column right  [disabled: Select a column that isn't deleted to insert columns beside it.]
+Delete column  [disabled: Select at least one column that isn't deleted.]
+Restore column
+Move >
+    Move columns left  [disabled: Select a column that isn't deleted to move it.]
+    Move columns right  [disabled: Select a column that isn't deleted to move it.]
 
 ## header menu, source column beside them (Column actions for B name)
 Copy column
 Hide column
 Rename column…  [disabled: Only new columns can be renamed on this sheet.]
 ---
-Insert column left
-Insert column right
-Delete column
-Move columns left
-Move columns right  [disabled: The selected columns are already at the right edge.]
----
 Sort ascending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
 Sort descending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
 ---
 Filter…  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+---
+Insert >
+    Insert column left
+    Insert column right
+Delete column
+Move >
+    Move columns left
+    Move columns right  [disabled: The selected columns are already at the right edge.]
 
 ## header menu, Pending Column and A selected (Column actions for 2 selected columns)
 Copy 2 columns
 Hide 2 columns  [disabled: Save the new column to hide it.]
 ---
-Insert 2 columns left
-Insert 2 columns right
-Delete 2 columns
-Move columns left  [disabled: The selected columns are already at the left edge.]
-Move columns right
----
 Sort ascending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
 Sort descending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+---
+Insert >
+    Insert 2 columns left
+    Insert 2 columns right
+Delete 2 columns
+Move >
+    Move columns left  [disabled: The selected columns are already at the left edge.]
+    Move columns right
 
 ## header menu, B and deleted C selected (Column actions for 2 selected columns)
 Copy 2 columns
 Hide 2 columns
 ---
-Insert 2 columns left
-Insert 2 columns right
-Delete 2 columns
-Restore column  [disabled: Select only deleted columns to restore them.]
-Move columns left
-Move columns right  [disabled: The selected columns are already at the right edge.]
----
 Sort ascending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
 Sort descending  [disabled: Save or discard inserted and moved rows to sort, filter, or hide rows.]
+---
+Insert >
+    Insert 2 columns left
+    Insert 2 columns right
+Delete 2 columns
+Restore column  [disabled: Select only deleted columns to restore them.]
+Move >
+    Move columns left
+    Move columns right  [disabled: The selected columns are already at the right edge.]
