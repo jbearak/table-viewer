@@ -110,7 +110,7 @@ test('CSV rows: insert, delete, restore, move by keyboard and drag, then save', 
     await wait_for_grid(page);
 
     // Insert above banana; focus moves into the new row.
-    await choose(await open_row_menu(page, 1), 'Insert row above');
+    await choose_from_submenu(await open_row_menu(page, 1), 'Insert', 'Insert row above');
     await expect.poll(() => grid_rows(page)).toEqual([
         '|apple|1',
         'Row 2, inserted||',
@@ -387,7 +387,7 @@ test('XLSX rows and columns: insert, delete, move, then save', async () => {
     await wait_for_grid(page);
     await expect.poll(() => grid_headers(page)).toEqual(['|Name', '|Age', '|Active', '|Joined']);
 
-    await choose(await open_row_menu(page, 0), 'Insert row below');
+    await choose_from_submenu(await open_row_menu(page, 0), 'Insert', 'Insert row below');
     await expect.poll(async () => (await grid_rows(page))[1]).toMatch(/^Row 3, inserted\|/);
     await expect_undo_label('Insert row');
     await type_into_cell(page, 1, 1, 'Cara');
@@ -401,7 +401,7 @@ test('XLSX rows and columns: insert, delete, move, then save', async () => {
     await expect_undo_label('Insert column');
 
     // Move Bob above Cara.
-    await choose(await open_row_menu(page, 2), 'Move rows up');
+    await choose_from_submenu(await open_row_menu(page, 2), 'Move', 'Move rows up');
     await expect.poll(async () => (await grid_rows(page)).map((row) => row.split('|')[2]))
         .toEqual(['Alice', 'Bob', 'Cara']);
     await expect_undo_label('Move row');
@@ -511,7 +511,7 @@ test('an .xlsx warns before Save only about formulas a change breaks, under the 
     const notices = page.locator('.pending-change-notices');
 
     // A plain insert breaks nothing: the green row says it all.
-    await choose(await open_row_menu(page, 1), 'Insert row below');
+    await choose_from_submenu(await open_row_menu(page, 1), 'Insert', 'Insert row below');
     await expect.poll(async () => (await grid_rows(page))[2]).toMatch(/^Row 4, inserted\|/);
     await expect(notices).toHaveCount(0);
     await save_screenshot(page, '11-xlsx-insert-no-notice');
@@ -635,7 +635,7 @@ test('a move that changes a summed range says so before Save', async () => {
     // Apple, the first row of SUM(B2:B5), moves below Banana: Banana leaves
     // the range, where Excel would keep it.
     await select_row(page, 0);
-    await choose(await open_row_menu(page, 0), 'Move rows down');
+    await choose_from_submenu(await open_row_menu(page, 0), 'Move', 'Move rows down');
     await expect.poll(async () => (await grid_rows(page)).map((line) => line.split('|')[1]).slice(0, 2))
         .toEqual(['Banana', 'Apple']);
     const ranges = page.getByRole('status', { name: 'Formulas whose ranges changed' });
@@ -833,7 +833,7 @@ test('auto-fit makes room for a long value in an inserted row and an appended ro
     };
 
     // About 300 px of text in an inserted row, under banana's 6 characters.
-    await choose(await open_row_menu(page, 1), 'Insert row above');
+    await choose_from_submenu(await open_row_menu(page, 1), 'Insert', 'Insert row above');
     await expect.poll(async () => (await grid_rows(page))[1]).toBe('Row 2, inserted||||||');
     const inserted = 'a long value typed into an inserted row, not cut off';
     await type_into_cell(page, 1, 1, inserted);
@@ -870,7 +870,7 @@ test('an external change conflicts, and both salvage actions resolve it', async 
     await wait_for_grid(page);
 
     // Insert a row and a column, type into both, and delete a row.
-    await choose(await open_row_menu(page, 1), 'Insert row above');
+    await choose_from_submenu(await open_row_menu(page, 1), 'Insert', 'Insert row above');
     await expect.poll(async () => (await grid_rows(page))[1]).toBe('Row 2, inserted||');
     await type_into_cell(page, 1, 1, 'kiwi');
     await choose(await open_column_menu(page, 1), 'Insert column right');
@@ -955,7 +955,7 @@ test('an external edit that turns on an .xlsx Header Row conflicts, and Keep new
     await expect.poll(async () => (await grid_rows(page)).map((line) => line.split('|')[1]))
         .toEqual(['1', '3', '5', '7']);
 
-    await choose(await open_row_menu(page, 0), 'Insert row below');
+    await choose_from_submenu(await open_row_menu(page, 0), 'Insert', 'Insert row below');
     await expect.poll(async () => (await grid_rows(page))[1]).toBe('Row 2, inserted||');
     await type_into_cell(page, 1, 1, '9');
     await choose(await open_row_menu(page, 2), 'Delete row');
@@ -1374,19 +1374,19 @@ test('a click on a workbook row menu item as first drawn, before the session arr
     const menu = await open_row_menu(page, 0);
     await expect_host_message_held('editSessionResult');
     await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'none');
-    // Aimed at "Move rows down" where the menu first drew it.
+    // Aimed at "Delete row" where the menu first drew it.
     const { first_rects } = await menu_watch(page);
-    const target = first_rects['Move rows down']!;
+    const target = first_rects['Delete row']!;
     const box = (await menu.boundingBox())!;
     await page.mouse.click(box.x + box.width / 2, target + 4);
-    // Moving waits for the session, so the click does nothing: no other item
+    // Deleting waits for the session, so the click does nothing: no other item
     // ran in its place, and the menu is still open.
     await expect(menu).toBeVisible();
     await expect(save_button(page)).toBeDisabled();
     await release_host_messages();
     await expect(page.locator('.grid-shell-root')).toHaveAttribute('data-edit-session', 'held');
     await expect(menu.locator('.context-menu-item').filter({
-        has: page.locator('.context-menu-label').getByText('Move rows down', { exact: true }),
+        has: page.locator('.context-menu-label').getByText('Delete row', { exact: true }),
     })).not.toHaveAttribute('aria-disabled', 'true');
     await page.keyboard.press('Escape');
     await expect(page.locator('[role="menu"]')).toHaveCount(0);

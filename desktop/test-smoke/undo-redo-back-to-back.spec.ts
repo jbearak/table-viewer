@@ -40,6 +40,7 @@ import {
     launch_structural_viewer,
     open_column_menu,
     open_row_menu,
+    choose_from_submenu,
     save_button,
     save_changes,
     take_dialogs,
@@ -411,7 +412,7 @@ for (const pressing of ['chained', 'held'] as const) {
             { label: 'Edit cell', make: (page) => type_into_cell(page, 1, 0, 'Ann'), shows: { body: ['Ann|30|New York', ...NATURAL.slice(1)] } },
             {
                 label: 'Insert row',
-                make: async (page) => choose(await open_row_menu(page, 1), 'Insert row above'),
+                make: async (page) => choose_from_submenu(await open_row_menu(page, 1), 'Insert', 'Insert row above'),
                 shows: { body: ['Ann|30|New York', '||', ...NATURAL.slice(1)] },
             },
             { label: 'Resize column', make: (page) => widen_first_column(page, 40), shows: {} },
@@ -444,7 +445,7 @@ for (const pressing of ['chained', 'held'] as const) {
             { label: 'Rename column', make: (page) => rename_column(page, 2, 'Town'), shows: { headers: ['Name', 'Age', 'Town'] } },
             {
                 label: 'Insert row',
-                make: async (page) => choose(await open_row_menu(page, 1), 'Insert row above'),
+                make: async (page) => choose_from_submenu(await open_row_menu(page, 1), 'Insert', 'Insert row above'),
                 shows: { body: ['Ann|30|New York', '||', ...NATURAL.slice(1)] },
             },
             { label: 'Resize column', make: (page) => widen_first_column(page, 40), shows: {} },

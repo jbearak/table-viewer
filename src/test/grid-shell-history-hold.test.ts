@@ -5,6 +5,7 @@
 // the press carries the ticket it took into the continuation that finishes it.
 
 import React, { act } from 'react';
+import { flushSync } from 'react-dom';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
@@ -347,6 +348,29 @@ function pending_with_row_and_column(): PendingRowStore {
     })).toBe(true);
     expect(pending.append_rows('session', ['pending-row'], { id: 'plain', format: { kind: 'none' } }, 2)).toBe(true);
     return pending;
+}
+
+
+/**
+ * A menu button by its label. The row menu keeps Insert and Move in
+ * submenus, so an "Insert …" or "Move …" item not shown yet opens its
+ * submenu first.
+ */
+function find_menu_item(label: string): HTMLButtonElement | undefined {
+    const find = () => Array.from(document.querySelectorAll('button'))
+        .find((candidate) => candidate.textContent === label);
+    const found = find();
+    if (found !== undefined) return found;
+    const parent = /^(Insert|Move)\b/.exec(label)?.[1];
+    const trigger = parent === undefined ? undefined : Array.from(document.querySelectorAll('button'))
+        .filter((candidate) => candidate.getAttribute('aria-haspopup') === 'menu'
+            && candidate.querySelector('.context-menu-label')?.textContent === parent)
+        .at(-1); // the menu opened last, should an earlier one still be up
+    if (trigger === undefined) return undefined;
+    // flushSync, not act: callers often look an item up inside their own act,
+    // where a nested act would not render the submenu until it returns.
+    flushSync(() => trigger.click());
+    return find();
 }
 
 describe('GridShell while a press of Undo or Redo is held', () => {
@@ -729,8 +753,7 @@ describe('GridShell work asked for before a press, carried out behind it', () =>
             localEventX: 10,
             localEventY: 10,
         }));
-        const insert = Array.from(document.querySelectorAll('button'))
-            .find((candidate) => candidate.textContent === 'Insert row below')!;
+        const insert = find_menu_item('Insert row below')!;
         await act(async () => insert.click());
         expect(on_insert_rows).toHaveBeenCalledTimes(1);
         expect(app.gesture_ticket).toHaveBeenCalledTimes(1);
@@ -782,8 +805,7 @@ describe('GridShell work asked for before a press, carried out behind it', () =>
             localEventY: 10,
         }));
         const click = async (label: string) => {
-            const item = Array.from(document.querySelectorAll('button'))
-                .find((candidate) => candidate.textContent === label);
+            const item = find_menu_item(label);
             expect(item, label).toBeDefined();
             await act(async () => item!.click());
         };

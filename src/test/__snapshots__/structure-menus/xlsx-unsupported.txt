@@ -1,38 +1,50 @@
 ## row menu, source row 2 (Row actions for row 2)
-Insert row above  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
-Insert row below  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
-Delete row  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
-Move rows up  [disabled: Can't move rows on this sheet: it contains an Excel table.]
-Move rows down  [disabled: Can't move rows on this sheet: it contains an Excel table.]
 Hide row
 Copy row
+---
+Insert >
+    Insert row above  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
+    Insert row below  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
+Delete row  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
+Move >
+    Move rows up  [disabled: Can't move rows on this sheet: it contains an Excel table.]
+    Move rows down  [disabled: Can't move rows on this sheet: it contains an Excel table.]
 
 ## row menu, first row (Row actions for row 1)
-Insert row above  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
-Insert row below  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
-Delete row  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
-Move rows up  [disabled: Can't move rows on this sheet: it contains an Excel table.]
-Move rows down  [disabled: Can't move rows on this sheet: it contains an Excel table.]
 Hide row
 Copy row
+---
+Insert >
+    Insert row above  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
+    Insert row below  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
+Delete row  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
+Move >
+    Move rows up  [disabled: Can't move rows on this sheet: it contains an Excel table.]
+    Move rows down  [disabled: Can't move rows on this sheet: it contains an Excel table.]
 
 ## row menu, rows 1-2 selected (Row actions for 2 selected rows)
-Insert 2 rows above  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
-Insert 2 rows below  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
-Delete 2 rows  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
-Move rows up  [disabled: Can't move rows on this sheet: it contains an Excel table.]
-Move rows down  [disabled: Can't move rows on this sheet: it contains an Excel table.]
 Hide 2 rows
 Copy 2 rows
+---
+Insert >
+    Insert 2 rows above  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
+    Insert 2 rows below  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
+Delete 2 rows  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
+Move >
+    Move rows up  [disabled: Can't move rows on this sheet: it contains an Excel table.]
+    Move rows down  [disabled: Can't move rows on this sheet: it contains an Excel table.]
 
 ## row menu, rows 1 and 3 selected (Row actions for 2 selected rows)
-Insert 2 rows above  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
-Insert 2 rows below  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
-Delete 2 rows  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
-Move rows up  [disabled: Can't move rows on this sheet: it contains an Excel table.]
-Move rows down  [disabled: Can't move rows on this sheet: it contains an Excel table.]
 Hide 2 rows
 Copy 2 rows
+---
+Insert >
+    Insert 2 rows above  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
+    Insert 2 rows below  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
+Delete 2 rows  [disabled: Can't insert or delete rows on this sheet: it contains an Excel table.]
+Move >
+    Move rows up  [disabled: Can't move rows on this sheet: it contains an Excel table.]
+    Move rows down  [disabled: Can't move rows on this sheet: it contains an Excel table.]
 
 ## cell menu, cell B2 (Context menu)
 Highlight yellow

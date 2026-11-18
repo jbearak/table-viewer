@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import React, { act } from 'react';
+import { flushSync } from 'react-dom';
 import { ROWS_NOT_LOADED_MESSAGE, STRUCTURE_BUSY_MESSAGE } from '../webview/row-structure-model';
 import { createRoot, type Root } from 'react-dom/client';
 import { readFileSync } from 'node:fs';
@@ -308,6 +309,28 @@ let container: HTMLDivElement | null = null;
 
 function compact(values: number[]) {
     return make_compact(values);
+}
+
+/**
+ * A menu button by its label. The row menu keeps Insert and Move in
+ * submenus, so an "Insert …" or "Move …" item not shown yet opens its
+ * submenu first.
+ */
+function find_menu_item(label: string): HTMLButtonElement | undefined {
+    const find = () => Array.from(document.querySelectorAll('button'))
+        .find((candidate) => candidate.textContent === label);
+    const found = find();
+    if (found !== undefined) return found;
+    const parent = /^(Insert|Move)\b/.exec(label)?.[1];
+    const trigger = parent === undefined ? undefined : Array.from(document.querySelectorAll('button'))
+        .filter((candidate) => candidate.getAttribute('aria-haspopup') === 'menu'
+            && candidate.querySelector('.context-menu-label')?.textContent === parent)
+        .at(-1); // the menu opened last, should an earlier one still be up
+    if (trigger === undefined) return undefined;
+    // flushSync, not act: callers often look an item up inside their own act,
+    // where a nested act would not render the submenu until it returns.
+    flushSync(() => trigger.click());
+    return find();
 }
 
 function menu_button_labels(): string[] {
@@ -9959,8 +9982,7 @@ describe('row Delete and Restore in the row-gutter menu', () => {
             localEventY: 10,
         }));
     };
-    const menu_item = (label: string) => Array.from(document.querySelectorAll('button'))
-        .find((candidate) => candidate.textContent === label);
+    const menu_item = find_menu_item;
 
     it('offers no structure items while structural editing is off', async () => {
         await render_grid(structure_props());
@@ -10352,8 +10374,7 @@ describe('row Insert in the row-gutter menu', () => {
             localEventY: 10,
         }));
     };
-    const menu_item = (label: string) => Array.from(document.querySelectorAll('button'))
-        .find((candidate) => candidate.textContent === label);
+    const menu_item = find_menu_item;
     const caret = () => (grid_mock.props!.gridSelection as {
         current?: { cell: [number, number] };
     }).current?.cell;
@@ -10386,7 +10407,7 @@ describe('row Insert in the row-gutter menu', () => {
             on_insert_rows: host.on_insert_rows,
         }));
         await open_row_menu(1);
-        expect(menu_button_labels()).toEqual(expect.arrayContaining(['Insert row above', 'Insert row below']));
+        expect(menu_button_labels()).toEqual(expect.arrayContaining(['Insert›', 'Delete row', 'Move›']));
         await act(async () => menu_item('Insert row below')!.click());
         expect(host.on_insert_rows).toHaveBeenCalledWith({
             anchor: { kind: 'source', sourceRow: 1 },
@@ -10488,9 +10509,9 @@ describe('row Insert in the row-gutter menu', () => {
         });
         const GridShell = await render_grid(base);
         await open_row_menu(1);
+        expect(menu_item('Insert row above')!.getAttribute('aria-disabled')).toBeNull();
         const settled = menu_button_labels();
         expect(settled).toEqual(expect.arrayContaining(['Insert row above', 'Delete row']));
-        expect(menu_item('Insert row above')!.getAttribute('aria-disabled')).toBeNull();
 
         await act(async () => {
             root!.render(React.createElement(GridShell, { ...base, view_request_in_flight: true }));
@@ -10512,6 +10533,7 @@ describe('row Insert in the row-gutter menu', () => {
         });
         await render_grid(armed);
         await open_row_menu(1);
+        menu_item('Insert row above'); // open the Insert submenu, as below
         const settled = menu_button_labels();
         expect(settled).toEqual(expect.arrayContaining(['Insert row above', 'Delete row']));
         // Opening the menu asks for the session its items need.
@@ -10526,8 +10548,8 @@ describe('row Insert in the row-gutter menu', () => {
         const GridShell = await render_grid({ ...armed, view_request_in_flight: true });
         await open_row_menu(1);
 
-        expect(menu_button_labels()).toEqual(settled);
         expect(menu_item('Insert row above')!.getAttribute('aria-disabled')).toBe('true');
+        expect(menu_button_labels()).toEqual(settled);
         expect(request).not.toHaveBeenCalled();
 
         // The request lands with the menu still open: now the menu asks for
@@ -11096,8 +11118,7 @@ describe('row Move by menu, shortcut, and drag', () => {
             localEventY: 10,
         }));
     };
-    const menu_item = (label: string) => Array.from(document.querySelectorAll('button'))
-        .find((candidate) => candidate.textContent === label);
+    const menu_item = find_menu_item;
     const announcement = () =>
         document.querySelector('[data-testid="structure-announcement"]')?.textContent?.trim();
     const selected_rows = () => [...(grid_mock.props!.gridSelection as { rows: Iterable<number> }).rows];
@@ -11131,7 +11152,7 @@ describe('row Move by menu, shortcut, and drag', () => {
     it('moves a row down from the menu: one action, tinted, labelled, announced, and followed', async () => {
         const { pending, history } = await render_moves();
         await open_row_menu(1);
-        expect(menu_button_labels()).toEqual(expect.arrayContaining(['Move rows up', 'Move rows down']));
+        expect(menu_button_labels()).toEqual(expect.arrayContaining(['Insert›', 'Delete row', 'Move›']));
         await act(async () => menu_item('Move rows down')!.click());
         expect(pending.snapshot().rowLayout?.runs).toEqual([
             { kind: 'source', start: 0, count: 1 },
@@ -11453,8 +11474,7 @@ describe('columns: Insert, Delete, Restore, Move, rename, Pending Column cells, 
         source_to_visible: [0, 1, 2],
         hidden_count: 0,
     };
-    const menu_item = (label: string) => Array.from(document.querySelectorAll('button'))
-        .find((candidate) => candidate.textContent === label);
+    const menu_item = find_menu_item;
     const announcement = () =>
         document.querySelector('[data-testid="structure-announcement"]')?.textContent?.trim();
     const column_ids = () => (grid_mock.props!.columns as { id: string; title: string }[])
@@ -12477,7 +12497,7 @@ describe('structure items across the cell, row, and column menus', () => {
         await act(async () => on_header_context_menu(column, context_event(40 + 100 * column, 0)));
     };
     const click = async (label: string) => {
-        const item = Array.from(document.querySelectorAll('button'))
+        const item = find_menu_item(label) ?? Array.from(document.querySelectorAll('button'))
             .find((candidate) => candidate.querySelector('.context-menu-label')?.textContent === label);
         if (item === undefined) throw new Error(`no item ${label}`);
         await act(async () => item.click());
