@@ -771,6 +771,8 @@ interface PostSaveRefresh {
     readonly seq: number;
     readonly saved_digest: string;
     readonly completion: Promise<FileRefreshSubscriberResult>;
+    /** Whether an attempt's source build has returned. */
+    built: boolean;
 }
 
 /**
@@ -10250,6 +10252,8 @@ export function attach_viewer(
         force: boolean,
         reason: 'ready' | 'fileReload' | 'recovery',
         initial = false,
+        /** Called each time an attempt's source build returns a candidate. */
+        on_built?: () => void,
     ): Promise<FileRefreshSubscriberResult> {
         let attempts = 0;
         let include_compare_original = true;
@@ -10275,6 +10279,7 @@ export function attach_viewer(
                 if (build.type === 'stale') return inactive_refresh_result();
                 if (build.type === 'stopped') return { type: 'completed' };
                 candidate = build.candidate;
+                on_built?.();
                 if (!load_is_current(request.seq, request.refreshEvent)) {
                     return inactive_refresh_result();
                 }
@@ -10601,6 +10606,9 @@ export function attach_viewer(
      * be the expensive part.
      */
     async function file_holds_bytes(digest: string): Promise<boolean> {
+        // A compare window rebuilds both sides: a postSave that fell back to
+        // a plain view of the saved file must not be taken as the answer.
+        if (compare_original_uri) return false;
         try {
             const stat = await host.fs.stat(uri);
             if (
@@ -10631,14 +10639,18 @@ export function attach_viewer(
             // second time. Bytes that differ are another writer's, and
             // supersede as any change does.
             //
+            // The event joins the postSave refresh only once that refresh's
+            // build has returned, which is when a synchronous parse lets the
+            // report through. A build still running may never return; the
+            // event then supersedes it as before, so a hung parse can still
+            // be recovered by a fresh one.
+            //
             // The check reads the file, so the postSave refresh may finish
             // first. It then covers this event too when no load has started
-            // since: it adopted (or kept) the bytes this event reports, so
-            // rebuilding them would only block the host for another parse.
-            // That holds for a failed postSave as well: rebuilding the same
-            // bytes would fail again and report the failure twice. A postSave
-            // that never settles holds a same-bytes event with it; different
-            // bytes never wait.
+            // since and it installed (or kept) exactly the bytes this event
+            // reports. A completion that installed other bytes, or nothing (a
+            // declined size prompt), and a failed postSave, leave the event to
+            // refresh as before.
             //
             // A parked header settlement is the exception: only an adoption
             // settles it, which a kept source does not give, so the event
@@ -10648,15 +10660,16 @@ export function attach_viewer(
                 if (
                     await file_holds_bytes(post_save.saved_digest)
                     && load_seq === post_save.seq
+                    && post_save.built
                 ) {
-                    const result = await post_save.completion;
-                    if (
-                        load_seq === post_save.seq
+                    const result = await post_save.completion.catch(() => undefined);
+                    const covered = result !== undefined
+                        && load_seq === post_save.seq
                         && !disposed
                         && header_settlement_waiter === undefined
-                    ) {
-                        return result;
-                    }
+                        && result.type === 'completed'
+                        && source_observation?.digest === post_save.saved_digest;
+                    if (covered) return result;
                 }
                 if (disposed) return { type: 'disposed' } as const;
                 // A newer event may have started its own load while this one
@@ -10691,21 +10704,27 @@ export function attach_viewer(
         // an ordinary reload would leave an empty renderer on "Loading..." after
         // the superseded dialog correctly declines to close a newer request.
         const initial = source_observation === undefined;
+        let tracked: PostSaveRefresh | undefined;
         const completion = run_physical_refresh(
             request,
             projection_recovery,
             projection_recovery ? 'recovery' : 'fileReload',
             initial,
+            () => {
+                if (tracked !== undefined) tracked.built = true;
+            },
         );
         if (event.reason === 'postSave' && event.savedDigest !== undefined) {
-            const tracked: PostSaveRefresh = {
+            tracked = {
                 seq: request.seq,
                 saved_digest: event.savedDigest,
                 completion,
+                built: false,
             };
             post_save_refresh = tracked;
+            const settled_tracker = tracked;
             const settle = () => {
-                if (post_save_refresh === tracked) post_save_refresh = undefined;
+                if (post_save_refresh === settled_tracker) post_save_refresh = undefined;
             };
             void completion.then(settle, settle);
         } else {
