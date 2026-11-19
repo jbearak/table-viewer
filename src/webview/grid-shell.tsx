@@ -2619,8 +2619,6 @@ export function GridShell({
     ].join(':');
     const paste_topology_key_ref = useRef(paste_topology_key);
     paste_topology_key_ref.current = paste_topology_key;
-    const pending_selection_topology_key_ref = useRef(pending_selection_topology_key);
-    pending_selection_topology_key_ref.current = pending_selection_topology_key;
     const pending_tail_removal_source_rows = useMemo(() => new Set(
         pending_rows.tailRemovals.map((removal) => removal.sourceRow),
     ), [pending_rows.tailRemovals]);
@@ -4696,8 +4694,8 @@ export function GridShell({
     useLayoutEffect(() => {
         if (committed_display_rows_key_ref.current === display_rows_key) return;
         committed_display_rows_key_ref.current = display_rows_key;
-        // A column header's menu names no row; it stays.
-        if (context_menu === null || context_menu.kind === 'header') return;
+        // Only a row or cell menu names rows; a column menu stays.
+        if (context_menu?.kind !== 'row' && context_menu?.kind !== 'cell') return;
         // Closed from here, not by the menu: give the grid the focus the
         // menu held, as the menu does when it is dismissed.
         const active = document.activeElement;

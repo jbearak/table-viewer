@@ -1867,6 +1867,27 @@ describe('GridShell cell wrapping', () => {
             root!.render(React.createElement(GridShell, shell_props));
         });
         expect(document.querySelector('[role="menu"]')?.getAttribute('aria-label')).toMatch(/^Column actions/);
+
+        // So does the menu of several selected columns.
+        await act(async () => (grid_mock.props!.onGridSelectionChange as (selection: unknown) => void)({
+            columns: compact([0, 1]), rows: compact([]),
+        }));
+        await act(async () => (grid_mock.props!.onHeaderContextMenu as (
+            column: number, event: Record<string, unknown>,
+        ) => void)(1, {
+            preventDefault: vi.fn(),
+            bounds: { x: 140, y: 0, width: 100, height: 36 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        const several = document.querySelector('[role="menu"]')?.getAttribute('aria-label');
+        expect(several).toMatch(/2/);
+        grid_mock.source_row_for_display = (display_row) => [4, 3, 2, 1, 0][display_row];
+        grid_mock.loader_version = 3;
+        await act(async () => {
+            root!.render(React.createElement(GridShell, shell_props));
+        });
+        expect(document.querySelector('[role="menu"]')?.getAttribute('aria-label')).toBe(several);
     });
 
     it('invalidates cuts after either source or pending cell payload changes', async () => {
