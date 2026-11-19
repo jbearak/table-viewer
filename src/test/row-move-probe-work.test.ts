@@ -215,4 +215,29 @@ describe('probe_row_move_runs work', () => {
         // (300 merges over 999,000 rows would be 300 million).
         expect(reads.count).toBeLessThan(10_000);
     });
+
+    it('resolves a selection across many layout runs by search of the removed rows', () => {
+        // 8,000 one-row layout runs over rows 2-8,001, every other row removed:
+        // the selection takes them all, asking for each run's removed rows.
+        const runs = 8_000;
+        const removed = counted(Array.from({ length: runs / 2 }, (_, index) => ({ start: BODY_START + 2 * index, count: 1 })));
+        reads.count = 0;
+        const selection = resolve_row_structure_selection(
+            {
+                rowCount: runs,
+                deletedBandStart: runs,
+                row_at: () => undefined,
+                source_row_runs: (start, end) => Array.from({ length: end - start + 1 }, (_, offset) => ({
+                    kind: 'source' as const, displayStart: start + offset, count: 1, sourceRow: BODY_START + start + offset,
+                })),
+            },
+            [{ start: 0, end: runs - 1 }],
+            { bodyStart: BODY_START, isRemoved: () => false, removedSourceRows: removed },
+        );
+        expect(selection.runs).toEqual([{ kind: 'source', start: BODY_START, count: runs }]);
+        expect(selection.removedCount).toBe(runs / 2);
+        // A binary search per run (about 13 reads each); walking the removed
+        // rows from the start for each run reads 16 million.
+        expect(reads.count).toBeLessThan(500_000);
+    });
 });
