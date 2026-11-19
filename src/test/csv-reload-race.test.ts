@@ -2547,6 +2547,37 @@ describe('CSV reload races', () => {
         });
     });
 
+    it('refreshes after an own watcher joined a postSave that stalls after its build', async () => {
+        // The postSave's own currency read never returns; the watcher's read
+        // does. The watcher's refresh is a separate read, so it recovers.
+        vi.useFakeTimers();
+        const harness = post_save_stalled_after_build('/tmp/post-save-own-watcher-stalled-tail.csv');
+        const { panel } = harness;
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        const before = workbook_snapshots(panel).at(-1)!.sourceGeneration;
+
+        void panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await harness.post_save_stalled;
+        void vscode_mock.__getActiveWatchers()[0].__fireChange();
+        // Short of the limit, the event is still waiting with the postSave.
+        await vi.advanceTimersByTimeAsync(900);
+        expect(harness.builds()).toBe(2);
+        await vi.advanceTimersByTimeAsync(200);
+        await vi.waitFor(() => {
+            expect(workbook_snapshots(panel).at(-1)!.sourceGeneration).toBeGreaterThan(before);
+        });
+
+        expect(harness.builds()).toBe(3);
+        await first_row(panel, 'recovered-tail');
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'rowData',
+            requestId: 'recovered-tail',
+            rows: [[expect.objectContaining({ raw: 'saved' })]],
+        }));
+        vi.useRealTimers();
+    });
+
     it('refreshes after an own watcher joined a postSave that installed other bytes', async () => {
         // Another writer replaced the saved bytes before the postSave read
         // them, so it installs those; the watcher's check still saw the saved

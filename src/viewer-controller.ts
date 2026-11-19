@@ -759,6 +759,12 @@ const READY_STATE_RETRY_MS = 50;
 const READY_STATE_REBASE_COUNT = 16;
 const EDIT_CLEANUP_RECOVERY_MS = 250;
 const PENDING_EDIT_FLUSH_TIMEOUT_MS = 2_000;
+/**
+ * How long a watcher event that joined a built postSave refresh waits for
+ * the rest of it (currency check, commit, adoption: milliseconds normally)
+ * before taking it as stalled and refreshing itself.
+ */
+const POST_SAVE_JOIN_LIMIT_MS = 1_000;
 
 function is_watcher_refresh(event: FileRefreshEvent): boolean {
     return event.reason === 'watcherChange'
@@ -10626,10 +10632,12 @@ export function attach_viewer(
             ) return false;
             // Past the size limit the build refuses before reading, so this
             // must not read it either; the refresh it falls back to refuses.
-            // As in the build, the limit is checked on the stat: a file
-            // replaced between the stat and the read is read as it is then.
+            // As in the build, the bytes read are checked again before they
+            // are hashed: a file replaced after the stat may be larger.
             assert_safe_file_size(stat.size, host.config.max_file_size_mib());
-            return content_digest(await host.fs.read_file(uri)) === digest;
+            const raw = await host.fs.read_file(uri);
+            assert_safe_file_size(raw.byteLength, host.config.max_file_size_mib());
+            return content_digest(raw) === digest;
         } catch {
             return false;
         }
@@ -10671,11 +10679,11 @@ export function attach_viewer(
             // settles it, which a kept source does not give, so the event
             // still refreshes.
             //
-            // A postSave that stalls after its build, in its own reads of the
-            // file or its commit, holds a joined event with it. The refresh
-            // the event would start instead does the same reads of the same
-            // file, so it is not a way out of that stall; a parse that hangs
-            // is (see above), and so is a new attempt.
+            // After its build the postSave has only its currency check,
+            // commit and adoption left, which take milliseconds. A joined
+            // event that has waited `POST_SAVE_JOIN_LIMIT_MS` for them takes
+            // the postSave as stalled and refreshes, as it would have before
+            // joining; so does one whose postSave starts another attempt.
             session.wake_delivery();
             const seq_at_arrival = load_seq;
             return (async () => {
@@ -10687,10 +10695,16 @@ export function attach_viewer(
                     // Joined to the attempt whose build returned: a retry
                     // starting after it ends the join, since its build may
                     // never return either.
+                    let stall_timer: ReturnType<typeof setTimeout> | undefined;
+                    const stalled = new Promise<undefined>((resolve) => {
+                        stall_timer = setTimeout(() => resolve(undefined), POST_SAVE_JOIN_LIMIT_MS);
+                    });
                     const result = await Promise.race([
                         post_save.completion.catch(() => undefined),
                         post_save.next_attempt.then(() => undefined),
+                        stalled,
                     ]);
+                    clearTimeout(stall_timer);
                     const covered = result !== undefined
                         && load_seq === post_save.seq
                         && !disposed
