@@ -57,11 +57,12 @@ const width_with_padding = (content_width: number): number =>
 interface CellOptions {
     readonly hyperlink?: boolean;
     readonly allow_wrapping?: boolean;
+    readonly wraps_on_break?: boolean;
 }
 
 function make_cell(
     lines: RichTextLine[],
-    { hyperlink = false, allow_wrapping = false }: CellOptions = {},
+    { hyperlink = false, allow_wrapping = false, wraps_on_break = false }: CellOptions = {},
 ): RichTextGridCell {
     return {
         kind: GridCellKind.Custom,
@@ -73,6 +74,7 @@ function make_cell(
                 ? { hyperlink: { kind: 'external' as const, target: 'https://x.example/' } }
                 : {}),
             ...(allow_wrapping ? { allow_wrapping: true as const } : {}),
+            ...(wraps_on_break ? { wraps_on_break: true as const } : {}),
         },
         copyData: 'x',
         allowOverlay: false,
@@ -382,12 +384,28 @@ describe('rich_cell_fit', () => {
     /** 10px a glyph, "i" 2px. */
     const narrow = () => stub_ctx((text) => [...text].reduce((width, glyph) => width + (glyph === 'i' ? 2 : 10), 0)).ctx;
     const fit = (lines: RichTextLine[], width: number, auto_fit_columns = false) =>
-        rich_cell_fit(narrow(), make_cell(lines).data, width, theme.cellHorizontalPadding, 'sans', auto_fit_columns);
+        rich_cell_fit(
+            narrow(),
+            // As cell-renderer marks it: a line break in what it paints.
+            make_cell(lines, { wraps_on_break: lines.length > 1 }).data,
+            width,
+            theme.cellHorizontalPadding,
+            'sans',
+            auto_fit_columns,
+        );
 
     it('counts a line of spaces that paints an underline or strikethrough', () => {
         expect(fit([[{ text: 'a' }], [], [{ text: '   ', style: { underline: true } }]], 200))
             .toEqual({ lines: 3, fits_default: false });
         expect(fit([[{ text: 'a' }], [], [{ text: '   ' }]], 200)).toEqual({ lines: 1, fits_default: true });
+    });
+
+    it('counts an underline over spaces cut at a quarter of the width in characters', () => {
+        // The second segment is cut at ceil(100 / 4) = 25 of its 27 spaces,
+        // and its underline runs past the cell's edge.
+        expect(fit([[{ text: 'a' }, { text: ' '.repeat(27), style: { underline: true } }]], 100).fits_default)
+            .toBe(false);
+        expect(fit([[{ text: 'a' }, { text: ' '.repeat(27) }]], 100).fits_default).toBe(true);
     });
 
     it('takes a line break as wrapping at the default height, with no character cap', () => {

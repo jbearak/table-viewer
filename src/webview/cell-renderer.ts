@@ -334,8 +334,9 @@ function rich_cell(
         // The wrap heuristic looks at everything the cell will paint: for a
         // diff cell that includes the old text, whose hard breaks must still
         // trigger the multiline path even when the new value has none.
-        const allow_wrapping = cell_allows_wrapping(display, soft_wrap)
+        const breaks = has_line_break(display)
             || (overlay?.diff_base !== undefined && has_line_break(overlay.diff_base));
+        const allow_wrapping = soft_wrap || breaks;
         // Whole-cell flags become one styled run for link/underline-only
         // cells. With formatting off only the link presentation survives
         // (mirroring the Text path dropping bold/italic): plain runs, and the
@@ -379,6 +380,7 @@ function rich_cell(
                 ...(c.hyperlink ? { hyperlink: c.hyperlink } : {}),
                 font_size_px,
                 ...(allow_wrapping ? { allow_wrapping: true as const } : {}),
+                ...(breaks ? { wraps_on_break: true as const } : {}),
                 // Whole-string RTL heuristic, same as Glide's Text cell.
                 ...(direction(display) === 'rtl' ? { rtl: true as const } : {}),
             },

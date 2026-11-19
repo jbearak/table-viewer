@@ -37,6 +37,8 @@ export interface RichCellData {
     /** Width-wrap each hard line inside the painted cell. Absent keeps the
      *  cheap clipping/truncation path used by a default-height single line. */
     readonly allow_wrapping?: true;
+    /** What it paints has a line break, so it wraps at any row height. */
+    readonly wraps_on_break?: true;
     /** Right-to-left cell text (Glide's whole-string heuristic): segments lay
      *  out from the right edge, like the built-in Text cell's RTL path. */
     readonly rtl?: true;

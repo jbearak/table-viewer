@@ -152,6 +152,14 @@ export function rich_cell_wrapped_lines(
     );
 }
 
+/** Whether a segment paints something: visible text, or spaces under an underline or strikethrough (a link's too). */
+function segment_paints(data: RichCellData): (segment: RichTextLine[number]) => boolean {
+    const linked = data.hyperlink !== undefined;
+    return (segment) => /\S/.test(segment.text)
+        || (segment.text !== ''
+            && (linked || segment.style?.underline === true || segment.style?.strikethrough === true));
+}
+
 /**
  * Whether this renderer, drawing `data` unwrapped on one line in a cell
  * `width` wide (what it does at the default row height), would leave visible
@@ -165,7 +173,7 @@ export function rich_cell_unwrapped_hides_text(
     horizontal_padding: number,
     font_family: string,
 ): boolean {
-    const visible = (text: string) => /\S/.test(text);
+    const paints = segment_paints(data);
     const line = data.lines[0] ?? [];
     const variants = font_variants(data.font_size_px, font_family);
     const max_chars = Math.ceil(width / 4);
@@ -178,14 +186,16 @@ export function rich_cell_unwrapped_hides_text(
     try {
         let pen = 0;
         for (let index = 0; index < line.length; index += 1) {
-            const later_visible = () => line.slice(index + 1).some((segment) => visible(segment.text));
+            const later_paints = () => line.slice(index + 1).some(paints);
             const segment = line[index];
-            if (pen >= room) return visible(segment.text) || later_visible();
+            if (pen >= room) return paints(segment) || later_paints();
             const truncated = segment.text.length > max_chars;
             const text = truncated ? segment.text.slice(0, max_chars) : segment.text;
             ctx.font = variant_of(variants, segment.style);
-            if (pen + ctx.measureText(text.trimEnd()).width > clip + 0.5) return true;
-            if (truncated) return visible(segment.text.slice(max_chars)) || later_visible();
+            // Up to its last glyph, or all of it under a decoration.
+            const drawn = paints({ ...segment, text: text.trimEnd() }) ? text.trimEnd() : text;
+            if (paints({ ...segment, text }) && pen + ctx.measureText(drawn).width > clip + 0.5) return true;
+            if (truncated) return paints({ ...segment, text: segment.text.slice(max_chars) }) || later_paints();
             pen += ctx.measureText(text).width;
         }
         return false;
@@ -198,7 +208,7 @@ export function rich_cell_unwrapped_hides_text(
  * What row auto-fit needs of a rich cell `width` wide: its lines once the row
  * is tall enough to wrap, through the last that paints something, and whether
  * it paints all of its text at the default height. It wraps there with
- * Auto-fit Columns on, or when it paints a line break (cell-renderer's rule);
+ * Auto-fit Columns on, or when it paints a line break (`wraps_on_break`);
  * otherwise it draws one line (see `rich_cell_unwrapped_hides_text`).
  */
 export function rich_cell_fit(
@@ -209,15 +219,13 @@ export function rich_cell_fit(
     font_family: string,
     auto_fit_columns: boolean,
 ): { lines: number; fits_default: boolean } {
-    const linked = data.hyperlink !== undefined;
-    // Visible text, or spaces under an underline or strikethrough (a link's too).
-    const paints = (line: RichTextLine): boolean => line.some((segment) =>
-        /\S/.test(segment.text)
-        || (segment.text !== ''
-            && (linked || segment.style?.underline === true || segment.style?.strikethrough === true)));
+    const paints = segment_paints(data);
     const available = Math.max(0, width - 2 * horizontal_padding);
-    const lines = lines_to_last_visible(rich_cell_wrapped_lines(ctx, data, available, font_family), paints);
-    const fits_default = auto_fit_columns || data.lines.length > 1
+    const lines = lines_to_last_visible(
+        rich_cell_wrapped_lines(ctx, data, available, font_family),
+        (line) => line.some(paints),
+    );
+    const fits_default = auto_fit_columns || data.wraps_on_break === true
         ? lines <= 1
         : !rich_cell_unwrapped_hides_text(ctx, data, width, horizontal_padding, font_family);
     return { lines, fits_default };

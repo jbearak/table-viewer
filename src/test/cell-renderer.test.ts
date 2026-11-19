@@ -495,6 +495,8 @@ describe('build_grid_cell — rich cells', () => {
         expect(short.data.allow_wrapping).toBeUndefined();
         expect(tall.data.allow_wrapping).toBe(true);
         expect(short_again.data.allow_wrapping).toBeUndefined();
+        // A tall row wraps; no line break does.
+        expect((tall as { data: { wraps_on_break?: true } }).data.wraps_on_break).toBeUndefined();
     });
 
     it('wraps a Formatting-off hyperlink when its row is tall', () => {
@@ -520,9 +522,11 @@ describe('build_grid_cell — rich cells', () => {
             },
         };
         const c = build_grid_cell(0, [information_note], true) as unknown as {
-            data: { allow_wrapping?: true; lines: unknown[] };
+            data: { allow_wrapping?: true; wraps_on_break?: true; lines: unknown[] };
         };
         expect(c.data.allow_wrapping).toBe(true);
+        // Wrapping for its line break, whatever the row's height: auto-fit reads this.
+        expect(c.data.wraps_on_break).toBe(true);
         expect(c.data.lines).toHaveLength(3);
 
         const formatting_off = build_grid_cell(
