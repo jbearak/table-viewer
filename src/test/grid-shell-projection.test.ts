@@ -4584,6 +4584,24 @@ describe('GridShell column projection', () => {
         await act(async () => window.dispatchEvent(text_copy));
         expect(text_copy.defaultPrevented).toBe(false);
         expect(glide_copy).toHaveBeenCalledOnce();
+
+        // So does focus outside the grid.
+        const outside = document.createElement('button');
+        document.body.appendChild(outside);
+        outside.focus();
+        const outside_copy = new Event('copy', { bubbles: true, cancelable: true });
+        await act(async () => window.dispatchEvent(outside_copy));
+        expect(outside_copy.defaultPrevented).toBe(false);
+        expect(glide_copy).toHaveBeenCalledTimes(2);
+
+        // And a grid with nothing selected.
+        focus_target.focus();
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([]) }));
+        const empty_copy = new Event('copy', { bubbles: true, cancelable: true });
+        await act(async () => window.dispatchEvent(empty_copy));
+        expect(empty_copy.defaultPrevented).toBe(false);
+        expect(glide_copy).toHaveBeenCalledTimes(3);
+        expect(write_text).toHaveBeenCalledOnce();
     });
 
     it('preserves an inside multi-row marker selection and hides its coalesced intervals', async () => {

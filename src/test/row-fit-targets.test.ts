@@ -49,6 +49,35 @@ function band_projection(removed: readonly number[], appended_ids: readonly stri
 }
 
 /**
+ * Band mode over a layout: a sorted view of 12 source rows after source rows
+ * 3 and 5 were removed in place, so removed rows sit among saved ones.
+ */
+function sorted_projection_with_removals(): PendingRowProjection {
+    const displayed = [4, 1, 7, 0, 2, 3, 5, 6, 8, 9, 10, 11];
+    return create_pending_row_projection({
+        sourceDisplayRowCount: displayed.length,
+        sourceRowAt: (row) => displayed[row],
+        displayRowForSource: (source) => {
+            const index = displayed.indexOf(source);
+            return index < 0 ? undefined : index;
+        },
+        sourceRowCount: 12,
+        bodyViewTransformed: true,
+        changes: {
+            formatTemplates: [],
+            appendedRows: [],
+            tailRemovals: [],
+            conflicts: [],
+            rowLayout: {
+                runs: [{ kind: 'source', start: 0, count: 12 }],
+                removedSourceRows: [{ start: 3, count: 1 }, { start: 5, count: 1 }],
+                discardedPendingRows: [],
+            },
+        },
+    });
+}
+
+/**
  * Layout mode: rows moved, one inserted, two removed inline, one appended;
  * or, `ends_removed`, nothing appended and the last rows removed.
  */
@@ -116,11 +145,15 @@ describe('row_fit_targets', () => {
         ['band mode with Pending Rows left over', () => band_projection([11], ['replacement', 'row-a', 'row-b'])],
         ['layout mode', () => layout_projection()],
         ['layout mode ending in removed rows', () => layout_projection(true)],
+        ['a sorted view with rows removed in place', sorted_projection_with_removals],
     ] as const;
     for (const [name, make] of cases) {
         it(`finds the same rows and the same skipped count by either walk, in ${name}`, () => {
             const projection = make();
-            const kinds = new Set(Array.from({ length: projection.rowCount }, (_, row) => projection.row_at(row)?.kind ?? 'unresolved'));
+            const kinds = new Set(Array.from(
+                { length: projection.rowCount },
+                (_, row) => `${projection.row_at(row)?.kind ?? 'unresolved'}/${projection.row_state(row) ?? 'unknown'}`,
+            ));
             expect(kinds.size, `${name} rows: ${[...kinds].join(', ')}`).toBeGreaterThanOrEqual(2);
             const next = random_source(name.length * 31);
             for (let trial = 0; trial < 400; trial++) {
@@ -219,6 +252,7 @@ describe('rows_hold_fit_target', () => {
             band_projection([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], []),
             layout_projection(),
             layout_projection(true),
+            sorted_projection_with_removals(),
         ];
         const next = random_source(52);
         for (const [index, projection] of projections.entries()) {

@@ -8,6 +8,7 @@ import type {
 import { parse_cell_highlight_key } from '../cell-highlights';
 import type { ColumnProjection } from './column-projection';
 import { expand_glide_selection } from './selection-glide';
+import type { SourceRowRun } from './pending-row-projection';
 
 export interface HighlightSelectionResult {
     /** The source cells; `sourceColumns` is empty when only Pending Columns are selected. */
@@ -19,23 +20,31 @@ export interface HighlightSelectionResult {
 }
 
 /**
- * Past this many rows a selection is not checked row by row for a highlight:
- * as many rows as the row loader holds (50 pages of 100), so a selection
- * larger than it has a row whose source row is unknown wherever rows map
- * through the loader, and is answered conservatively without the walk.
+ * How a projection groups grid rows by their source rows (see
+ * `PendingRowProjection.source_row_runs`), so a probe can read a selection
+ * by its runs rather than its rows.
  */
-export const HIGHLIGHT_PROBE_ROW_LIMIT = 5_000;
+export interface SelectionSourceRuns {
+    /** Grid rows from here on are past the source band, read one by one. */
+    readonly deleted_band_start: number;
+    readonly source_row_runs: (start: number, end: number) => readonly SourceRowRun[];
+}
 
 /**
  * Whether clearing the effective selection could remove a renderable highlight.
  * Unknown display-to-source rows are conservative, but only after a highlight
- * candidate has been found in one of the selected source columns. So is a
- * selection of more than `HIGHLIGHT_PROBE_ROW_LIMIT` rows.
+ * candidate has been found in one of the selected source columns.
+ *
+ * With `runs`, a run of consecutive source rows is checked against the
+ * highlighted rows in one step, so a selection of a million rows in the
+ * layout costs as much as its runs; rows that resolve one at a time are
+ * read one at a time, as without it.
  */
 export function highlight_selection_may_have_renderable_highlight(
     selection: CellHighlightSelection | null,
     cells: Readonly<Record<string, CellHighlightColor>> | undefined,
     get_source_row: (display_row: number) => number | undefined,
+    runs?: SelectionSourceRuns,
 ): boolean {
     if (!selection || !cells || selection.displayRows.length === 0) return false;
     const selected_columns = new Set(selection.sourceColumns);
@@ -50,16 +59,45 @@ export function highlight_selection_may_have_renderable_highlight(
     }
     if (highlighted_source_rows.size === 0) return false;
 
-    let selected_rows = 0;
-    for (const interval of selection.displayRows) selected_rows += interval.end - interval.start + 1;
-    if (selected_rows > HIGHLIGHT_PROBE_ROW_LIMIT) return true;
+    const row_may_have = (display_row: number): boolean => {
+        const source_row = get_source_row(display_row);
+        return source_row === undefined || highlighted_source_rows.has(source_row);
+    };
+    const rows_may_have = (start: number, end: number): boolean => {
+        for (let display_row = start; display_row <= end; display_row++) {
+            if (row_may_have(display_row)) return true;
+        }
+        return false;
+    };
+    if (runs === undefined) {
+        return selection.displayRows.some((interval) => rows_may_have(interval.start, interval.end));
+    }
+    const sorted = [...highlighted_source_rows].sort((left, right) => left - right);
+    // Whether a highlighted source row lies in [first, first + count).
+    const highlighted_in = (first: number, count: number): boolean => {
+        let low = 0;
+        let high = sorted.length;
+        while (low < high) {
+            const middle = (low + high) >>> 1;
+            if (sorted[middle] < first) low = middle + 1;
+            else high = middle;
+        }
+        return low < sorted.length && sorted[low] < first + count;
+    };
     for (const interval of selection.displayRows) {
-        for (let display_row = interval.start; display_row <= interval.end; display_row++) {
-            const source_row = get_source_row(display_row);
-            if (source_row === undefined || highlighted_source_rows.has(source_row)) {
-                return true;
+        const source_end = Math.min(interval.end, runs.deleted_band_start - 1);
+        if (interval.start <= source_end) {
+            for (const run of runs.source_row_runs(interval.start, source_end)) {
+                if (run.kind === 'source') {
+                    if (highlighted_in(run.sourceRow, run.count)) return true;
+                } else if (run.kind === 'row') {
+                    if (row_may_have(run.displayRow)) return true;
+                } else if (rows_may_have(run.displayStart, run.displayStart + run.count - 1)) {
+                    return true;
+                }
             }
         }
+        if (rows_may_have(Math.max(interval.start, runs.deleted_band_start), interval.end)) return true;
     }
     return false;
 }

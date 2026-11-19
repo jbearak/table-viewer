@@ -13103,6 +13103,16 @@ export function GridShell({
                         }])[0]?.start;
                         return raw === undefined ? undefined : get_source_row(raw);
                     },
+                    // In the layout every saved row knows its source row, so
+                    // a selection is read by its runs. A sorted or filtered
+                    // view reads row by row, stopping at the first row not
+                    // loaded, so at most the rows the loader holds.
+                    pending_projection.layoutMode
+                        ? {
+                            deleted_band_start: pending_projection.deletedBandStart,
+                            source_row_runs: pending_projection.source_row_runs,
+                        }
+                        : undefined,
                 ),
             highlight_cell_count,
             on_discard_edit: () => {
@@ -13504,43 +13514,14 @@ export function GridShell({
                             on_copy_rows: () => {
                                 // The rows the menu opened on, by their
                                 // intervals: the copy reads only as many as
-                                // the clipboard cap lets through.
+                                // the clipboard cap lets through. The menu
+                                // closes when those rows move; should it not,
+                                // it copies nothing, as Auto-fit fits nothing.
                                 if (
                                     row_menu.display_rows.topology_key
-                                    === pending_selection_topology_key_ref.current
-                                ) {
-                                    copy_display_rows(row_menu.display_rows.rows);
-                                    return;
-                                }
-                                const resolved_rows = new Set<number>();
-                                {
-                                    for (const interval of row_menu.source_display_rows) {
-                                        for (let row = interval.start; row <= interval.end; row += 1) {
-                                            const display = pending_projection
-                                                .display_row_for_source_display(row);
-                                            if (display !== undefined) resolved_rows.add(display);
-                                        }
-                                    }
-                                    for (const id of selected_pending_ids) {
-                                        const display = pending_projection.display_row_for_identity({
-                                            kind: 'pending', pendingRowId: id,
-                                        });
-                                        if (display !== undefined) resolved_rows.add(display);
-                                    }
-                                    for (const sourceRow of selected_removal_rows) {
-                                        const display = pending_projection.display_row_for_identity({
-                                            kind: 'source', sourceRow,
-                                        });
-                                        if (display !== undefined) resolved_rows.add(display);
-                                    }
-                                }
-                                const ordered_rows = [...resolved_rows]
-                                    .sort((left, right) => left - right);
-                                copy_source_selection({
-                                    row_indices: ordered_rows,
-                                    row_count: ordered_rows.length,
-                                    source_columns: copy_columns,
-                                });
+                                    !== pending_selection_topology_key_ref.current
+                                ) return;
+                                copy_display_rows(row_menu.display_rows.rows);
                             },
                         })}
                         on_dismiss={dismiss_context_menu}

@@ -11,7 +11,7 @@
  */
 
 import type { DisplayRowInterval } from '../types';
-import type { PendingRowProjection } from './pending-row-projection';
+import { NEAREST_LIVE_ROW_SCAN_LIMIT, type PendingRowProjection } from './pending-row-projection';
 
 export interface RowFitTargetSources {
     readonly projection: Pick<
@@ -131,9 +131,6 @@ export function row_fit_targets_by_resident_rows(
             if (display_row === undefined || !contains(intervals, display_row)) continue;
             const projected = projection.row_at(display_row);
             if (projected !== undefined && projected.kind !== 'source') continue;
-            // The row walk reads this grid row's own source-display row; one
-            // that is not this one is found when its own row comes round.
-            if ((projected?.sourceDisplayRow ?? display_row) !== source_display_row) continue;
             const source_row = projected?.identity?.sourceRow ?? sources.source_row_of(source_display_row);
             if (source_row === undefined) continue;
             found_sources.push({ display_row, source_row });
@@ -163,15 +160,14 @@ export function row_fit_targets(
 /**
  * Whether `rows` hold a row a fit can size: anything but a row the session
  * will delete (a Pending Row Removal in the layout, or one past the last
- * row). By runs, not rows, so a selection of a million removed rows costs
- * no more than one: in layout mode removed rows are skipped a run at a time,
- * and in band mode only the deleted band holds removals.
+ * row). In layout mode removed rows are skipped a run at a time, so a
+ * selection of a million removed rows costs no more than one. A sorted or
+ * filtered view (band mode) can show inline removals too, scattered: there
+ * each interval is read row by row for at most
+ * `NEAREST_LIVE_ROW_SCAN_LIMIT` rows, past which it is taken to hold one.
  */
 export function rows_hold_fit_target(
-    projection: Pick<
-        PendingRowProjection,
-        'layoutMode' | 'nearest_live_display_row' | 'deletedBandStart' | 'pendingBandStart' | 'rowCount'
-    >,
+    projection: Pick<PendingRowProjection, 'layoutMode' | 'nearest_live_display_row' | 'row_state' | 'rowCount'>,
     rows: readonly DisplayRowInterval[],
 ): boolean {
     for (const interval of rows) {
@@ -183,7 +179,12 @@ export function rows_hold_fit_target(
             if (live !== undefined && live >= start && live <= end) return true;
             continue;
         }
-        if (start < projection.deletedBandStart || end >= projection.pendingBandStart) return true;
+        const last = Math.min(end, start + NEAREST_LIVE_ROW_SCAN_LIMIT - 1);
+        for (let row = start; row <= last; row += 1) {
+            const state = projection.row_state(row);
+            if (state !== 'removed' && state !== 'tail-removal') return true;
+        }
+        if (last < end) return true;
     }
     return false;
 }

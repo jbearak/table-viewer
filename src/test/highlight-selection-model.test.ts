@@ -2,8 +2,8 @@ import { CompactSelection, type GridSelection } from '../webview/glide-data-grid
 import { describe, expect, it, vi } from 'vitest';
 import { plan_cell_highlight_mutation } from '../cell-highlight-command';
 import { create_column_projection } from '../webview/column-projection';
+import { create_pending_row_projection } from '../webview/pending-row-projection';
 import {
-    HIGHLIGHT_PROBE_ROW_LIMIT,
     compact_intervals,
     grid_selection_contains_cell,
     grid_selection_contains_row,
@@ -41,21 +41,6 @@ describe('highlight_selection_may_have_renderable_highlight', () => {
             { '14:1': 'yellow', '15:2': 'green' },
             get_source_row,
         )).toBe(true);
-    });
-
-    it('answers a selection larger than the loader holds without walking it', () => {
-        const get_source_row = vi.fn((display_row: number) => display_row + 10);
-        const huge = { displayRows: [{ start: 0, end: 999_999 }], sourceColumns: [0, 2] };
-        expect(highlight_selection_may_have_renderable_highlight(huge, { '2000000:2': 'blue' }, get_source_row))
-            .toBe(true);
-        expect(get_source_row).not.toHaveBeenCalled();
-        // Still nothing to clear when no selected column holds a highlight.
-        expect(highlight_selection_may_have_renderable_highlight(huge, { '15:1': 'blue' }, get_source_row))
-            .toBe(false);
-        const at_limit = { displayRows: [{ start: 0, end: HIGHLIGHT_PROBE_ROW_LIMIT - 1 }], sourceColumns: [2] };
-        expect(highlight_selection_may_have_renderable_highlight(at_limit, { '2000000:2': 'blue' }, get_source_row))
-            .toBe(false);
-        expect(get_source_row).toHaveBeenCalledTimes(HIGHLIGHT_PROBE_ROW_LIMIT);
     });
 
     it('treats an unresolved selected row conservatively only for selected-column candidates', () => {
@@ -509,5 +494,93 @@ describe('highlight_selection_from_grid over random selections', () => {
             }
             expect(listed_rows, `trial ${trial}`).toEqual([...covered_rows].sort((a, b) => a - b));
         }
+    });
+});
+
+describe('highlight_selection_may_have_renderable_highlight by source runs', () => {
+    /**
+     * The layout of row-fit-targets.test.ts: fixed rows 0-1, then source 2,
+     * an inserted row and a discarded one, 3 (removed), 6-11, 4, 5 (removed),
+     * then an appended row.
+     */
+    const layout = create_pending_row_projection({
+        sourceDisplayRowCount: 12,
+        sourceRowAt: (row) => (row === 1 ? undefined : row),
+        displayRowForSource: (source) => source,
+        sourceRowCount: 12,
+        bodyStart: 2,
+        bodyViewTransformed: false,
+        changes: {
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+            appendedRows: [
+                { id: 'ins', origin: 'insert', cells: {}, formatTemplateId: 'plain', createdOrder: 1 },
+                { id: 'app', cells: {}, formatTemplateId: 'plain', createdOrder: 3 },
+            ],
+            tailRemovals: [],
+            conflicts: [],
+            rowLayout: {
+                runs: [
+                    { kind: 'source', start: 2, count: 1 },
+                    { kind: 'pending', ids: ['gone', 'ins'] },
+                    { kind: 'source', start: 3, count: 1 },
+                    { kind: 'source', start: 6, count: 6 },
+                    { kind: 'source', start: 4, count: 2 },
+                ],
+                removedSourceRows: [{ start: 3, count: 1 }, { start: 5, count: 1 }],
+                discardedPendingRows: [{ id: 'gone', createdOrder: 2 }],
+            },
+        },
+    });
+    // As GridShell resolves a grid row to its source row.
+    const source_row_of = (display_row: number) => {
+        const projected = layout.row_at(display_row);
+        if (projected?.kind === 'source') return projected.identity?.sourceRow;
+        return undefined;
+    };
+    const runs = { deleted_band_start: layout.deletedBandStart, source_row_runs: layout.source_row_runs };
+
+    it('answers as the row walk does, over random selections and highlights', () => {
+        let state = 13;
+        const next = () => {
+            state = (state * 1664525 + 1013904223) >>> 0;
+            return state / 2 ** 32;
+        };
+        let seen_true = 0;
+        for (let trial = 0; trial < 600; trial++) {
+            const display_rows: { start: number; end: number }[] = [];
+            let row = Math.floor(next() * layout.rowCount);
+            for (let count = 1 + Math.floor(next() * 2); count > 0 && row < layout.rowCount; count--) {
+                const end = Math.min(layout.rowCount - 1, row + Math.floor(next() * 4));
+                display_rows.push({ start: row, end });
+                row = end + 2 + Math.floor(next() * 3);
+            }
+            const cells: Record<string, 'yellow'> = {};
+            for (let source = 0; source < 14; source++) {
+                if (next() < 0.15) cells[`${source}:${next() < 0.7 ? 2 : 1}`] = 'yellow';
+            }
+            const selection = { displayRows: display_rows, sourceColumns: [0, 2] };
+            const expected = highlight_selection_may_have_renderable_highlight(selection, cells, source_row_of);
+            if (expected) seen_true += 1;
+            expect(
+                highlight_selection_may_have_renderable_highlight(selection, cells, source_row_of, runs),
+                `trial ${trial} ${JSON.stringify(display_rows)} ${Object.keys(cells).join(' ')}`,
+            ).toBe(expected);
+        }
+        expect(seen_true).toBeGreaterThan(50);
+        expect(seen_true).toBeLessThan(550);
+    });
+
+    it('reads a million saved rows by their run, not row by row', () => {
+        const get_source_row = vi.fn((display_row: number) => display_row);
+        const million = {
+            deleted_band_start: 1_000_000,
+            source_row_runs: () => [{ kind: 'source' as const, displayStart: 0, count: 1_000_000, sourceRow: 0 }],
+        };
+        const selection = { displayRows: [{ start: 0, end: 999_999 }], sourceColumns: [2] };
+        expect(highlight_selection_may_have_renderable_highlight(selection, { '2000000:2': 'blue' }, get_source_row, million))
+            .toBe(false);
+        expect(highlight_selection_may_have_renderable_highlight(selection, { '999999:2': 'blue' }, get_source_row, million))
+            .toBe(true);
+        expect(get_source_row).not.toHaveBeenCalled();
     });
 });
