@@ -360,6 +360,8 @@ describe('rich_cell_unwrapped_hides_text', () => {
         // Cut at ceil(60 / 4) = 15 characters, in spaces, with nothing after it.
         ['a cut through spaces alone, last', [[{ text: 'ab' }, { text: 'cd' + ' '.repeat(20) }]], 60, false],
         ['indentation pushes text past the edge', [[{ text: ' '.repeat(20) + 'x' }]], 100, true],
+        // Past the right padding but inside the cell, which is where Glide clips.
+        ['text into the right padding is still painted', [[{ text: '  x' }]], 40, false],
         ['a later segment past the edge', [[{ text: 'abcdefghij' }, { text: 'klmnop' }]], 120, true],
     ] as const)('says whether draw hides text: %s', (_name, lines, width, expected) => {
         const cell = make_cell(lines.map((line) => [...line]));

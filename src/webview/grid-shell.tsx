@@ -10935,7 +10935,9 @@ export function GridShell({
                         ctx.direction = direction(drawn) === 'rtl' ? 'rtl' : 'inherit';
                         if (
                             visible_past_cut.test(text)
-                            || ctx.measureText(drawn.trimEnd()).width > available
+                            // Drawn from the left padding (and half a pixel),
+                            // clipped at the cell's edge; half a pixel of slack.
+                            || ctx.measureText(drawn.trimEnd()).width > width - padding
                         ) lines = 2;
                     }
                 } finally {

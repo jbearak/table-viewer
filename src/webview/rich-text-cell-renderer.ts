@@ -168,8 +168,10 @@ export function rich_cell_unwrapped_hides_text(
     const line = data.lines[0] ?? [];
     const variants = font_variants(data.font_size_px, font_family);
     const max_chars = Math.ceil(width / 4);
-    // From `left` to `right` in `draw`.
+    // From `left` to `right` in `draw`: where it stops starting segments.
     const room = width - 2 * horizontal_padding - 0.5;
+    // From `left` to the cell's edge: where Glide clips what it paints.
+    const clip = width - horizontal_padding - 0.5;
     const direction = ctx.direction;
     ctx.direction = data.rtl === true ? 'rtl' : 'inherit';
     try {
@@ -181,7 +183,7 @@ export function rich_cell_unwrapped_hides_text(
             const truncated = segment.text.length > max_chars;
             const text = truncated ? segment.text.slice(0, max_chars) : segment.text;
             ctx.font = variant_of(variants, segment.style);
-            if (pen + ctx.measureText(text.trimEnd()).width > room + 0.5) return true;
+            if (pen + ctx.measureText(text.trimEnd()).width > clip + 0.5) return true;
             if (truncated) return visible(segment.text.slice(max_chars)) || later_visible();
             pen += ctx.measureText(text).width;
         }

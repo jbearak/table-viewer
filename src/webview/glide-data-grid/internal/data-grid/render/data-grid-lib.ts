@@ -579,6 +579,9 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, width: number
     const fits = (text: string) => ctx.measureText(text).width <= width;
     // Whitespace alone draws nothing, however many lines it would take.
     if (/^\s*$/.test(line) || fits(line)) return [line];
+    // Trailing whitespace is trimmed off the line it ends, so it takes none
+    // of its own (a no-break space or BOM after spaces would have).
+    line = line.trimEnd();
     const lines: string[] = [];
     let current = "";
     // Each word keeps the whitespace before it; trailing whitespace is a word
