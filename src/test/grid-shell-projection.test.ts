@@ -10985,6 +10985,75 @@ describe('row Insert in the row-gutter menu', () => {
         expect(pending.snapshot().appendedRows[0]?.viewerRowHeight).toBeUndefined();
     });
 
+    /** A 7px-per-glyph canvas, and every saved row holding 30 glyphs: three lines in column 0. */
+    const long_rows = () => {
+        const canvas_context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+            .mockReturnValue({
+                font: '',
+                measureText: (text: string) => ({ width: [...text].length * 7 }),
+            } as unknown as CanvasRenderingContext2D);
+        onTestFinished(() => canvas_context.mockRestore());
+        const text = 'x'.repeat(30);
+        grid_mock.get_row.mockImplementation(() => [
+            { raw: text, formatted: text, bold: false, italic: false },
+            { raw: 'b', formatted: 'b', bold: false, italic: false },
+            { raw: 'c', formatted: 'c', bold: false, italic: false },
+        ] as any);
+    };
+
+    it('fits the row menu\'s rows from Auto-fit, an inserted Pending Row among them', async () => {
+        long_rows();
+        const on_row_fit = vi.fn((_runs: unknown, on_result?: (applied: boolean) => void) => on_result?.(true));
+        const size_gesture_may_start = vi.fn(() => true);
+        const { pending } = await insert_after_first({ on_row_fit, size_gesture_may_start });
+        // Rows: source 0, the inserted row, source 1, ...
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as (selection: unknown) => void;
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([0, 1, 2]) }));
+        await open_row_menu(1);
+        await act(async () => menu_item('Auto-fit 3 row heights')!.click());
+        expect(size_gesture_may_start).toHaveBeenCalledOnce();
+        expect(on_row_fit).toHaveBeenCalledExactlyOnceWith([{ start: 0, end: 1, height: 62 }], expect.any(Function));
+        // The blank inserted row fits one line: its own height, staged with the write.
+        expect(pending.snapshot().appendedRows[0]).toMatchObject({ id: 'ins-a', viewerRowHeight: 24 });
+    });
+
+    it('offers no Auto-fit for rows being deleted, and fits nothing once the rows have moved', async () => {
+        long_rows();
+        const on_row_fit = vi.fn();
+        // The gate folds an open editor, which can change the rows; a test
+        // stands in for that here.
+        let while_admitting: (() => void) | undefined;
+        const { pending } = await insert_after_first({
+            on_row_fit,
+            size_gesture_may_start: () => {
+                while_admitting?.();
+                return true;
+            },
+        });
+        // Deleted in layout mode: the row stays in place, as a removal.
+        await open_row_menu(2);
+        await act(async () => menu_item('Delete row')!.click());
+        await open_row_menu(2);
+        expect(menu_item('Restore row')).toBeDefined();
+        expect(menu_item('Auto-fit row height')).toBeUndefined();
+        // Read with the menu; by the time it measures, another row stands
+        // where it read them.
+        await open_row_menu(0);
+        while_admitting = () => {
+            const kept = keep_inserted_rows_at_end(pending.snapshot(), {
+                worksheet: { sheetIndex: 0 },
+                bodyStart: 0,
+                sourceRowCount: 4,
+                sourceColumnCount: 3,
+                bodyViewTransformed: false,
+            });
+            if (!kept.ok) throw new Error(kept.refusal.message);
+            pending.apply_structure('session', kept.outcome);
+        };
+        await act(async () => menu_item('Auto-fit row height')!.click());
+        expect(on_row_fit).not.toHaveBeenCalled();
+    });
+
     it('offers Reset row height for saved rows that show a custom height, and posts a reset', async () => {
         const on_row_resize = vi.fn();
         const size_gesture_may_start = vi.fn(() => true);

@@ -1519,6 +1519,29 @@ interface RowResizePreview {
     moved: boolean;
 }
 
+/**
+ * Whether `rows` hold a row a fit can size: anything but a row the session
+ * will delete (an inline Pending Row Removal, or one past the last row).
+ * Stops at the first, so an ordinary selection costs a row or two.
+ */
+function rows_hold_fit_target(
+    projection: Pick<PendingRowProjection, 'row_state'>,
+    rows: readonly DisplayRowInterval[],
+): boolean {
+    for (const interval of rows) {
+        for (let row = interval.start; row <= interval.end; row += 1) {
+            const state = projection.row_state(row);
+            if (state !== 'removed' && state !== 'tail-removal') return true;
+        }
+    }
+    return false;
+}
+
+/** What a row fit fits: see `fit_row_heights` in GridShell. */
+type RowFitTarget =
+    | { readonly border: number }
+    | { readonly rows: readonly DisplayRowInterval[]; readonly topology_key: string };
+
 /** A finished press on a row border, for telling a double-click from two drags. */
 interface RowBorderPress {
     readonly row: number;
@@ -2239,6 +2262,12 @@ export function GridShell({
         selected_row_count: number;
         /** Raw host display intervals, captured before structural compression. */
         source_display_rows: DisplayRowInterval[];
+        /**
+         * The grid rows the menu acts on, Pending Rows included, and the
+         * topology they were read under: what Auto-fit fits. Present when
+         * one of them can be fitted.
+         */
+        fit_rows?: { readonly rows: DisplayRowInterval[]; readonly topology_key: string };
         /** Stable structural identities captured when the menu opened. */
         pending_row_ids: string[];
         tail_removal_source_rows: number[];
@@ -4294,6 +4323,16 @@ export function GridShell({
                 0,
             ),
             source_display_rows: source_intervals,
+            ...(on_row_fit !== undefined
+                && !preview_mode
+                && rows_hold_fit_target(pending_projection, request.display_rows)
+                ? {
+                    fit_rows: {
+                        rows: request.display_rows,
+                        topology_key: pending_selection_topology_key_ref.current,
+                    },
+                }
+                : {}),
             pending_row_ids: [...pending_ids],
             tail_removal_source_rows: [...removal_rows],
             ...(structure_items_offered
@@ -4307,7 +4346,9 @@ export function GridShell({
                 : {}),
         });
     }, [
+        on_row_fit,
         pending_projection,
+        preview_mode,
         row_marker_options,
         row_structure_selection_options,
         structure_items_offered,
@@ -10843,9 +10884,12 @@ export function GridShell({
     }, [apply_row_resize]);
 
     /**
-     * Fit rows to the lines their cells paint: a double-click on `row`'s
-     * border fits `row`, or every selected row when the selection holds it,
-     * each to its own height. Shrinks as well as grows.
+     * Fit rows to the lines their cells paint, each to its own height:
+     * `{ border }` is a double-click on that row's border, which fits the row,
+     * or every selected row when the selection holds it; `{ rows }` is the
+     * row menu's rows, which it read under `topology_key` and which are not
+     * fitted if another row now stands at one of them. Shrinks as well as
+     * grows.
      *
      * Measures what the grid paints (`get_cell_content`: edits, formula
      * results, Pending Rows and Columns, Diff and Git compare text), split
@@ -10855,26 +10899,34 @@ export function GridShell({
      * loaded can be measured; the rest are left as they are and counted in a
      * warning, as Copy does.
      */
-    const fit_row_heights = useCallback((row: number): void => {
+    const fit_row_heights = useCallback((target: RowFitTarget): void => {
         if (on_row_fit === undefined) return;
         // App folds an open editor first. What the fold commits renders
         // before anything is measured, and the measuring is done by this
         // render's callbacks, which paint it.
         if (size_gesture_may_start !== undefined && !size_gesture_may_start()) return;
         flushSync(() => {});
-        fit_rows_now_ref.current(row);
+        fit_rows_now_ref.current(target);
     }, [on_row_fit, size_gesture_may_start]);
     /** `fit_row_heights` past its gate, measuring with the cells this render paints. */
-    const fit_rows_now = useCallback((row: number): void => {
+    const fit_rows_now = useCallback((target: RowFitTarget): void => {
         if (on_row_fit === undefined) return;
         const projection = pending_projection_ref.current;
-        const selected_rows = grid_selection_ref.current.rows;
-        const intervals = selected_rows.hasIndex(row)
-            ? selected_display_row_intervals(
-                { columns: CompactSelection.empty(), rows: selected_rows },
-                projection.rowCount,
-            ) ?? [{ start: row, end: row }]
-            : [{ start: row, end: row }];
+        let intervals: readonly DisplayRowInterval[];
+        if ('rows' in target) {
+            // Checked after the fold, which can insert or commit a row.
+            if (target.topology_key !== pending_selection_topology_key_ref.current) return;
+            intervals = target.rows;
+        } else {
+            const row = target.border;
+            const selected_rows = grid_selection_ref.current.rows;
+            intervals = selected_rows.hasIndex(row)
+                ? selected_display_row_intervals(
+                    { columns: CompactSelection.empty(), rows: selected_rows },
+                    projection.rowCount,
+                ) ?? [{ start: row, end: row }]
+                : [{ start: row, end: row }];
+        }
         if (!measure_ctx_ref.current) {
             measure_ctx_ref.current = document.createElement('canvas').getContext('2d');
         }
@@ -11076,7 +11128,7 @@ export function GridShell({
         }
         // The strip's row height and border position are about to change.
         row_resize_ref.current?.set_target(null);
-        fit_row_heights(row);
+        fit_row_heights({ border: row });
     }, [fit_row_heights]);
 
     // Armed by a header mousedown (Glide selects the column and reports it via
@@ -13420,6 +13472,11 @@ export function GridShell({
                                     },
                                 }
                                 : {}),
+                            // The grid rows it read, as a double-click on a
+                            // border fits them; nothing if they have moved.
+                            ...(row_menu.fit_rows === undefined
+                                ? {}
+                                : { on_auto_fit_rows: () => fit_row_heights(row_menu.fit_rows!) }),
                             ...(only_pending ? {
                                 pending_row_count: selected_pending_ids.size,
                                 on_remove_pending_rows: () => {

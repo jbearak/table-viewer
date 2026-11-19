@@ -95,6 +95,7 @@ It also removes other friction from reading tables:
 - Drag column and row borders to resize
 - Double-click a column border to auto-fit to content
 - Double-click a row border to fit the row's height to its content, wrapping long text at the column widths. If the row is selected, every selected row is fitted, each to its own height. Rows that are not loaded yet (scrolled far out of view) are skipped with a message
+- Right-click a row number and choose **Auto-fit row height** to do the same for the row, or for the selected rows
 - Select contiguous or discontiguous rows by their row numbers, then drag a selected row boundary to resize them together
 - Select multiple columns, then drag a border of one of them to resize them together. A click on a border that does not move it changes nothing
 - **Auto-fit Columns** in the toolbar fits every column of the sheet to its content; pressed again, it puts back the widths the fit replaced. Its menu does either on all sheets: a sheet you have not opened yet is fitted when you open it
