@@ -759,6 +759,30 @@ const READY_STATE_RETRY_MS = 50;
 const READY_STATE_REBASE_COUNT = 16;
 const EDIT_CLEANUP_RECOVERY_MS = 250;
 const PENDING_EDIT_FLUSH_TIMEOUT_MS = 2_000;
+/**
+ * How long a watcher event that joined a built postSave refresh waits for
+ * the rest of it (currency check, commit, adoption: milliseconds normally)
+ * before taking it as stalled and refreshing itself.
+ */
+const POST_SAVE_JOIN_LIMIT_MS = 1_000;
+
+function is_watcher_refresh(event: FileRefreshEvent): boolean {
+    return event.reason === 'watcherChange'
+        || event.reason === 'watcherCreate'
+        || event.reason === 'watcherDelete';
+}
+
+/** A postSave refresh in flight: its load and the bytes it reads. */
+interface PostSaveRefresh {
+    readonly seq: number;
+    readonly saved_digest: string;
+    readonly completion: Promise<FileRefreshSubscriberResult>;
+    /** Whether the current attempt's source build has returned. */
+    built: boolean;
+    /** Settles when the next attempt starts. */
+    next_attempt: Promise<void>;
+    start_next_attempt: () => void;
+}
 
 /**
  * Source rows and the height each held, as ascending runs of consecutive rows
@@ -3199,6 +3223,11 @@ export function attach_viewer(
      * refresh that reads those same bytes is still the save, not a reload.
      */
     let unadopted_saved_digest: string | undefined;
+    /**
+     * The postSave refresh still in flight, so a watcher reporting the save's
+     * own write while it reads the saved bytes does not supersede it.
+     */
+    let post_save_refresh: PostSaveRefresh | undefined;
     let disposed = false;
     /**
      * What a replay lease retains, so a commit mutates only what preparation
@@ -10232,6 +10261,12 @@ export function attach_viewer(
         force: boolean,
         reason: 'ready' | 'fileReload' | 'recovery',
         initial = false,
+        /**
+         * Told, for the current attempt, whether its source build has
+         * returned a candidate: false as each attempt starts, true when its
+         * build returns one.
+         */
+        on_build_state?: (built: boolean) => void,
     ): Promise<FileRefreshSubscriberResult> {
         let attempts = 0;
         let include_compare_original = true;
@@ -10249,6 +10284,7 @@ export function attach_viewer(
             let file_failure = false;
             try {
                 const expected_authority = file_coordinator.authority().authorityRevision;
+                on_build_state?.(false);
                 const build = await build_source_with_file_size_decision(
                     request,
                     initial,
@@ -10257,6 +10293,7 @@ export function attach_viewer(
                 if (build.type === 'stale') return inactive_refresh_result();
                 if (build.type === 'stopped') return { type: 'completed' };
                 candidate = build.candidate;
+                on_build_state?.(true);
                 if (!load_is_current(request.seq, request.refreshEvent)) {
                     return inactive_refresh_result();
                 }
@@ -10576,10 +10613,129 @@ export function attach_viewer(
         return refresh_panel_source(false);
     }
 
+    /**
+     * Whether the file now holds exactly the bytes `digest` names. Only for a
+     * file the build reads whole anyway, and within the size limit: a
+     * file-backed source is cheap to rebuild, and reading it whole here could
+     * be the expensive part.
+     */
+    async function file_holds_bytes(digest: string): Promise<boolean> {
+        // A compare window rebuilds both sides: a postSave that fell back to
+        // a plain view of the saved file must not be taken as the answer.
+        if (compare_original_uri) return false;
+        try {
+            const stat = await host.fs.stat(uri);
+            if (
+                uri.scheme.toLowerCase() === 'file'
+                && profile.build_file_source !== undefined
+                && (profile.prefer_file_source || stat.size > MAX_WHOLE_FILE_READ_BYTES)
+            ) return false;
+            // Past the size limit the build refuses before reading, so this
+            // must not read it either; the refresh it falls back to refuses.
+            // As in the build, the bytes read are checked again before they
+            // are hashed: a file replaced after the stat may be larger.
+            assert_safe_file_size(stat.size, host.config.max_file_size_mib());
+            const raw = await host.fs.read_file(uri);
+            assert_safe_file_size(raw.byteLength, host.config.max_file_size_mib());
+            return content_digest(raw) === digest;
+        } catch {
+            return false;
+        }
+    }
+
     function refresh_from_event(
         event: FileRefreshEvent,
     ): Promise<FileRefreshSubscriberResult> {
         if (disposed) return Promise.resolve({ type: 'disposed' });
+        const post_save = post_save_refresh;
+        if (is_watcher_refresh(event) && post_save !== undefined) {
+            // A watcher reporting the save's own write while the postSave
+            // refresh is still reading it: as a change, or as a create when
+            // the write replaced the file. A large workbook parses
+            // synchronously, so this report is delivered only once that parse
+            // returns; superseding it would read and parse the same bytes a
+            // second time. Bytes that differ are another writer's, and
+            // supersede as any change does.
+            //
+            // The event joins the postSave refresh only once the build of the
+            // attempt it is on has returned, which is when a synchronous parse
+            // lets the report through. A build still running may never return; the
+            // event then supersedes it as before, so a hung parse can still
+            // be recovered by a fresh one.
+            //
+            // The check reads the file, so the postSave refresh may finish
+            // first. It then covers this event too when no load has started
+            // since and it installed (or kept) exactly the bytes this event
+            // reports. A completion that installed other bytes, or nothing (a
+            // declined size prompt), and a failed postSave, leave the event to
+            // refresh as before. One consequence is accepted: a postSave whose
+            // build returns but whose commit or adoption fails the same way on
+            // every retry reports its failure, and the joined event's refresh
+            // fails and reports again. Treating that failure as covering the
+            // event instead would swallow the refresh that recovers from a
+            // transient one.
+            //
+            // A parked header settlement is the exception: only an adoption
+            // settles it, which a kept source does not give, so the event
+            // still refreshes.
+            //
+            // After its build the postSave has only its currency check,
+            // commit and adoption left, which take milliseconds. A joined
+            // event that has waited `POST_SAVE_JOIN_LIMIT_MS` for them takes
+            // the postSave as stalled and refreshes, as it would have before
+            // joining; so does one whose postSave starts another attempt.
+            session.wake_delivery();
+            const seq_at_arrival = load_seq;
+            return (async () => {
+                if (
+                    await file_holds_bytes(post_save.saved_digest)
+                    && load_seq === post_save.seq
+                    && post_save.built
+                ) {
+                    // Joined to the attempt whose build returned: a retry
+                    // starting after it ends the join, since its build may
+                    // never return either.
+                    let stall_timer: ReturnType<typeof setTimeout> | undefined;
+                    const stalled = new Promise<undefined>((resolve) => {
+                        stall_timer = setTimeout(() => resolve(undefined), POST_SAVE_JOIN_LIMIT_MS);
+                    });
+                    const result = await Promise.race([
+                        post_save.completion.catch(() => undefined),
+                        post_save.next_attempt.then(() => undefined),
+                        stalled,
+                    ]);
+                    clearTimeout(stall_timer);
+                    const covered = result !== undefined
+                        && load_seq === post_save.seq
+                        && !disposed
+                        && header_settlement_waiter === undefined
+                        && result.type === 'completed'
+                        && source_observation?.digest === post_save.saved_digest;
+                    if (covered) return result;
+                }
+                if (disposed) return { type: 'disposed' } as const;
+                // A load that started while this event was checking (a newer
+                // event, a recovery, a later save, or a local refresh such as
+                // Load all rows) is newer than this report and reads the file
+                // itself. Starting this one now would supersede it with an
+                // older event. A retry of the postSave this event checked is
+                // the same load and does not count.
+                if (
+                    load_seq !== seq_at_arrival
+                    || (latest_refresh_event !== undefined
+                        && latest_refresh_event.episode > event.episode)
+                ) {
+                    return inactive_refresh_result();
+                }
+                return start_refresh_from_event(event);
+            })();
+        }
+        return start_refresh_from_event(event);
+    }
+
+    function start_refresh_from_event(
+        event: FileRefreshEvent,
+    ): Promise<FileRefreshSubscriberResult> {
         latest_refresh_event = event;
         if (event.reason === 'postSave') unadopted_saved_digest = event.savedDigest;
         session.wake_delivery();
@@ -10593,12 +10749,45 @@ export function attach_viewer(
         // an ordinary reload would leave an empty renderer on "Loading..." after
         // the superseded dialog correctly declines to close a newer request.
         const initial = source_observation === undefined;
-        return run_physical_refresh(
+        let tracked: PostSaveRefresh | undefined;
+        const completion = run_physical_refresh(
             request,
             projection_recovery,
             projection_recovery ? 'recovery' : 'fileReload',
             initial,
+            (built) => {
+                if (tracked === undefined) return;
+                tracked.built = built;
+                if (!built) tracked.start_next_attempt();
+            },
         );
+        if (event.reason === 'postSave' && event.savedDigest !== undefined) {
+            let start_next_attempt!: () => void;
+            const next_attempt = new Promise<void>((resolve) => { start_next_attempt = resolve; });
+            tracked = {
+                seq: request.seq,
+                saved_digest: event.savedDigest,
+                completion,
+                built: false,
+                next_attempt,
+                start_next_attempt: () => {
+                    const settle_this = start_next_attempt;
+                    tracked!.next_attempt = new Promise<void>((resolve) => {
+                        start_next_attempt = resolve;
+                    });
+                    settle_this();
+                },
+            };
+            post_save_refresh = tracked;
+            const settled_tracker = tracked;
+            const settle = () => {
+                if (post_save_refresh === settled_tracker) post_save_refresh = undefined;
+            };
+            void completion.then(settle, settle);
+        } else {
+            post_save_refresh = undefined;
+        }
+        return completion;
     }
 
     async function send_initial_data(): Promise<void> {
