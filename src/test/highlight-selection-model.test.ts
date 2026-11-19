@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { plan_cell_highlight_mutation } from '../cell-highlight-command';
 import { create_column_projection } from '../webview/column-projection';
 import {
+    HIGHLIGHT_PROBE_ROW_LIMIT,
     compact_intervals,
     grid_selection_contains_cell,
     grid_selection_contains_row,
@@ -40,6 +41,21 @@ describe('highlight_selection_may_have_renderable_highlight', () => {
             { '14:1': 'yellow', '15:2': 'green' },
             get_source_row,
         )).toBe(true);
+    });
+
+    it('answers a selection larger than the loader holds without walking it', () => {
+        const get_source_row = vi.fn((display_row: number) => display_row + 10);
+        const huge = { displayRows: [{ start: 0, end: 999_999 }], sourceColumns: [0, 2] };
+        expect(highlight_selection_may_have_renderable_highlight(huge, { '2000000:2': 'blue' }, get_source_row))
+            .toBe(true);
+        expect(get_source_row).not.toHaveBeenCalled();
+        // Still nothing to clear when no selected column holds a highlight.
+        expect(highlight_selection_may_have_renderable_highlight(huge, { '15:1': 'blue' }, get_source_row))
+            .toBe(false);
+        const at_limit = { displayRows: [{ start: 0, end: HIGHLIGHT_PROBE_ROW_LIMIT - 1 }], sourceColumns: [2] };
+        expect(highlight_selection_may_have_renderable_highlight(at_limit, { '2000000:2': 'blue' }, get_source_row))
+            .toBe(false);
+        expect(get_source_row).toHaveBeenCalledTimes(HIGHLIGHT_PROBE_ROW_LIMIT);
     });
 
     it('treats an unresolved selected row conservatively only for selected-column candidates', () => {

@@ -54,6 +54,8 @@ export interface UseRowLoader {
     sample_loaded_rows(max: number): LoadedRowSample[];
     /** Rows per loader page after its width and byte caps. */
     get_page_size(): number;
+    /** The display rows the loader holds, as ascending inclusive ranges. */
+    resident_row_ranges(): { start: number; end: number }[];
     /** Bumps on every ingested page so consumers can re-key Glide redraws. */
     readonly version: number;
 }
@@ -165,6 +167,7 @@ export function use_row_loader(
         [loader],
     );
     const get_page_size = useCallback(() => loader.effective_page_size, [loader]);
+    const resident_row_ranges = useCallback(() => loader.resident_row_ranges(), [loader]);
     const sample_loaded_rows = useCallback((max: number) => loader.sample_loaded_rows(max), [loader]);
 
     return {
@@ -184,6 +187,7 @@ export function use_row_loader(
         get_compare_base,
         sample_loaded_rows,
         get_page_size,
+        resident_row_ranges,
         version,
     };
 }

@@ -137,6 +137,18 @@ export class RowLoader {
         return this.page_size;
     }
 
+    /**
+     * The display rows the loader holds, as ascending inclusive ranges: one
+     * per resident page, so a few dozen at most.
+     */
+    resident_row_ranges(): { start: number; end: number }[] {
+        const ranges: { start: number; end: number }[] = [];
+        for (const [start, page] of this.pages) {
+            if (page.rows.length > 0) ranges.push({ start, end: start + page.rows.length - 1 });
+        }
+        return ranges.sort((left, right) => left.start - right.start);
+    }
+
     /** For tests: number of resident pages. */
     get page_count(): number {
         return this.pages.size;

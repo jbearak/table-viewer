@@ -181,6 +181,7 @@ import {
     type FittedSourceRow,
     type MeasuredCell,
 } from './fit-row-model';
+import { row_fit_targets, rows_hold_fit_target } from './row-fit-targets';
 import { parse_http_external_url } from '../external-url';
 import type { CellHyperlink } from '../cell-content';
 import { HyperlinkDialog, type HyperlinkDialogHandle } from './hyperlink-dialog';
@@ -303,6 +304,7 @@ import {
     grid_selection_contains_cell,
     highlight_selection_may_have_renderable_highlight,
     highlight_selection_from_grid,
+    merge_display_row_intervals,
     selected_display_row_intervals,
 } from './highlight-selection-model';
 import { highlight_rgba, history_flash_rgba } from './highlight-theme';
@@ -1519,24 +1521,6 @@ interface RowResizePreview {
     moved: boolean;
 }
 
-/**
- * Whether `rows` hold a row a fit can size: anything but a row the session
- * will delete (an inline Pending Row Removal, or one past the last row).
- * Stops at the first, so an ordinary selection costs a row or two.
- */
-function rows_hold_fit_target(
-    projection: Pick<PendingRowProjection, 'row_state'>,
-    rows: readonly DisplayRowInterval[],
-): boolean {
-    for (const interval of rows) {
-        for (let row = interval.start; row <= interval.end; row += 1) {
-            const state = projection.row_state(row);
-            if (state !== 'removed' && state !== 'tail-removal') return true;
-        }
-    }
-    return false;
-}
-
 /** What a row fit fits: see `fit_row_heights` in GridShell. */
 type RowFitTarget =
     | { readonly border: number }
@@ -2264,10 +2248,12 @@ export function GridShell({
         source_display_rows: DisplayRowInterval[];
         /**
          * The grid rows the menu acts on, Pending Rows included, and the
-         * topology they were read under: what Auto-fit fits. Present when
-         * one of them can be fitted.
+         * topology they were read under: what Copy copies and Auto-fit fits
+         * while the topology still holds.
          */
-        fit_rows?: { readonly rows: DisplayRowInterval[]; readonly topology_key: string };
+        display_rows: { readonly rows: DisplayRowInterval[]; readonly topology_key: string };
+        /** Whether one of those rows can be fitted: Auto-fit is offered. */
+        can_fit_rows: boolean;
         /** Stable structural identities captured when the menu opened. */
         pending_row_ids: string[];
         tail_removal_source_rows: number[];
@@ -2348,6 +2334,7 @@ export function GridShell({
         get_compare_base,
         sample_loaded_rows,
         get_page_size,
+        resident_row_ranges,
         version,
     } = loader;
     const lifecycle_operation = save_lifecycle.state === 'active'
@@ -4323,16 +4310,13 @@ export function GridShell({
                 0,
             ),
             source_display_rows: source_intervals,
-            ...(on_row_fit !== undefined
+            display_rows: {
+                rows: request.display_rows,
+                topology_key: pending_selection_topology_key_ref.current,
+            },
+            can_fit_rows: on_row_fit !== undefined
                 && !preview_mode
-                && rows_hold_fit_target(pending_projection, request.display_rows)
-                ? {
-                    fit_rows: {
-                        rows: request.display_rows,
-                        topology_key: pending_selection_topology_key_ref.current,
-                    },
-                }
-                : {}),
+                && rows_hold_fit_target(pending_projection, request.display_rows),
             pending_row_ids: [...pending_ids],
             tail_removal_source_rows: [...removal_rows],
             ...(structure_items_offered
@@ -11021,37 +11005,23 @@ export function GridShell({
             }
             return fit_row_height(counts, metrics, keep_at_least);
         };
-        const source_rows: FittedSourceRow[] = [];
+        // Only loaded rows can be measured; a selection larger than the
+        // loader's rows is read through them rather than row by row.
+        const targets = row_fit_targets(merge_display_row_intervals(intervals), {
+            projection,
+            resident_rows: resident_row_ranges,
+            row_loaded: (source_display_row) => get_row(source_display_row) !== undefined,
+            source_row_of: get_source_row,
+            pending_rendered: (id) => pending_rendered_rows.has(id),
+        });
+        const source_rows: FittedSourceRow[] = targets.sources.map(({ display_row, source_row }) => {
+            const height = fitted_height(display_row);
+            // At the default, the row keeps no custom height.
+            return { source_row, height: height === default_row_height ? null : height };
+        });
         const pending_heights = new Map<string, number>();
-        let skipped = 0;
-        for (const interval of intervals) {
-            for (let display_row = interval.start; display_row <= interval.end; display_row += 1) {
-                const projected = projection.row_at(display_row);
-                if (projected?.kind === 'removal') continue;
-                if (projected?.kind === 'pending' || projected?.kind === 'replacement') {
-                    if (!pending_rendered_rows.has(projected.row.id)) {
-                        skipped += 1;
-                        continue;
-                    }
-                    pending_heights.set(projected.row.id, fitted_height(display_row));
-                    continue;
-                }
-                const source_display_row = projected?.sourceDisplayRow ?? display_row;
-                const source_row = get_row(source_display_row) === undefined
-                    ? undefined
-                    : projected?.identity?.sourceRow ?? get_source_row(source_display_row);
-                if (source_row === undefined) {
-                    skipped += 1;
-                    continue;
-                }
-                const height = fitted_height(display_row);
-                source_rows.push({
-                    source_row,
-                    // At the default, the row keeps no custom height.
-                    height: height === default_row_height ? null : height,
-                });
-            }
-        }
+        for (const { display_row, id } of targets.pending) pending_heights.set(id, fitted_height(display_row));
+        const { skipped } = targets;
         if (skipped > 0) {
             host_bridge.postMessage({
                 type: 'showWarning',
@@ -11079,6 +11049,7 @@ export function GridShell({
         merge_index,
         on_row_fit,
         pending_rendered_rows,
+        resident_row_ranges,
         theme,
         write_row_heights_with_pending_rows,
     ]);
@@ -11483,6 +11454,59 @@ export function GridShell({
         const rows = selected_display_row_intervals(selection, row_count);
         if (rows) copy_display_rows(rows);
     }, [copy_display_rows, copy_rect, row_count]);
+
+    /**
+     * Copy the grid's selection through the guarded path, as Ctrl/Cmd+C
+     * does: whole columns, else whole rows, else the cell range. The copy is
+     * capped and reads only the rows it emits, so a selection of a million
+     * rows costs what the cap allows. False when nothing is selected that
+     * this path copies.
+     */
+    const copy_grid_selection = useCallback((): boolean => {
+        const selection = grid_selection_ref.current;
+        if (selection.columns.length > 0) {
+            const source_columns = Array.from(
+                selection.columns,
+                (display_column) => copy_columns[display_column],
+            ).filter((source_column): source_column is number =>
+                source_column !== undefined);
+            copy_source_selection({
+                y: 0,
+                height: row_count,
+                source_columns,
+            }, true);
+            return true;
+        }
+        if (selection.rows.length > 0) {
+            copy_source_selection({
+                row_indices: selection.rows,
+                row_count: selection.rows.length,
+                source_columns: copy_columns,
+            });
+            return true;
+        }
+        if (selection.current) {
+            copy_rect(selection.current.range);
+            return true;
+        }
+        return false;
+    }, [copy_columns, copy_rect, copy_source_selection, row_count]);
+    const copy_grid_selection_ref = useRef(copy_grid_selection);
+    copy_grid_selection_ref.current = copy_grid_selection;
+    // A copy that arrives as the browser's own event (a host's Edit > Copy,
+    // which no key handler sees) takes the same path, before Glide's own
+    // copy handler: that one lists every selected row, uncapped.
+    useEffect(() => {
+        const on_copy = (event: ClipboardEvent) => {
+            if (!grid_owns_focus(grid_root_ref.current, document.activeElement)) return;
+            if (is_editable_target(document.activeElement)) return;
+            if (!copy_grid_selection_ref.current()) return;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+        };
+        window.addEventListener('copy', on_copy, true);
+        return () => window.removeEventListener('copy', on_copy, true);
+    }, []);
 
     // Whole visible sheet with a header row (delegates to copy_rect, so the same
     // clipboard-failure and truncation handling applies). Because this copies
@@ -12246,32 +12270,9 @@ export function GridShell({
                     alt: args.altKey,
                 })
             ) {
-                const selection = grid_selection_ref.current;
-                if (selection.columns.length > 0) {
-                    const source_columns = Array.from(
-                        selection.columns,
-                        (display_column) => copy_columns[display_column],
-                    ).filter((source_column): source_column is number =>
-                        source_column !== undefined);
+                if (copy_grid_selection()) {
                     args.cancel();
                     args.preventDefault();
-                    copy_source_selection({
-                        y: 0,
-                        height: row_count,
-                        source_columns,
-                    }, true);
-                } else if (selection.rows.length > 0) {
-                    args.cancel();
-                    args.preventDefault();
-                    copy_source_selection({
-                        row_indices: selection.rows,
-                        row_count: selection.rows.length,
-                        source_columns: copy_columns,
-                    });
-                } else if (selection.current) {
-                    args.cancel();
-                    args.preventDefault();
-                    copy_rect(selection.current.range);
                 }
                 return;
             }
@@ -12347,8 +12348,7 @@ export function GridShell({
         [
             apply_column_sort,
             clear_filter_on_column,
-            copy_rect,
-            copy_source_selection,
+            copy_grid_selection,
             display_column_count,
             display_column_for_source,
             cells_accept_edits,
@@ -13474,9 +13474,9 @@ export function GridShell({
                                 : {}),
                             // The grid rows it read, as a double-click on a
                             // border fits them; nothing if they have moved.
-                            ...(row_menu.fit_rows === undefined
-                                ? {}
-                                : { on_auto_fit_rows: () => fit_row_heights(row_menu.fit_rows!) }),
+                            ...(row_menu.can_fit_rows
+                                ? { on_auto_fit_rows: () => fit_row_heights(row_menu.display_rows) }
+                                : {}),
                             ...(only_pending ? {
                                 pending_row_count: selected_pending_ids.size,
                                 on_remove_pending_rows: () => {
@@ -13502,6 +13502,16 @@ export function GridShell({
                                 if (display_row !== undefined) on_promote_row_to_header(display_row);
                             },
                             on_copy_rows: () => {
+                                // The rows the menu opened on, by their
+                                // intervals: the copy reads only as many as
+                                // the clipboard cap lets through.
+                                if (
+                                    row_menu.display_rows.topology_key
+                                    === pending_selection_topology_key_ref.current
+                                ) {
+                                    copy_display_rows(row_menu.display_rows.rows);
+                                    return;
+                                }
                                 const resolved_rows = new Set<number>();
                                 {
                                     for (const interval of row_menu.source_display_rows) {

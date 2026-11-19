@@ -19,9 +19,18 @@ export interface HighlightSelectionResult {
 }
 
 /**
+ * Past this many rows a selection is not checked row by row for a highlight:
+ * as many rows as the row loader holds (50 pages of 100), so a selection
+ * larger than it has a row whose source row is unknown wherever rows map
+ * through the loader, and is answered conservatively without the walk.
+ */
+export const HIGHLIGHT_PROBE_ROW_LIMIT = 5_000;
+
+/**
  * Whether clearing the effective selection could remove a renderable highlight.
  * Unknown display-to-source rows are conservative, but only after a highlight
- * candidate has been found in one of the selected source columns.
+ * candidate has been found in one of the selected source columns. So is a
+ * selection of more than `HIGHLIGHT_PROBE_ROW_LIMIT` rows.
  */
 export function highlight_selection_may_have_renderable_highlight(
     selection: CellHighlightSelection | null,
@@ -41,6 +50,9 @@ export function highlight_selection_may_have_renderable_highlight(
     }
     if (highlighted_source_rows.size === 0) return false;
 
+    let selected_rows = 0;
+    for (const interval of selection.displayRows) selected_rows += interval.end - interval.start + 1;
+    if (selected_rows > HIGHLIGHT_PROBE_ROW_LIMIT) return true;
     for (const interval of selection.displayRows) {
         for (let display_row = interval.start; display_row <= interval.end; display_row++) {
             const source_row = get_source_row(display_row);

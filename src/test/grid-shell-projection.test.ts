@@ -137,6 +137,9 @@ const grid_mock = vi.hoisted(() => ({
     source_row_for_display: null as null | ((display_row: number) => number | undefined),
     // Source rows whose cells read as not loaded, though a display row claims them.
     unloaded_source_rows: new Set<number>(),
+    // The display rows the loader reports holding. Every row by default, so
+    // a fit walks its selection row by row unless a test says otherwise.
+    resident_row_ranges: [{ start: 0, end: 1_000_000 }] as { start: number; end: number }[],
     // How many display rows, from 0, auto-fit samples as resident.
     sampled_row_count: 0,
     ensure_rows: vi.fn(),
@@ -301,6 +304,7 @@ vi.mock('../webview/use-row-loader', () => ({
                 }),
             ),
             get_page_size: () => 100,
+            resident_row_ranges: () => grid_mock.resident_row_ranges,
             version: grid_mock.loader_version,
         };
     },
@@ -474,6 +478,7 @@ afterEach(() => {
     grid_mock.source_row_for_display = null;
     additionally_loaded_source_rows.clear();
     grid_mock.sampled_row_count = 0;
+    grid_mock.resident_row_ranges = [{ start: 0, end: 1_000_000 }];
     grid_mock.row_resize_props = null;
     grid_mock.row_resize_set_target.mockReset();
     grid_mock.update_cells.mockReset();
@@ -4479,6 +4484,108 @@ describe('GridShell column projection', () => {
         });
     });
 
+    it('copies a huge row selection from the row menu, reading no more rows than the copy cap', async () => {
+        const write_text = vi.fn(async (_text: string) => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        grid_mock.get_row.mockImplementation(((row: number) => [
+            { raw: `r${row}`, formatted: `r${row}`, bold: false, italic: false },
+            null,
+            { raw: 'c', formatted: 'c', bold: false, italic: false },
+        ]) as any);
+        await render_grid(props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 300_000, sourceRowCount: 300_000 },
+            row_count: 300_000,
+        }));
+        // A selection of every row but the last that refuses to be listed
+        // index by index.
+        const refuse = () => {
+            throw new Error('expanded the row selection index by index');
+        };
+        const rows = {
+            length: 299_999,
+            toRanges: () => [[0, 299_999]] as [number, number][],
+            hasIndex: (index: number) => index >= 0 && index < 299_999,
+            first: () => 0,
+            last: () => 299_998,
+            toArray: refuse,
+            [Symbol.iterator]: refuse,
+            equals: (other: unknown) => other === rows,
+        };
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({ columns: compact([]), rows }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([-1, 2], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 72, width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        grid_mock.get_row.mockClear();
+        // Collecting the rows one by one (into a set, then sorting them) is
+        // the walk the copy no longer makes: count what goes into sets.
+        const set_add = vi.spyOn(Set.prototype, 'add');
+        onTestFinished(() => set_add.mockRestore());
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Copy 299999 rows')!.click());
+        expect(set_add.mock.calls.length).toBeLessThan(10_000);
+        set_add.mockRestore();
+        const copied = write_text.mock.calls[0]?.[0] ?? '';
+        const lines = copied.split('\n');
+        expect(lines[0]).toBe('r0\tc');
+        expect(lines.length).toBeLessThan(299_999);
+        expect(grid_mock.get_row.mock.calls.length).toBeLessThanOrEqual(lines.length + 1);
+        expect(grid_mock.post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: expect.stringMatching(/copy limit/),
+        });
+    });
+
+    it('copies the rows a native copy event finds selected through the guarded path, before Glide sees it', async () => {
+        const write_text = vi.fn(async (_text: string) => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        grid_mock.get_row.mockImplementation(((row: number) => [
+            { raw: `r${row}`, formatted: `r${row}`, bold: false, italic: false },
+            null,
+            { raw: 'c', formatted: 'c', bold: false, italic: false },
+        ]) as any);
+        await render_grid(props({ row_count: 5 }));
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({ columns: compact([]), rows: compact([1, 3]) }));
+        // Glide listens for the copy event on the window, as here.
+        const glide_copy = vi.fn();
+        window.addEventListener('copy', glide_copy);
+        onTestFinished(() => window.removeEventListener('copy', glide_copy));
+        const focus_target = document.createElement('button');
+        container!.querySelector('.grid-shell-root')!.appendChild(focus_target);
+        focus_target.focus();
+        const event = new Event('copy', { bubbles: true, cancelable: true });
+        await act(async () => {
+            window.dispatchEvent(event);
+            await Promise.resolve();
+        });
+        expect(event.defaultPrevented).toBe(true);
+        expect(glide_copy).not.toHaveBeenCalled();
+        expect(write_text).toHaveBeenCalledWith('r1\tc\nr3\tc');
+
+        // Text in a field keeps the browser's own copy.
+        const field = document.createElement('textarea');
+        container!.querySelector('.grid-shell-root')!.appendChild(field);
+        field.focus();
+        const text_copy = new Event('copy', { bubbles: true, cancelable: true });
+        await act(async () => window.dispatchEvent(text_copy));
+        expect(text_copy.defaultPrevented).toBe(false);
+        expect(glide_copy).toHaveBeenCalledOnce();
+    });
+
     it('preserves an inside multi-row marker selection and hides its coalesced intervals', async () => {
         const on_hide_rows = vi.fn();
         await render_grid(props({
@@ -8206,6 +8313,24 @@ describe('GridShell row auto-fit', () => {
     it('skips rows that are not loaded, and says how many', async () => {
         const on_row_fit = await render_fit({ 0: 'a', 1: 'x'.repeat(30) });
         await select_rows([1, 2, 3]);
+        double_click_border(1);
+        expect(on_row_fit).toHaveBeenCalledExactlyOnceWith(
+            [{ start: 1, end: 1, height: 62 }],
+            undefined,
+        );
+        expect(grid_mock.post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: 'Auto-fit skipped 2 rows that are not loaded. Scroll to them and try again.',
+        });
+    });
+
+    it('reads a selection larger than the loaded rows through the rows the loader holds', async () => {
+        // Rows 0 and 1 have cells, but the loader reports holding only row 1:
+        // the selection (three rows) is larger, so the fit walks what it
+        // holds, and row 0 is skipped with row 2.
+        grid_mock.resident_row_ranges = [{ start: 1, end: 1 }];
+        const on_row_fit = await render_fit({ 0: 'x'.repeat(30), 1: 'x'.repeat(30) });
+        await select_rows([0, 1, 2]);
         double_click_border(1);
         expect(on_row_fit).toHaveBeenCalledExactlyOnceWith(
             [{ start: 1, end: 1, height: 62 }],
