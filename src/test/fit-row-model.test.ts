@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
     fit_height_for_lines,
     fit_row_height,
+    lines_to_last_visible,
     source_height_runs,
     type RowFitMetrics,
 } from '../webview/fit-row-model';
@@ -142,5 +143,14 @@ describe('source_height_runs', () => {
             { start: 4, end: 4, height: 60 },
         ]);
         expect(source_height_runs([])).toEqual([]);
+    });
+});
+
+describe('lines_to_last_visible', () => {
+    const visible = (line: string) => /\S/.test(line);
+    it('counts through the last line that paints something, and at least one', () => {
+        expect(lines_to_last_visible(['a', '', 'b', '', ' '], visible)).toBe(3);
+        expect(lines_to_last_visible(['', ''], visible)).toBe(1);
+        expect(lines_to_last_visible([], visible)).toBe(1);
     });
 });

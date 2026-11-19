@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
     is_rich_text_cell,
+    rich_cell_fit,
     rich_cell_unwrapped_hides_text,
     rich_text_cell_renderer,
     type RichTextGridCell,
@@ -374,5 +375,28 @@ describe('rich_cell_unwrapped_hides_text', () => {
     it('agrees with draw that a cut segment stops the line', () => {
         const cell = make_cell([[{ text: 'ab' + ' '.repeat(12) }, { text: 'cd' }]]);
         expect(hidden_by_draw(cell, 40)).toBe(true);
+    });
+});
+
+describe('rich_cell_fit', () => {
+    /** 10px a glyph, "i" 2px. */
+    const narrow = () => stub_ctx((text) => [...text].reduce((width, glyph) => width + (glyph === 'i' ? 2 : 10), 0)).ctx;
+    const fit = (lines: RichTextLine[], width: number, auto_fit_columns = false) =>
+        rich_cell_fit(narrow(), make_cell(lines).data, width, theme.cellHorizontalPadding, 'sans', auto_fit_columns);
+
+    it('counts a line of spaces that paints an underline or strikethrough', () => {
+        expect(fit([[{ text: 'a' }], [], [{ text: '   ', style: { underline: true } }]], 200))
+            .toEqual({ lines: 3, fits_default: false });
+        expect(fit([[{ text: 'a' }], [], [{ text: '   ' }]], 200)).toEqual({ lines: 1, fits_default: true });
+    });
+
+    it('takes a line break as wrapping at the default height, with no character cap', () => {
+        // 27 narrow glyphs in 100px: past ceil(100 / 4) = 25 characters, but
+        // a cell that paints a line break wraps there and draws them all.
+        expect(fit([[{ text: 'i'.repeat(27) }], []], 100)).toEqual({ lines: 1, fits_default: true });
+        // Without one it draws one line, cut at 25.
+        expect(fit([[{ text: 'i'.repeat(27) }]], 100)).toEqual({ lines: 1, fits_default: false });
+        // Auto-fit Columns has the default height wrap.
+        expect(fit([[{ text: 'i'.repeat(27) }]], 100, true)).toEqual({ lines: 1, fits_default: true });
     });
 });

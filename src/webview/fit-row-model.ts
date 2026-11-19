@@ -94,6 +94,21 @@ export function fit_row_height(
     return keep_at_least === undefined ? fitted : Math.max(fitted, keep_at_least);
 }
 
+/**
+ * The lines a cell needs: through its last one that paints something (at
+ * least one). Blank lines after it show nothing, and a block taller than its
+ * row is drawn from the top, so they need no room.
+ */
+export function lines_to_last_visible<Line>(
+    lines: readonly Line[],
+    paints: (line: Line) => boolean,
+): number {
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+        if (paints(lines[index])) return index + 1;
+    }
+    return 1;
+}
+
 /** One fitted source row. */
 export interface FittedSourceRow {
     readonly source_row: number;

@@ -20,6 +20,7 @@ import {
 } from './glide-data-grid';
 import type { CellTextStyle } from '../cell-content';
 import { canvas_font } from './fit-column-model';
+import { lines_to_last_visible } from './fit-row-model';
 import {
     rich_lines_max_width,
     wrap_rich_text_lines,
@@ -191,6 +192,35 @@ export function rich_cell_unwrapped_hides_text(
     } finally {
         ctx.direction = direction;
     }
+}
+
+/**
+ * What row auto-fit needs of a rich cell `width` wide: its lines once the row
+ * is tall enough to wrap, through the last that paints something, and whether
+ * it paints all of its text at the default height. It wraps there with
+ * Auto-fit Columns on, or when it paints a line break (cell-renderer's rule);
+ * otherwise it draws one line (see `rich_cell_unwrapped_hides_text`).
+ */
+export function rich_cell_fit(
+    ctx: CanvasRenderingContext2D,
+    data: RichCellData,
+    width: number,
+    horizontal_padding: number,
+    font_family: string,
+    auto_fit_columns: boolean,
+): { lines: number; fits_default: boolean } {
+    const linked = data.hyperlink !== undefined;
+    // Visible text, or spaces under an underline or strikethrough (a link's too).
+    const paints = (line: RichTextLine): boolean => line.some((segment) =>
+        /\S/.test(segment.text)
+        || (segment.text !== ''
+            && (linked || segment.style?.underline === true || segment.style?.strikethrough === true)));
+    const available = Math.max(0, width - 2 * horizontal_padding);
+    const lines = lines_to_last_visible(rich_cell_wrapped_lines(ctx, data, available, font_family), paints);
+    const fits_default = auto_fit_columns || data.lines.length > 1
+        ? lines <= 1
+        : !rich_cell_unwrapped_hides_text(ctx, data, width, horizontal_padding, font_family);
+    return { lines, fits_default };
 }
 
 export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
