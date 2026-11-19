@@ -8631,6 +8631,27 @@ describe('GridShell row resizing', () => {
         expect(pending.snapshot().appendedRows[0]!.viewerRowHeight).toBe(3000);
     });
 
+    it('saves a drag that stopped at a limit at the limit', async () => {
+        for (const [stored, dragged_to] of [[14.3 * 96 / 72, 20], [4096.000011444092, 3000], [4000.3, 4096]]) {
+            const pending = create_pending_row_store({ session_id: 'session' });
+            pending.append_rows('session', ['band-a'], { id: 'plain', format: { kind: 'none' } }, 1);
+            pending.set_row_heights('session', new Set(['band-a']), stored);
+            await render_grid(six_rows({
+                editing_session_held: true,
+                csv_editable: true,
+                edit_session_id: 'session',
+                pending_row_store: pending,
+            }));
+            const drawn = indexed_height()(6);
+            const resize = grid_mock.row_resize_props as Record<string, (row: number, height: number) => void>;
+            act(() => resize.on_resize_start!(6, drawn));
+            act(() => resize.on_resize!(6, dragged_to));
+            act(() => resize.on_resize_end!(6, dragged_to));
+            expect(pending.snapshot().appendedRows[0]!.viewerRowHeight, `${stored} → ${dragged_to}`).toBe(dragged_to);
+            act(() => root?.unmount());
+        }
+    });
+
     it('caps the default row height of a huge font as it caps every drawn height', async () => {
         theme_mock.font_size_px = 3000;
         await render_grid(six_rows());

@@ -165,6 +165,47 @@ describe("mergedRanges rendering", () => {
         expect(merged_rect((_r: number) => 34, 700)).toEqual(uniform);
     });
 
+    // Fork test: with an indexed callable a tall merge's height and anchor
+    // offset are prefix differences, so painting it asks for no row of it
+    // beyond the visible ones.
+    test("paints a tall merge without asking for each of its rows' heights", () => {
+        const rows = 100_000;
+        let calls = 0;
+        const height = (r: number) => {
+            calls++;
+            return r % 2 === 0 ? 40 : 30;
+        };
+        // Closed form: pairs of 70 px.
+        const top = (row: number) => Math.floor(row / 2) * 70 + (row % 2) * 40;
+        const indexed = Object.assign((r: number) => height(r), {
+            rowHeightIndex: {
+                top,
+                rowAtY: (y: number) => {
+                    if (!(y > 0)) return 0;
+                    let row = Math.floor(y / 70) * 2;
+                    while (top(row + 1) <= y) row++;
+                    return row;
+                },
+            },
+        });
+        vi.useFakeTimers();
+        render(
+            <DataEditor
+                {...basicProps}
+                rows={rows}
+                rowHeight={indexed}
+                mergedRanges={[{ x: 0, y: 10, width: 1, height: 50_000 }]}
+            />,
+            { wrapper: Context }
+        );
+        const scroller = prep();
+        if (scroller !== null) {
+            vi.spyOn(scroller, "scrollTop", "get").mockImplementation(() => top(30_000));
+            fireEvent.scroll(scroller);
+        }
+        expect(calls).toBeLessThan(5_000);
+    });
+
     test("damage draw repaints merges without crashing", () => {
         vi.useFakeTimers();
         const ref = React.createRef<DataEditorRef>();

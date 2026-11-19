@@ -325,6 +325,8 @@ import {
     natural_row_height,
     custom_height_row_count,
     DEFAULT_ROW_HEIGHT_PX,
+    MAX_ROW_HEIGHT_PX,
+    MIN_ROW_HEIGHT_PX,
     type RowHeightLayer,
     type RowHeightOverrides,
 } from './row-heights';
@@ -10926,8 +10928,13 @@ export function GridShell({
             )
             : null;
         // The guide moved from the drawn height; what is saved moves the stored
-        // height by as much, unless the drawn one is capped rather than rounded.
-        const saved = Math.abs(preview.raw_start_height - preview.start_height) <= ROW_HEIGHT_QUANTUM
+        // height by as much. Not when the drawn one is capped rather than only
+        // rounded, nor when the drag stopped at a limit: then the drawn height
+        // is what the drag asked for.
+        const rounded_only = preview.raw_start_height <= MAX_ROW_HEIGHT_PX
+            && Math.abs(preview.raw_start_height - preview.start_height) <= ROW_HEIGHT_QUANTUM;
+        const at_limit = height <= MIN_ROW_HEIGHT_PX || height >= MAX_ROW_HEIGHT_PX;
+        const saved = rounded_only && !at_limit
             ? clamp_row_height(preview.raw_start_height + (height - preview.start_height))
             : height;
         apply_row_resize(selected ?? [{ start: row, end: row }], saved, 'gesture');
