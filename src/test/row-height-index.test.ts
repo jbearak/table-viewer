@@ -189,6 +189,16 @@ describe('create_row_height_index', () => {
         expect(near.runs).toEqual([]);
     });
 
+    it('joins runs at the safe-integer limit without losing a row', () => {
+        const top_row = Number.MAX_SAFE_INTEGER;
+        const index = create_row_height_index(top_row, 24, [
+            { start: top_row - 3, count: 2, height: 40 },
+            { start: top_row - 1, count: 1, height: 40 },
+        ]);
+        expect(index.runs).toEqual([{ start: top_row - 3, count: 3, height: 40 }]);
+        expect(index.height(top_row - 1)).toBe(40);
+    });
+
     it('takes NaN and negative y as row 0 and +Infinity as no row', () => {
         const index = create_row_height_index(5, 24, [{ start: 1, count: 2, height: 40 }]);
         expect(index.rowAtY(Number.NaN)).toBe(0);

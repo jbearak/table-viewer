@@ -328,7 +328,13 @@ import {
     type RowHeightLayer,
     type RowHeightOverrides,
 } from './row-heights';
-import { create_row_height_index, geometry_row_height, indexed_row_height, type RowHeightIndex } from './row-height-index';
+import {
+    create_row_height_index,
+    geometry_row_height,
+    indexed_row_height,
+    ROW_HEIGHT_QUANTUM,
+    type RowHeightIndex,
+} from './row-height-index';
 import {
     display_height_runs,
     preview_row_height_index,
@@ -1522,7 +1528,10 @@ interface RowResizePreview {
     commit_rows: GridSelection['rows'] | null;
     /** Live preview selection. Like Glide columns, only active from its first row. */
     preview_rows: GridSelection['rows'] | null;
+    /** The height the row is drawn at as the drag began (`geometry_row_height`). */
     start_height: number;
+    /** Its height as stored, which the drawn one rounds and caps. */
+    raw_start_height: number;
     height: number;
     /** `pending_selection_topology_key` as the drag began: which row a display index names. */
     topology_key: string;
@@ -10832,6 +10841,7 @@ export function GridShell({
             // Glide uses this same first-selected-item rule for columns.
             preview_rows: commit_rows?.first() === row ? commit_rows : null,
             start_height: height,
+            raw_start_height: effective_row_height(row, false),
             height,
             topology_key: display_rows_key_ref.current,
             // Counted in the capture phase, before this press reached the strip.
@@ -10839,7 +10849,7 @@ export function GridShell({
             moved: false,
         };
         row_resize_preview_ref.current = preview;
-    }, []);
+    }, [effective_row_height]);
 
     const handle_row_resize_drag = useCallback(
         (row: number, height: number) => {
@@ -10915,7 +10925,12 @@ export function GridShell({
                 pending_projection_ref.current.rowCount,
             )
             : null;
-        apply_row_resize(selected ?? [{ start: row, end: row }], height, 'gesture');
+        // The guide moved from the drawn height; what is saved moves the stored
+        // height by as much, unless the drawn one is capped rather than rounded.
+        const saved = Math.abs(preview.raw_start_height - preview.start_height) <= ROW_HEIGHT_QUANTUM
+            ? clamp_row_height(preview.raw_start_height + (height - preview.start_height))
+            : height;
+        apply_row_resize(selected ?? [{ start: row, end: row }], saved, 'gesture');
     }, [apply_row_resize]);
 
     /**

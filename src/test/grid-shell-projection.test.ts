@@ -8594,6 +8594,19 @@ describe('GridShell row resizing', () => {
         expect(row_height.rowHeightIndex.top(7)).toBe(30 + 5 * 24 + 64);
     });
 
+    it('saves a drag of a fractional height by the distance dragged, unrounded', async () => {
+        const on_row_resize = vi.fn();
+        await render_grid(six_rows({ row_heights: { 1: 26.8 }, on_row_resize }));
+        const drawn = indexed_height()(1);
+        expect(drawn).not.toBe(26.8);
+        expect(Math.abs(drawn - 26.8)).toBeLessThan(2 ** -16);
+        const resize = grid_mock.row_resize_props as Record<string, (row: number, height: number) => void>;
+        act(() => resize.on_resize_start!(1, drawn));
+        act(() => resize.on_resize!(1, drawn + 1));
+        act(() => resize.on_resize_end!(1, drawn + 1));
+        expect(on_row_resize).toHaveBeenCalledWith([{ start: 1, end: 1 }], 27.8, { gesture: true });
+    });
+
     it('starts a border drag at the drawn height of a row taller than the grid draws', async () => {
         const pending = create_pending_row_store({ session_id: 'session' });
         pending.append_rows('session', ['band-a'], { id: 'plain', format: { kind: 'none' } }, 1);

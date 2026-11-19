@@ -1,6 +1,7 @@
 // Fork tests: the row-height prefix index Glide reads from a row-height
 // callable, against the row-by-row walks it replaces.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { blitLastFrame } from "../internal/data-grid/render/data-grid-render.blit.js";
 import {
     computeBounds,
     rowHeightPrefixOf,
@@ -129,6 +130,8 @@ describe("rowSpanHeight", () => {
         expect(rowHeightPrefixOf(() => 24)).toBeUndefined();
         expect(rowHeightPrefixOf(uniformRowHeight(24))?.top(3)).toBe(72);
         expect(rowHeightPrefixOf(uniformRowHeight(24))?.rowAtY(47.9)).toBe(1);
+        // Far past any row it answers rather than looping.
+        expect(rowHeightPrefixOf(uniformRowHeight(24))?.rowAtY(2 ** 60)).toBe(Number.MAX_SAFE_INTEGER);
     });
 });
 
@@ -157,5 +160,47 @@ describe("computeBounds rows", () => {
         // Upstream used row 1's height for row 0 here.
         const heights = (row: number) => (row === 0 ? 60 : 24);
         expect(bounds_y(0, 1, heights)).toBe(36 - 60);
+    });
+});
+
+describe("blitLastFrame rows", () => {
+    const columns = [{ width: 1000, sticky: false, sourceIndex: 0 }] as unknown as readonly MappedGridColumn[];
+    const blit = (rowHeight: number | ((row: number) => number), from: number, to: number) => {
+        const calls: unknown[][] = [];
+        const ctx = new Proxy({} as Record<string | symbol, unknown>, {
+            get: (target, key) => (key in target ? target[key] : (...args: unknown[]) => calls.push([key, ...args])),
+            set: (target, key, value) => {
+                target[key] = value;
+                return true;
+            },
+        }) as unknown as CanvasRenderingContext2D;
+        const last = {
+            cellXOffset: 0, cellYOffset: from, translateX: 0, translateY: 0,
+            mustDrawFocusOnHeader: false, mustDrawHighlightRingsOnHeader: false,
+            lastBuffer: undefined, aBufferScroll: undefined, bBufferScroll: undefined,
+        };
+        const result = blitLastFrame(
+            ctx, {} as HTMLCanvasElement, undefined, undefined, last,
+            0, to, 0, 0, 0, 1000, 800, 40, 36, 1, columns, columns, rowHeight, false
+        );
+        return { regions: result.regions, calls };
+    };
+
+    it("moves the last frame by the rows scrolled, with the index as by the walk", () => {
+        const next = random_source(23);
+        for (let trial = 0; trial < 60; trial++) {
+            const { indexed, plain } = random_heights(next, 40);
+            const from = Math.floor(next() * 30);
+            const to = Math.max(0, Math.min(39, from + Math.floor(next() * 7) - 3));
+            const walked = blit(plain, from, to);
+            expect(blit(indexed, from, to), `from ${from} to ${to}`).toEqual(walked);
+            if (from !== to) {
+                // The region it redraws is as tall as the rows between (scrolling
+                // up, one more for the line above them).
+                let span = 0;
+                for (let row = Math.min(from, to); row < Math.max(from, to); row++) span += plain(row);
+                if (span < 800 - 36 - 151) expect(walked.regions[0]?.height).toBe(span + (to < from ? 1 : 0));
+            }
+        }
     });
 });

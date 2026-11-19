@@ -80,7 +80,7 @@ export function create_row_height_index(
         if (run.height === defaultHeight) continue;
         const last = kept[kept.length - 1];
         if (last !== undefined && last.start + last.count === start && last.height === run.height) {
-            kept[kept.length - 1] = { start: last.start, count: last.count + end - start, height: run.height };
+            kept[kept.length - 1] = { start: last.start, count: end - last.start, height: run.height };
         } else {
             kept.push({ start, count: end - start, height: run.height });
         }

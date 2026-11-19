@@ -216,8 +216,10 @@ export function uniformRowHeight(height: number): ((row: number) => number) & {
                 if (Number.isNaN(y) || y <= 0) return 0;
                 if (y === Number.POSITIVE_INFINITY) return y;
                 let row = Math.floor(y / height);
-                while (row > 0 && row * height > y) row--;
-                while ((row + 1) * height <= y) row++;
+                if (!(row < Number.MAX_SAFE_INTEGER)) return Number.MAX_SAFE_INTEGER;
+                // A few settling steps at most: past 2^53 rows `row + 1` is `row`.
+                for (let step = 0; step < 4 && row > 0 && row * height > y; step++) row--;
+                for (let step = 0; step < 4 && (row + 1) * height <= y; step++) row++;
                 return row;
             },
         },

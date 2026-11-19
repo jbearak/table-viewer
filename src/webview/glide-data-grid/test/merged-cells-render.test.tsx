@@ -109,6 +109,62 @@ describe("mergedRanges rendering", () => {
         expect(document.body.contains(canvas)).toBe(true);
     });
 
+    // Fork test: a tall merge's rectangle is the same whether its rows'
+    // heights come as a number, a plain callable (walked once) or a callable
+    // carrying a prefix index (two prefix differences), anchor above the view.
+    test("paints a tall merge at the same rectangle for every kind of row height", () => {
+        const height = (r: number) => (r % 3 === 0 ? 40 : 30);
+        const top = (row: number) => {
+            let sum = 0;
+            for (let r = 0; r < row; r++) sum += height(r);
+            return sum;
+        };
+        const indexed = Object.assign((r: number) => height(r), {
+            rowHeightIndex: {
+                top,
+                rowAtY: (y: number) => {
+                    let row = 0;
+                    while (top(row + 1) <= y) row++;
+                    return row;
+                },
+            },
+        });
+        const merged_rect = (rowHeight: DataEditorProps["rowHeight"], scroll_top: number) => {
+            const rects: { y: number; height: number }[] = [];
+            vi.useFakeTimers();
+            render(
+                <DataEditor
+                    {...basicProps}
+                    rowHeight={rowHeight}
+                    mergedRanges={[{ x: 0, y: 0, width: 1, height: 60 }]}
+                    drawCell={args => {
+                        if (args.col === 0) rects.push({ y: args.rect.y, height: args.rect.height });
+                        return false;
+                    }}
+                />,
+                { wrapper: Context }
+            );
+            const scroller = prep();
+            if (scroller !== null) {
+                vi.spyOn(scroller, "scrollTop", "get").mockImplementation(() => scroll_top);
+                fireEvent.scroll(scroller);
+            }
+            act(() => {
+                cleanup();
+            });
+            expect(rects.length).toBeGreaterThan(0);
+            return rects[rects.length - 1];
+        };
+        for (const scroll_top of [0, 700]) {
+            const walked = merged_rect(height, scroll_top);
+            expect(merged_rect(indexed, scroll_top)).toEqual(walked);
+            expect(walked.height).toBe(top(60));
+        }
+        const uniform = merged_rect(34, 700);
+        expect(uniform.height).toBe(60 * 34);
+        expect(merged_rect((_r: number) => 34, 700)).toEqual(uniform);
+    });
+
     test("damage draw repaints merges without crashing", () => {
         vi.useFakeTimers();
         const ref = React.createRef<DataEditorRef>();
