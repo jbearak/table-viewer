@@ -188,6 +188,34 @@ describe("splitMultiLineText", () => {
         expect(splitMultiLineText(ctx, "x\n" + " ".repeat(30), "13px test", 70)).toEqual(["x", ""]);
     });
 
+    it("measures each candidate line whole, so kerning across glyphs counts", () => {
+        // "AV" kerns 4px tighter than its glyphs summed.
+        const kerned = {
+            font: "",
+            direction: "inherit",
+            measureText: (text: string) => ({ width: text.length * 10 - 4 * (text.split("AV").length - 1) }),
+        } as unknown as CanvasRenderingContext2D;
+        expect(splitMultiLineText(kerned, "AVAVAV AVAVAV", "13px test", 50)).toEqual(["AVAVAV", "AVAVAV"]);
+    });
+
+    it("wraps in the context's direction, and keeps each direction's wrap apart", () => {
+        const directed = {
+            font: "",
+            direction: "inherit",
+            measureText(this: { direction: string }, text: string) {
+                return { width: text.length * 10 + (this.direction === "rtl" ? 5 : 0) };
+            },
+        } as unknown as CanvasRenderingContext2D;
+        expect(splitMultiLineText(directed, "abc def", "13px test", 70)).toEqual(["abc def"]);
+        directed.direction = "rtl";
+        expect(splitMultiLineText(directed, "abc def", "13px test", 70)).toEqual(["abc", "def"]);
+    });
+
+    it("wraps a value into more lines than a spread can pass", () => {
+        const lines = splitMultiLineText(ctx, "ab ".repeat(150_000), "13px test", 25);
+        expect(lines).toHaveLength(150_000);
+    });
+
     it("keeps no state from earlier text that could change a later wrap", () => {
         // canvas-hypertxt judged a line from a prefix sized by the average
         // glyph width of earlier text: after wide text, a long line of narrow

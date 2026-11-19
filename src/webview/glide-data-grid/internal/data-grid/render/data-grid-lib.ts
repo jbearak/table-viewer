@@ -519,50 +519,51 @@ function graphemes(text: string): Iterable<string> {
  * space that fits, and inside a word only when the word alone is wider than
  * the line. A glyph wider than the line takes a line of its own.
  *
- * Widths are summed from measured words and glyphs rather than estimated, so
+ * Every candidate line is measured whole, in the context's font and
+ * direction, so kerning and shaping across words count as they paint, and
  * the result does not depend on what was measured before. canvas-hypertxt
- * judges whether a line fits from a prefix whose length comes from the
- * average glyph width of earlier text, so after wide text a long line of
- * narrow glyphs was taken whole and clipped; and it never returned when one
- * glyph was wider than the line.
+ * judged whether a line fits from a prefix whose length came from the average
+ * glyph width of earlier text, so after wide text a long line of narrow
+ * glyphs was taken whole and clipped; and it never returned when one glyph
+ * was wider than the line.
  */
-function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, fontStyle: string, width: number): string[] {
-    const measure = (text: string) => measureTextCached(text, ctx, fontStyle).width;
+function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, width: number): string[] {
+    // Not `measureTextCached`: candidates are one-off strings, and its key
+    // names neither the direction nor, for a long line, a short string.
+    const fits = (text: string) => ctx.measureText(text).width <= width;
     // Spaces alone draw nothing, however many lines they would take.
-    if (line.trim() === "" || measure(line) <= width) return [line];
+    if (line.trim() === "" || fits(line)) return [line];
     const lines: string[] = [];
     let current = "";
-    let currentWidth = 0;
     // Each word keeps the spaces before it; trailing spaces are a word too.
     for (const word of line.match(/ *[^ ]+| +$/g) ?? [line]) {
-        const wordWidth = measure(word);
-        if (current === "" || currentWidth + wordWidth <= width) {
+        let fitting: boolean;
+        if (current === "") {
+            current = word;
+            fitting = fits(current);
+        } else if (fits(current + word)) {
             current += word;
-            currentWidth += wordWidth;
+            fitting = true;
         } else if (word.trim() === "") {
             // Trailing spaces past the edge: dropped, as the line's trim would.
             continue;
         } else {
             lines.push(current);
             current = word.trimStart();
-            currentWidth = measure(current);
+            fitting = fits(current);
         }
-        if (currentWidth <= width) continue;
-        // One word wider than the line: break it between glyphs.
+        if (fitting) continue;
+        // One word wider than the line: break it between graphemes.
         let piece = "";
-        let pieceWidth = 0;
         for (const glyph of graphemes(current)) {
-            const glyphWidth = measure(glyph);
-            if (piece !== "" && pieceWidth + glyphWidth > width) {
+            if (piece !== "" && !fits(piece + glyph)) {
                 lines.push(piece);
-                piece = "";
-                pieceWidth = 0;
+                piece = glyph;
+            } else {
+                piece += glyph;
             }
-            piece += glyph;
-            pieceWidth += glyphWidth;
         }
         current = piece;
-        currentWidth = pieceWidth;
     }
     lines.push(current);
     return lines;
@@ -572,7 +573,7 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, fontStyle: st
  * Fork addition: the visual lines `drawMultiLineText` draws `data` as, at
  * `availableWidth` (the cell width less both horizontal paddings). Exported so
  * row auto-fit counts exactly the lines the painter will draw. The caller
- * sets `ctx.font` to `fontStyle`.
+ * sets `ctx.font` to `fontStyle`, and `ctx.direction` as the painter does.
  *
  * `hyperWrapping` keeps canvas-hypertxt's estimated layout, as upstream.
  */
@@ -585,7 +586,7 @@ export function splitMultiLineText(
 ): readonly string[] {
     if (hyperWrapping) return splitText(ctx, data, fontStyle, availableWidth, true);
     if (availableWidth <= 0) return [];
-    const key = `${fontStyle}\u0000${availableWidth}\u0000${data}`;
+    const key = `${fontStyle}\u0000${ctx.direction}\u0000${availableWidth}\u0000${data}`;
     const cached = wrapCache.get(key);
     if (cached !== undefined) {
         // Most recently used last, so a viewport's cells outlive one scan.
@@ -594,7 +595,10 @@ export function splitMultiLineText(
         return cached;
     }
     const split: string[] = [];
-    for (const hardLine of data.split("\n")) split.push(...wrapHardLine(ctx, hardLine, fontStyle, availableWidth));
+    // Appended one by one: a long value wraps to more lines than a spread can pass.
+    for (const hardLine of data.split("\n")) {
+        for (const line of wrapHardLine(ctx, hardLine, availableWidth)) split.push(line);
+    }
     // canvas-hypertxt's whitespace handling, which the painter has always had.
     const lines = split.map((line, index) => index === 0 ? line.trimEnd() : line.trim());
     wrapCache.set(key, lines);

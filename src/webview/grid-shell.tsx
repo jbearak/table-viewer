@@ -28,6 +28,7 @@ import {
     type Item,
     type ProvideEditorCallback,
     type Rectangle,
+    direction,
     getDefaultTheme,
     getEmHeight,
     splitMultiLineText,
@@ -10907,12 +10908,13 @@ export function GridShell({
                 // The Text cell paints in its own font (bold or italic), and
                 // takes its line metric from that font too.
                 const font = `${cell.themeOverride?.baseFontStyle ?? glide_theme.baseFontStyle} ${glide_theme.fontFamily}`;
-                // canvas-hypertxt measures with the context's current font.
+                // Measured in the context's font and direction, as the Text
+                // cell paints: right to left for right-to-left text.
                 ctx.font = font;
-                return {
-                    lines: splitMultiLineText(ctx, cell.displayData, font, available).length,
-                    em_height: em_of(font),
-                };
+                ctx.direction = direction(cell.displayData) === 'rtl' ? 'rtl' : 'inherit';
+                const lines = splitMultiLineText(ctx, cell.displayData, font, available).length;
+                ctx.direction = 'inherit';
+                return { lines, em_height: em_of(font) };
             }
             if (cell.kind === GridCellKind.Custom && is_rich_text_cell(cell)) {
                 // The rich renderer takes its line metric from the base font.
