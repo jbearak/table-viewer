@@ -2364,6 +2364,127 @@ describe('CSV reload races', () => {
         vi.useRealTimers();
     });
 
+    it.each(['change', 'create'] as const)('lets a postSave build finish when the watcher reports the save’s own bytes as a %s', async (kind) => {
+        // A large workbook parses synchronously, so the watcher's report of the
+        // save's own write is delivered only once the postSave parse returns.
+        // Superseding that parse to read the same bytes again doubled the time
+        // the grid waited for the saved file.
+        const file_path = `/tmp/post-save-own-watcher-${kind}.csv`;
+        let bytes = enc.encode('h\na\n');
+        let builds = 0;
+        const post_save_started = deferred<void>();
+        const release_post_save = deferred<void>();
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const profile: ViewerProfile = {
+            editing: true,
+            plan_save: plan_csv_save,
+            async build_source(raw: Uint8Array, path: string) {
+                builds += 1;
+                if (builds === 2) {
+                    post_save_started.resolve();
+                    await release_post_save.promise;
+                }
+                return build_csv_source(raw, path);
+            },
+        };
+        const panel = open_csv_table(uri(file_path), state_store(), profile);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+
+        const save = panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await post_save_started.promise;
+        const active = vscode_mock.__getActiveWatchers()[0];
+        const watcher = kind === 'change' ? active.__fireChange() : active.__fireCreate();
+        // The watcher's byte check reads the file before deciding; let it.
+        await flush_promises();
+        release_post_save.resolve();
+        await Promise.all([save, watcher]);
+        await flush_promises();
+
+        expect(builds).toBe(2);
+        const latest = workbook_snapshots(panel).at(-1)!;
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            requestId: 'saved-bytes',
+            generation: latest.generation,
+            sourceGeneration: latest.sourceGeneration,
+        });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'rowData',
+            requestId: 'saved-bytes',
+            rows: [[expect.objectContaining({ raw: 'saved' })]],
+        }));
+        expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
+    });
+
+    it('needs no rebuild for an own watcher whose check ends after postSave adopted', async () => {
+        // The check reads the file, so the postSave refresh can adopt the
+        // saved bytes first. Rebuilding them then would block the host for a
+        // parse the user is waiting behind.
+        const file_path = '/tmp/post-save-own-watcher-late-check.csv';
+        let bytes = enc.encode('h\na\n');
+        let builds = 0;
+        let reads = 0;
+        let gate_next_read = false;
+        const check_read_started = deferred<void>();
+        const release_check_read = deferred<void>();
+        const post_save_started = deferred<void>();
+        const release_post_save = deferred<void>();
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            if (gate_next_read) {
+                gate_next_read = false;
+                const held = bytes;
+                check_read_started.resolve();
+                await release_check_read.promise;
+                return held;
+            }
+            return bytes;
+        });
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const profile: ViewerProfile = {
+            editing: true,
+            plan_save: plan_csv_save,
+            async build_source(raw: Uint8Array, path: string) {
+                builds += 1;
+                if (builds === 2) {
+                    post_save_started.resolve();
+                    await release_post_save.promise;
+                }
+                return build_csv_source(raw, path);
+            },
+        };
+        const panel = open_csv_table(uri(file_path), state_store(), profile);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+
+        const save = panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await post_save_started.promise;
+        gate_next_read = true;
+        const watcher = vscode_mock.__getActiveWatchers()[0].__fireCreate();
+        await check_read_started.promise;
+        release_post_save.resolve();
+        await save;
+        await flush_promises();
+        release_check_read.resolve();
+        await watcher;
+        await flush_promises();
+
+        expect(reads).toBeGreaterThan(0);
+        expect(builds).toBe(2);
+        expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
+    });
+
     it('lets a same-stat external watcher supersede a stalled postSave candidate', async () => {
         const file_path = '/tmp/post-save-external-supersede.csv';
         // 'a' rather than 'aaaaa': host-side base validation compares the save's
