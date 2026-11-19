@@ -147,6 +147,27 @@ describe('plan_cell_highlight_mutation', () => {
         });
     });
 
+    it('refuses a set whose additions must pass the limit without mapping its rows', () => {
+        const largeSheet = { ...sheet, rowCount: 1_000_000, sourceRowCount: 1_000_000, columnCount: 1 };
+        const mapper = vi.fn(() => {
+            throw new Error('mapped every selected row');
+        });
+        const result = plan_cell_highlight_mutation({
+            sheetIndex: 0, sheetName: 'People',
+            selection: { displayRows: [{ start: 0, end: 999_999 }], sourceColumns: [0] },
+            mutation: { type: 'set', color: 'blue' },
+        }, {
+            current: undefined, meta: { sheets: [largeSheet], hasFormatting: false }, sourceDigest: 'digest',
+            mapDisplayRowsToSource: mapper,
+            displayRowForSource: (_sheet, sourceRow) => sourceRow,
+        });
+        expect(result).toMatchObject({
+            type: 'rejected',
+            error: `A file may contain at most ${MAX_HIGHLIGHTED_CELLS_PER_FILE} highlighted cells.`,
+        });
+        expect(mapper).not.toHaveBeenCalled();
+    });
+
     it('rejects additions but permits recolors and clears in loaded over-cap state', () => {
         const cells: Record<string, 'yellow'> = {};
         for (let row = 0; row <= MAX_HIGHLIGHTED_CELLS_PER_FILE; row++) cells[`${row}:0`] = 'yellow';

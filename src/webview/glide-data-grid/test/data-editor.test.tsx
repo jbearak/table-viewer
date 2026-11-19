@@ -4218,6 +4218,75 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         );
     });
 
+    test("Copy rows reads no more rows than maxCopyRows, and says so", async () => {
+        vi.useFakeTimers();
+        const limited = vi.fn();
+        const getCellContent = vi.fn(basicProps.getCellContent);
+        render(
+            <EventedDataEditor
+                {...basicProps}
+                getCellContent={getCellContent}
+                rowMarkers="both"
+                maxCopyRows={2}
+                onCopyRowsLimited={limited}
+                gridSelection={{
+                    current: undefined,
+                    rows: CompactSelection.fromSingleSelection([3, 7]),
+                    columns: CompactSelection.empty(),
+                }}
+            />,
+            {
+                wrapper: Context,
+            }
+        );
+        prep();
+
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+
+        getCellContent.mockClear();
+        fireEvent.copy(window);
+        await vi.waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalled());
+        const copied = vi.mocked(navigator.clipboard.writeText).mock.calls[0][0];
+        expect(copied.split("\n").map(line => line.split("\t")[0])).toEqual(["Data: 0, 3", "Data: 0, 4"]);
+        expect(new Set(getCellContent.mock.calls.map(([[, row]]) => row))).toEqual(new Set([3, 4]));
+        expect(limited).toHaveBeenCalledExactlyOnceWith({ action: "copy", selected: 4, copied: 2 });
+    });
+
+    test("Cut rows past maxCopyRows cuts nothing, and says so", async () => {
+        vi.useFakeTimers();
+        const limited = vi.fn();
+        const getCellContent = vi.fn(basicProps.getCellContent);
+        render(
+            <EventedDataEditor
+                {...basicProps}
+                getCellContent={getCellContent}
+                rowMarkers="both"
+                maxCopyRows={2}
+                onCopyRowsLimited={limited}
+                gridSelection={{
+                    current: undefined,
+                    rows: CompactSelection.fromSingleSelection([3, 7]),
+                    columns: CompactSelection.empty(),
+                }}
+            />,
+            {
+                wrapper: Context,
+            }
+        );
+        prep();
+
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+
+        getCellContent.mockClear();
+        fireEvent.cut(window);
+        await vi.waitFor(() => expect(limited).toHaveBeenCalled());
+        expect(limited).toHaveBeenCalledExactlyOnceWith({ action: "cut", selected: 4, copied: 0 });
+        expect(navigator.clipboard.writeText).not.toHaveBeenCalled();
+        expect(getCellContent).not.toHaveBeenCalled();
+    });
+
     test("Copy cols", async () => {
         vi.useFakeTimers();
         render(

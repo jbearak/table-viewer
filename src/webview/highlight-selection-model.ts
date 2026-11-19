@@ -221,7 +221,7 @@ export function compact_intervals(
         // count, so a slice that starts between two holds none.
         if (!Number.isInteger(start)) continue;
         const first = Math.max(0, start);
-        const last = Math.min(limit - 1, Math.ceil(end) - 1);
+        const last = Math.min(Math.ceil(limit) - 1, Math.ceil(end) - 1);
         if (Number.isSafeInteger(first) && Number.isSafeInteger(last) && first <= last) {
             clamped.push({ start: first, end: last });
         }

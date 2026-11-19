@@ -99,6 +99,20 @@ export function plan_cell_highlight_mutation(
         if (!Number.isSafeInteger(selected_count)) {
             return reject('The selected cell range is too large.');
         }
+        // Every selected cell is one already highlighted on this sheet or an
+        // addition, so at least this many are additions. When those alone
+        // must pass the file's limit, the loop below would refuse at one of
+        // them: refuse before the rows are mapped one by one.
+        const fewest_additions = selected_count
+            - Object.keys(current?.sheets[input.sheetIndex]?.cells ?? {}).length;
+        if (
+            fewest_additions > 0
+            && count_cell_highlights(current) + fewest_additions > MAX_HIGHLIGHTED_CELLS_PER_FILE
+        ) {
+            return reject(
+                `A file may contain at most ${MAX_HIGHLIGHTED_CELLS_PER_FILE} highlighted cells.`,
+            );
+        }
         let source_rows: Uint32Array;
         try {
             source_rows = context.mapDisplayRowsToSource(

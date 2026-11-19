@@ -1524,7 +1524,11 @@ interface RowResizePreview {
 /** What a row fit fits: see `fit_row_heights` in GridShell. */
 type RowFitTarget =
     | { readonly border: number }
-    | { readonly rows: readonly DisplayRowInterval[]; readonly topology_key: string };
+    | {
+        readonly rows: readonly DisplayRowInterval[];
+        /** `display_rows_key` when the rows were read. */
+        readonly topology_key: string;
+    };
 
 /** A finished press on a row border, for telling a double-click from two drags. */
 interface RowBorderPress {
@@ -2248,8 +2252,8 @@ export function GridShell({
         source_display_rows: DisplayRowInterval[];
         /**
          * The grid rows the menu acts on, Pending Rows included, and the
-         * topology they were read under: what Copy copies and Auto-fit fits
-         * while the topology still holds.
+         * `display_rows_key` they were read under: what Copy copies and
+         * Auto-fit fits while that key still holds.
          */
         display_rows: { readonly rows: DisplayRowInterval[]; readonly topology_key: string };
         /** Whether one of those rows can be fitted: Auto-fit is offered. */
@@ -2669,6 +2673,19 @@ export function GridShell({
         source_row_count,
         version,
     ]);
+    /**
+     * Which row each grid index names, for an action that captured grid
+     * indices and runs later (a menu's Copy and Auto-fit): the pending
+     * topology, and also where rows removed at the end sit in a sorted view,
+     * which a page arriving can settle without changing the topology.
+     */
+    const display_rows_key = [
+        pending_selection_topology_key,
+        pending_projection.layoutMode ? 'layout' : 'band',
+        removed_source_display_rows.join(','),
+    ].join('|');
+    const display_rows_key_ref = useRef(display_rows_key);
+    display_rows_key_ref.current = display_rows_key;
     const row_count = pending_projection.rowCount;
     pending_projection_ref.current = pending_projection;
     const source_row_for_projected_display = useCallback((display_row: number) => {
@@ -4312,7 +4329,7 @@ export function GridShell({
             source_display_rows: source_intervals,
             display_rows: {
                 rows: request.display_rows,
-                topology_key: pending_selection_topology_key_ref.current,
+                topology_key: display_rows_key_ref.current,
             },
             can_fit_rows: on_row_fit !== undefined
                 && !preview_mode
@@ -4672,6 +4689,15 @@ export function GridShell({
         pending_projection,
         write_grid_selection,
     ]);
+    // A page that settles where a removed row sits moves the rows after it
+    // without changing the topology: a menu holding grid indices closes, as
+    // it does for a topology change.
+    const committed_display_rows_key_ref = useRef(display_rows_key);
+    useLayoutEffect(() => {
+        if (committed_display_rows_key_ref.current === display_rows_key) return;
+        committed_display_rows_key_ref.current = display_rows_key;
+        set_context_menu(null);
+    }, [display_rows_key]);
     const select_active_display_cell = useCallback((target: Item) => {
         // Merge snapping is required here: the vendored grid's canonicalization
         // chokepoint (setGridSelection) covers selections *it* originates —
@@ -10899,7 +10925,7 @@ export function GridShell({
         let intervals: readonly DisplayRowInterval[];
         if ('rows' in target) {
             // Checked after the fold, which can insert or commit a row.
-            if (target.topology_key !== pending_selection_topology_key_ref.current) return;
+            if (target.topology_key !== display_rows_key_ref.current) return;
             intervals = target.rows;
         } else {
             const row = target.border;
@@ -11491,22 +11517,30 @@ export function GridShell({
         }
         return false;
     }, [copy_columns, copy_rect, copy_source_selection, row_count]);
-    const copy_grid_selection_ref = useRef(copy_grid_selection);
-    copy_grid_selection_ref.current = copy_grid_selection;
-    // A copy that arrives as the browser's own event (a host's Edit > Copy,
-    // which no key handler sees) takes the same path, before Glide's own
-    // copy handler: that one lists every selected row, uncapped.
-    useEffect(() => {
-        const on_copy = (event: ClipboardEvent) => {
-            if (!grid_owns_focus(grid_root_ref.current, document.activeElement)) return;
-            if (is_editable_target(document.activeElement)) return;
-            if (!copy_grid_selection_ref.current()) return;
-            event.preventDefault();
-            event.stopImmediatePropagation();
-        };
-        window.addEventListener('copy', on_copy, true);
-        return () => window.removeEventListener('copy', on_copy, true);
-    }, []);
+
+    // A copy or cut that arrives as the browser's own event (a host's Edit
+    // menu, which no key handler sees) is Glide's: it keeps the cells' rich
+    // form and formula origins for Paste. Its row branch reads no more rows
+    // than this copy would, and a cut it cannot take whole is refused.
+    const native_copy_row_limit = max_copy_rows_for_columns(
+        copy_columns.length,
+        undefined,
+        undefined,
+        sheet_meta.estimatedRowBytes,
+    );
+    const on_copy_rows_limited = useCallback((event: {
+        readonly action: 'copy' | 'cut';
+        readonly selected: number;
+        readonly copied: number;
+    }) => {
+        host_bridge.postMessage({
+            type: 'showWarning',
+            message: event.action === 'cut'
+                ? `Nothing was cut: ${event.selected.toLocaleString('en-US')} rows are more than a cut can take `
+                    + `(${native_copy_row_limit.toLocaleString('en-US')}). Select fewer rows, or copy them instead.`
+                : copy_truncation_message({ rowCapped: true, nonResident: false, rowCap: event.copied })!,
+        });
+    }, [native_copy_row_limit]);
 
     // Whole visible sheet with a header row (delegates to copy_rect, so the same
     // clipboard-failure and truncation handling applies). Because this copies
@@ -13223,6 +13257,8 @@ export function GridShell({
                 scrollOffsetX={initial_scroll_position?.left}
                 scrollOffsetY={initial_scroll_position?.top}
                 getCellsForSelection={true}
+                maxCopyRows={native_copy_row_limit}
+                onCopyRowsLimited={on_copy_rows_limited}
                 gridSelection={grid_selection}
                 onGridSelectionChange={on_grid_selection_change}
                 drawHeader={draw_header}
@@ -13519,7 +13555,7 @@ export function GridShell({
                                 // it copies nothing, as Auto-fit fits nothing.
                                 if (
                                     row_menu.display_rows.topology_key
-                                    !== pending_selection_topology_key_ref.current
+                                    !== display_rows_key_ref.current
                                 ) return;
                                 copy_display_rows(row_menu.display_rows.rows);
                             },

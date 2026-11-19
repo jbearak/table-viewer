@@ -81,10 +81,15 @@ export function header_drag_state_for_selection(
     previous_columns: GridSelection['columns'],
     next_columns: GridSelection['columns'],
 ): HeaderDragState | null {
-    if (typeof next_columns.toRanges === 'function' && typeof previous_columns.toRanges === 'function') {
+    const whole = (ranges: readonly (readonly [number, number])[]) =>
+        ranges.every(([start, end]) => Number.isInteger(start) && Number.isInteger(end));
+    const previous_ranges = typeof previous_columns.toRanges === 'function' ? previous_columns.toRanges() : undefined;
+    const next_ranges = typeof next_columns.toRanges === 'function' ? next_columns.toRanges() : undefined;
+    if (previous_ranges !== undefined && next_ranges !== undefined && whole(previous_ranges) && whole(next_ranges)) {
         // By ranges, never by index: a row-marker click can land on a
-        // selection of a million rows.
-        const added = single_added_index(previous_columns.toRanges(), next_columns.toRanges());
+        // selection of a million rows. (Grid gestures give whole indices;
+        // anything else is listed, as before.)
+        const added = single_added_index(previous_ranges, next_ranges);
         const anchor = added === 'none' || added === 'many'
             ? next_columns.length === 1 ? next_columns.first() : undefined
             : added;

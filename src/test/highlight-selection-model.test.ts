@@ -414,6 +414,9 @@ describe('compact_intervals', () => {
         // one from 6 to 7.5 holds 6 and 7.
         const fractional = { length: 3, toRanges: () => [[2.5, 5], [6, 7.5]] } as unknown as GridSelection['rows'];
         expect(compact_intervals(fractional, 10)).toEqual([{ start: 6, end: 7 }]);
+        // A limit between two indices keeps the one below it, as `< limit` did.
+        const two = { length: 2, toRanges: () => [[0, 2]] } as unknown as GridSelection['rows'];
+        expect(compact_intervals(two, 1.5)).toEqual([{ start: 0, end: 1 }]);
         expect(compact_intervals(CompactSelection.empty(), 10)).toEqual([]);
     });
 
@@ -582,5 +585,22 @@ describe('highlight_selection_may_have_renderable_highlight by source runs', () 
         expect(highlight_selection_may_have_renderable_highlight(selection, { '999999:2': 'blue' }, get_source_row, million))
             .toBe(true);
         expect(get_source_row).not.toHaveBeenCalled();
+    });
+});
+
+describe('highlight_selection_from_grid over many disjoint rows', () => {
+    it('checks the rows x columns shape in about one step per interval', () => {
+        // 100,000 separate rows: checking every pair of regions takes
+        // billions of steps; the sweep, hundreds of thousands.
+        const slices = Array.from({ length: 100_000 }, (_, index) => [2 * index, 2 * index + 1] as [number, number]);
+        const rows = {
+            length: slices.length,
+            toRanges: () => slices,
+            hasIndex: (index: number) => index % 2 === 0,
+        } as unknown as GridSelection['rows'];
+        const started = performance.now();
+        const result = highlight_selection_from_grid({ ...empty(), rows }, 200_000, projection, []);
+        expect(performance.now() - started).toBeLessThan(2_000);
+        expect(result?.selection.displayRows).toHaveLength(100_000);
     });
 });

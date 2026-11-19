@@ -241,6 +241,21 @@ describe('header_drag_state_for_selection by ranges', () => {
         expect(header_drag_state_for_selection(CompactSelection.empty(), previous)).toBeNull();
     });
 
+    it('lists slices that do not start and end on whole indices, as before', () => {
+        const fractional = (ranges: [number, number][], values: number[]) => ({
+            length: values.length,
+            toRanges: () => ranges,
+            toArray: () => values,
+            // As CompactSelection answers: inside one of its slices.
+            hasIndex: (index: number) => ranges.some(([start, end]) => index >= start && index < end),
+            first: () => values[0],
+            last: () => values.at(-1),
+        }) as unknown as CompactSelection;
+        const previous = fractional([[0.5, 1.5]], [0.5]);
+        const next = fractional([[0, 2]], [0, 1]);
+        expect(header_drag_state_for_selection(previous, next)?.anchor).toBe(0);
+    });
+
     it('agrees with the listed rule over random selections', () => {
         let state = 402;
         const next_random = () => {
