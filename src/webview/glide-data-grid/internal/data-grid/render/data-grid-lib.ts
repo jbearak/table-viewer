@@ -502,6 +502,12 @@ function truncateString(data: string, w: number): string {
     return data;
 }
 
+/** Whitespace a line may break at: any but the no-break spaces (U+00A0, U+2007, U+202F). */
+const BREAK_SPACE = "[^\\S\\u00a0\\u2007\\u202f]";
+/** Words with the break space before them, and a line's trailing break space. */
+const BREAKABLE_WORDS = new RegExp(`${BREAK_SPACE}*(?:(?!${BREAK_SPACE})[\\s\\S])+|${BREAK_SPACE}+$`, "g");
+const BREAK_SPACE_ONLY = new RegExp(`^${BREAK_SPACE}+$`);
+
 /** `splitMultiLineText` results by font, direction, width and text, least recently used first. */
 const wrapCache = new Map<string, readonly string[]>();
 /** The characters of `wrapCache`'s keys, which hold whole cell values. */
@@ -553,8 +559,9 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, width: number
     if (/^\s*$/.test(line) || fits(line)) return [line];
     const lines: string[] = [];
     let current = "";
-    // Each word keeps the whitespace before it; trailing whitespace is a word too.
-    for (const word of line.match(/\s*\S+|\s+$/g) ?? [line]) {
+    // Each word keeps the whitespace before it; trailing whitespace is a word
+    // too. No-break spaces belong to the word they are in.
+    for (const word of line.match(BREAKABLE_WORDS) ?? [line]) {
         let fitting: boolean;
         if (current === "") {
             current = word;
@@ -562,7 +569,7 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, width: number
         } else if (fits(current + word)) {
             current += word;
             fitting = true;
-        } else if (/^\s+$/.test(word)) {
+        } else if (BREAK_SPACE_ONLY.test(word)) {
             // Trailing whitespace past the edge: dropped, as the line's trim would.
             continue;
         } else {
@@ -650,6 +657,8 @@ export function splitMultiLineText(
     }
     // canvas-hypertxt's whitespace handling, which the painter has always had.
     const lines = split.map((line, index) => index === 0 ? line.trimEnd() : line.trim());
+    // A value too long for the whole cache is not kept: it would evict everything first.
+    if (key.length > WRAP_CACHE_MAX_CHARS) return lines;
     wrapCache.set(key, lines);
     wrapCacheChars += key.length;
     while (wrapCache.size > WRAP_CACHE_MAX_ENTRIES || wrapCacheChars > WRAP_CACHE_MAX_CHARS) {

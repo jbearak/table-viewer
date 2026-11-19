@@ -239,6 +239,8 @@ describe("splitMultiLineText", () => {
         // Runs of indentation alone add nothing; what is left of it stays on the first line.
         expect(splitMultiLineText(ctx, " ".repeat(12) + "abcdefgh", "13px test", 50)).toEqual(["  abc", "defgh"]);
         expect(splitMultiLineText(ctx, "ab\tcd ef", "13px test", 50)).toEqual(["ab\tcd", "ef"]);
+        // A no-break space keeps its words together: "10\u00a0km" moves whole.
+        expect(splitMultiLineText(ctx, "abc 10\u00a0km", "13px test", 60)).toEqual(["abc", "10\u00a0km"]);
     });
 
     it("keeps no state from earlier text that could change a later wrap", () => {

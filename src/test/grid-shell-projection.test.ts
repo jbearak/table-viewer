@@ -8060,7 +8060,10 @@ describe('GridShell row auto-fit', () => {
         const canvas_context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
             .mockReturnValue({
                 font: '',
-                measureText: (text: string) => ({ width: text.length * 7 }),
+                // As the split mock measures: 7px a glyph, "i" 2px.
+                measureText: (text: string) => ({
+                    width: [...text].reduce((width, glyph) => width + (glyph === 'i' ? 2 : 7), 0),
+                }),
             } as unknown as CanvasRenderingContext2D);
         onTestFinished(() => canvas_context.mockRestore());
         grid_mock.get_row.mockImplementation(((row: number) => {
@@ -8131,6 +8134,12 @@ describe('GridShell row auto-fit', () => {
             { start: 0, end: 0, height: 44 },
             { start: 1, end: 1, height: null },
         ], undefined);
+    });
+
+    it('lets one line keep the default height when Auto-fit Columns has the default height wrap', async () => {
+        const on_row_fit = await render_fit({ 0: 'i'.repeat(30), 1: 'b', 2: 'c', 3: 'd' }, { auto_fit_active: true });
+        double_click_border(0);
+        expect(on_row_fit).toHaveBeenCalledExactlyOnceWith([{ start: 0, end: 0, height: null }], undefined);
     });
 
     it('fits only the row whose border it was when that row is not selected', async () => {

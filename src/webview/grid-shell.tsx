@@ -10904,36 +10904,48 @@ export function GridShell({
             const cell = get_cell_content([display_column, display_row]);
             const width = get_cell_width(display_row, display_column);
             const available = Math.max(0, width - 2 * padding);
-            // At the default height a cell paints one line, cut at a quarter of
-            // its width in characters whatever their width (both painters do,
-            // to bound the work of a huge value). Text that fits on one line
-            // by measure but is longer than that needs the row tall enough to
-            // wrap, or the fit would hide what it fitted.
-            const one_line = (lines: number, longest: number, cap: number): number =>
-                lines === 1 && longest > cap ? 2 : lines;
+            // A layout of one line is fitted to the default height, where a
+            // cell does not wrap (unless Auto-fit Columns is on, or it has a
+            // line break): it paints its whole value on one line, cut at a
+            // quarter of its width in characters (both painters do, to bound
+            // the work of a huge value) and clipped at the column. When that
+            // would hide anything visible, the row must be tall enough to wrap.
+            const unwrapped_at_default = (lines: number, hard_lines: number): boolean =>
+                lines <= 1 && hard_lines <= 1 && !auto_fit_active;
             if (cell.kind === GridCellKind.Text) {
-                if (cell.displayData === '') return { lines: 1 };
+                const text = cell.displayData;
+                if (text === '') return { lines: 1 };
                 // The Text cell paints in its own font (bold or italic), and
                 // takes its line metric from that font too.
                 const font = `${cell.themeOverride?.baseFontStyle ?? glide_theme.baseFontStyle} ${glide_theme.fontFamily}`;
                 // Measured in the context's font and direction, as the Text
                 // cell paints: right to left for right-to-left text.
                 ctx.font = font;
-                ctx.direction = direction(cell.displayData) === 'rtl' ? 'rtl' : 'inherit';
-                const lines = splitMultiLineText(ctx, cell.displayData, font, available).length;
+                ctx.direction = direction(text) === 'rtl' ? 'rtl' : 'inherit';
+                let lines = splitMultiLineText(ctx, text, font, available).length;
+                if (unwrapped_at_default(lines, has_line_break(text) ? 2 : 1)) {
+                    // Glide's truncateString keeps `slice(0, width / 4)`.
+                    const drawn = text.slice(0, width / 4);
+                    if (
+                        text.slice(drawn.length).trim() !== ''
+                        || ctx.measureText(drawn.trimEnd()).width > available
+                    ) lines = 2;
+                }
                 ctx.direction = 'inherit';
-                // Glide's truncateString keeps `slice(0, width / 4)`.
-                return { lines: one_line(lines, cell.displayData.length, width / 4), em_height: em_of(font) };
+                return { lines, em_height: em_of(font) };
             }
             if (cell.kind === GridCellKind.Custom && is_rich_text_cell(cell)) {
                 // The rich renderer takes its line metric from the base font.
-                const lines = rich_cell_wrapped_lines(ctx, cell.data, available, glide_theme.fontFamily).length;
-                let longest = 0;
-                for (const line of cell.data.lines) {
-                    for (const segment of line) longest = Math.max(longest, segment.text.length);
+                let lines = rich_cell_wrapped_lines(ctx, cell.data, available, glide_theme.fontFamily).length;
+                if (unwrapped_at_default(lines, cell.data.lines.length)) {
+                    // The rich renderer cuts each segment at `ceil(width / 4)`;
+                    // its one wrapped line fits the width, so nothing clips.
+                    const cap = Math.ceil(width / 4);
+                    const cut = cell.data.lines.some((line) =>
+                        line.some((segment) => segment.text.slice(cap).trim() !== ''));
+                    if (cut) lines = 2;
                 }
-                // The rich renderer cuts each segment at `ceil(width / 4)`.
-                return { lines: one_line(lines, longest, Math.ceil(width / 4)) };
+                return { lines };
             }
             return { lines: 1 };
         };
@@ -11001,6 +11013,7 @@ export function GridShell({
             return true;
         });
     }, [
+        auto_fit_active,
         default_row_height,
         display_column_count,
         effective_row_height,
