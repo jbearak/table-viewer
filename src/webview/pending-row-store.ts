@@ -1981,12 +1981,36 @@ function rows_in_range(
 }
 
 /**
+ * Whether moving the live source rows `moved` takes part of a merge: some of
+ * a merge's rows but not all its live rows, counted unclipped to the body as
+ * `live_in_range` counts them. `removed` and `moved` are canonical (sorted,
+ * merged) and `moved` holds no removed row. Two binary searches per merge.
+ */
+export function merge_split_by_intervals(
+    merges: readonly MergeRange[],
+    removed: readonly SourceInterval[],
+    moved: readonly SourceInterval[],
+): boolean {
+    const removed_prefix = row_prefix(removed);
+    const moved_prefix = row_prefix(moved);
+    for (const merge of merges) {
+        if (merge.endRow <= merge.startRow) continue;
+        const inside = rows_in_range(moved, moved_prefix, merge.startRow, merge.endRow);
+        if (inside === 0) continue;
+        const live = merge.endRow - merge.startRow + 1
+            - rows_in_range(removed, removed_prefix, merge.startRow, merge.endRow);
+        if (inside < live) return true;
+    }
+    return false;
+}
+
+/**
  * The nearest row to `row`, going `up` (to higher rows) or `down`, that no
  * interval of canonical `intervals` (sorted, merged, adjacent ones joined)
  * holds: `row` itself, or the row just past the interval holding it. One
  * binary search.
  */
-function row_outside(intervals: readonly SourceInterval[], row: number, direction: 'up' | 'down'): number {
+export function row_outside(intervals: readonly SourceInterval[], row: number, direction: 'up' | 'down'): number {
     // The last interval starting at or before `row`.
     let low = 0;
     let high = intervals.length;
@@ -2054,15 +2078,9 @@ function merge_move_refusal_by_intervals(
     const merges = (context.merges ?? []).filter((merge) => merge.endRow > merge.startRow);
     if (merges.length === 0) return undefined;
     const removed = canonical_source_intervals(layout.removedSourceRows);
-    const removed_prefix = row_prefix(removed);
     const moved_sources = moved.movedSources;
-    const moved_prefix = row_prefix(moved_sources);
-    for (const merge of merges) {
-        const inside = rows_in_range(moved_sources, moved_prefix, merge.startRow, merge.endRow);
-        // Live rows of the span, unclipped to the body as `live_in_range` counts them.
-        const live = merge.endRow - merge.startRow + 1
-            - rows_in_range(removed, removed_prefix, merge.startRow, merge.endRow);
-        if (inside > 0 && inside < live) return refuse_structure('merge-split', MERGE_SPLIT_MESSAGE);
+    if (merge_split_by_intervals(merges, removed, moved_sources)) {
+        return refuse_structure('merge-split', MERGE_SPLIT_MESSAGE);
     }
     const after = index_row_layout(moved.layout);
     const first = after.body_index_of(moved.first);

@@ -16,6 +16,7 @@ import {
 } from '../webview/pending-row-store';
 import {
     identities_of_runs,
+    live_span_identities,
     plan_row_delete,
     plan_row_insert,
     plan_row_move,
@@ -373,5 +374,35 @@ describe('probe_row_move_runs', () => {
             seen.add(expected.split(':')[0]!);
         }
         expect([...seen]).toContain('too-many-runs');
+    });
+});
+
+describe('live_span_identities', () => {
+    it('names each run’s first and last live rows, as a walk of its rows does', () => {
+        const next = random_source(406);
+        for (let trial = 0; trial < 2000; trial++) {
+            // Removed rows as a layout stores them: sorted, merged, adjacent ones joined.
+            const removed: { start: number; count: number }[] = [];
+            for (let row = 0; row < 40; row++) {
+                if (next() < 0.4) {
+                    const last = removed[removed.length - 1];
+                    if (last !== undefined && last.start + last.count === row) last.count += 1;
+                    else removed.push({ start: row, count: 1 });
+                }
+            }
+            const start = Math.floor(next() * 36);
+            const runs: RowSelectionRun[] = [{ kind: 'source', start, count: 1 + Math.floor(next() * (40 - start)) }];
+            const changes: PendingStructuralChanges = {
+                ...EMPTY,
+                rowLayout: { runs: [{ kind: 'source', start: 0, count: 40 }], removedSourceRows: removed, discardedPendingRows: [] },
+            };
+            const run = runs[0] as { start: number; count: number };
+            const live = Array.from({ length: run.count }, (_, offset) => run.start + offset)
+                .filter((row) => !removed.some((entry) => row >= entry.start && row < entry.start + entry.count));
+            const expected = live.length === 0
+                ? [source(run.start)]
+                : [...new Set([live[0]!, live[live.length - 1]!])].map(source);
+            expect(live_span_identities(changes, runs), JSON.stringify({ removed, run })).toEqual(expected);
+        }
     });
 });

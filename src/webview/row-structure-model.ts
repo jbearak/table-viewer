@@ -38,6 +38,7 @@ import {
 } from '../formula-rule-split';
 import type { MergeRange } from '../types';
 import {
+    canonical_source_intervals,
     has_live_column_layout_change,
     index_row_layout,
     insert_anchor_for_selection,
@@ -56,9 +57,11 @@ import {
     row_runs_of_identities,
     insert_rows,
     MERGE_SPLIT_MESSAGE,
+    merge_split_by_intervals,
     move_rows,
     probe_row_move_runs,
     restore_rows,
+    row_outside,
     source_cells_removed_by,
     structure_exclusivity_message,
     STRUCTURE_TAIL_REMOVAL_MESSAGE,
@@ -192,7 +195,17 @@ function intersect_intervals(
     right: readonly SourceInterval[],
 ): SourceInterval[] {
     const out: SourceInterval[] = [];
+    if (left.length === 0) return out;
+    // The first `right` interval ending after the first `left` one starts:
+    // one binary search, so a caller asking per run does not walk `right`
+    // from its start each time.
     let at = 0;
+    let high = right.length;
+    while (at < high) {
+        const middle = (at + high) >>> 1;
+        if (right[middle]!.start + right[middle]!.count > left[0]!.start) high = middle;
+        else at = middle + 1;
+    }
     for (const entry of left) {
         const end = entry.start + entry.count;
         while (at < right.length && right[at]!.start + right[at]!.count <= entry.start) at++;
@@ -238,7 +251,9 @@ export function resolve_row_structure_selection(
             runs.push({ kind: 'source', start: first, count: rows });
         }
         if (options.removedSourceRows !== undefined) {
-            removed.push(...intersect_intervals([{ start: first, count: rows }], options.removedSourceRows));
+            for (const entry of intersect_intervals([{ start: first, count: rows }], options.removedSourceRows)) {
+                removed.push(entry);
+            }
         } else {
             for (let row = first; row < first + rows; row += 1) {
                 if (options.isRemoved(row)) removed.push({ start: row, count: 1 });
@@ -404,25 +419,24 @@ export function live_span_identities(
     changes: PendingStructuralChanges,
     runs: readonly RowSelectionRun[],
 ): RowIdentity[] {
-    const removed = changes.rowLayout?.removedSourceRows ?? [];
+    const removed = canonical_source_intervals(changes.rowLayout?.removedSourceRows ?? []);
     const out: RowIdentity[] = [];
     for (const run of runs) {
         if (run.kind === 'pending') {
             out.push(run.identity);
             continue;
         }
-        const live = subtract_intervals([{ start: run.start, count: run.count }], removed);
-        const first = live[0];
-        const last = live[live.length - 1];
-        if (first === undefined || last === undefined) {
+        // The run's first and last live rows, one binary search each.
+        const end = run.start + run.count - 1;
+        const first = row_outside(removed, run.start, 'up');
+        if (first > end) {
             // A run of tombstones still names a known row for the index to place.
             out.push({ kind: 'source', sourceRow: run.start });
             continue;
         }
-        out.push({ kind: 'source', sourceRow: first.start });
-        if (last.start + last.count - 1 !== first.start) {
-            out.push({ kind: 'source', sourceRow: last.start + last.count - 1 });
-        }
+        const last = row_outside(removed, end, 'down');
+        out.push({ kind: 'source', sourceRow: first });
+        if (last !== first) out.push({ kind: 'source', sourceRow: last });
     }
     return out;
 }
@@ -593,21 +607,11 @@ function merge_split_refusal(
 ): string | undefined {
     const merges = context.merges ?? [];
     if (merges.length === 0) return undefined;
-    const removed = changes.rowLayout?.removedSourceRows ?? [];
-    const moved = subtract_intervals(merge_intervals(runs.flatMap((run) =>
+    const removed = canonical_source_intervals(changes.rowLayout?.removedSourceRows ?? []);
+    const moved = subtract_intervals(canonical_source_intervals(runs.flatMap((run) =>
         run.kind === 'source' ? [{ start: run.start, count: run.count }] : [])), removed);
     if (moved.length === 0) return undefined;
-    const size = (intervals: readonly SourceInterval[]) =>
-        intervals.reduce((total, entry) => total + entry.count, 0);
-    for (const merge of merges) {
-        if (merge.endRow <= merge.startRow) continue;
-        const span = [{ start: merge.startRow, count: merge.endRow - merge.startRow + 1 }];
-        const inside = size(intersect_intervals(moved, span));
-        if (inside === 0) continue;
-        const live = size(subtract_intervals(span, removed));
-        if (inside < live) return MERGE_SPLIT_MESSAGE;
-    }
-    return undefined;
+    return merge_split_by_intervals(merges, removed, moved) ? MERGE_SPLIT_MESSAGE : undefined;
 }
 
 /**
