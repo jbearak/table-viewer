@@ -24,6 +24,11 @@ export interface RowContextMenuModelProps {
     on_reset_row_heights?: () => void;
     /** How many of those rows show a custom height: the rows the reset changes. */
     reset_row_count?: number;
+    /**
+     * Fit the menu's rows to their content, as a double-click on a row border
+     * does. Present when at least one of them can be fitted.
+     */
+    on_auto_fit_rows?: () => void;
     on_promote_row_to_header: () => void;
     on_copy_rows: () => void;
     pending_row_count?: number;
@@ -85,6 +90,14 @@ export function row_context_menu_items(props: RowContextMenuModelProps): MenuIte
                 ? 'Reset row height'
                 : `Reset ${reset_row_count} row heights`,
             on_click: () => props.on_reset_row_heights?.(),
+        });
+    }
+    if (props.on_auto_fit_rows !== undefined) {
+        items.push({
+            label: selected_row_count === 1
+                ? 'Auto-fit row height'
+                : `Auto-fit ${selected_row_count} row heights`,
+            on_click: () => props.on_auto_fit_rows?.(),
         });
     }
     items.push({

@@ -93,6 +93,31 @@ describe('row context menu model', () => {
         ]);
     });
 
+    it('offers Auto-fit after Reset row height when given, counting the menu\'s rows', () => {
+        const base = {
+            selected_row_count: 3,
+            can_hide_rows: true,
+            can_promote_row_to_header: false,
+            on_hide_rows: vi.fn(),
+            on_promote_row_to_header: vi.fn(),
+            on_copy_rows: vi.fn(),
+        };
+        const labels_of = (props: Parameters<typeof row_context_menu_items>[0]) =>
+            row_context_menu_items(props).flatMap((item) => item.kind === 'separator' ? [] : [item.label]);
+        const on_auto_fit_rows = vi.fn();
+        expect(labels_of({ ...base, on_auto_fit_rows }))
+            .toEqual(['Hide 3 rows', 'Auto-fit 3 row heights', 'Copy 3 rows']);
+        expect(labels_of({ ...base, on_auto_fit_rows, on_reset_row_heights: vi.fn(), reset_row_count: 1 }))
+            .toEqual(['Hide 3 rows', 'Reset row height', 'Auto-fit 3 row heights', 'Copy 3 rows']);
+        expect(labels_of({ ...base, selected_row_count: 1, on_auto_fit_rows }))
+            .toEqual(['Hide row', 'Auto-fit row height', 'Copy row']);
+        const fit = row_context_menu_items({ ...base, on_auto_fit_rows })
+            .find((item) => item.kind !== 'separator' && item.label === 'Auto-fit 3 row heights');
+        if (!fit || fit.kind === 'separator' || fit.kind === 'submenu') throw new Error('no fit item');
+        fit.on_click({} as never);
+        expect(on_auto_fit_rows).toHaveBeenCalledTimes(1);
+    });
+
     it('offers Reset row height only when given, between Hide and Copy, counting the rows it is given', () => {
         const base = {
             selected_row_count: 3,
