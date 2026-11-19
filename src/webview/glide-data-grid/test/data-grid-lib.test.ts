@@ -164,27 +164,37 @@ describe("drawTextCell wrapping", () => {
 describe("splitMultiLineText", () => {
     beforeEach(() => clearTextMetricsCache());
 
-    it("returns when a glyph is wider than the width it wraps to", () => {
-        // canvas-hypertxt alone never returns here: "W" (29px) cannot fit in
-        // 24px, so its break search makes no progress.
-        const ctx = {
-            font: "",
-            measureText: (text: string) => ({
-                width: [...text].reduce((width, glyph) => width + (glyph === "W" ? 29 : 10), 0),
-            }),
-        } as unknown as CanvasRenderingContext2D;
-        const lines = splitMultiLineText(ctx, "Wabc def", "13px test", 24);
-        expect(lines.join("").replace(/ /g, "")).toBe("Wabcdef");
-        expect(lines[0]).toBe("W");
+    /** "W" is 29px, "i" 2px, every other glyph 10px. */
+    const ctx = {
+        font: "",
+        measureText: (text: string) => ({
+            width: [...text].reduce((width, glyph) => width + (glyph === "W" ? 29 : glyph === "i" ? 2 : 10), 0),
+        }),
+    } as unknown as CanvasRenderingContext2D;
+
+    it("gives a glyph wider than the line a line of its own, and wraps the rest at the real width", () => {
+        // canvas-hypertxt never returns here: its break search makes no progress.
+        expect(splitMultiLineText(ctx, "Wabc def", "13px test", 24)).toEqual(["W", "ab", "c", "de", "f"]);
     });
 
-    it("splits as canvas-hypertxt does when every glyph fits", () => {
-        const ctx = {
-            font: "",
-            measureText: (text: string) => ({ width: text.length * 10 }),
-        } as unknown as CanvasRenderingContext2D;
+    it("breaks after the last space that fits, and inside a word only when it must", () => {
         expect(splitMultiLineText(ctx, "alpha beta\n\ngamma", "13px test", 60))
             .toEqual(["alpha", "beta", "", "gamma"]);
+        expect(splitMultiLineText(ctx, "ab abcdefgh", "13px test", 50)).toEqual(["ab", "abcde", "fgh"]);
+        expect(splitMultiLineText(ctx, "  lead and trail  ", "13px test", 1000)).toEqual(["  lead and trail"]);
+    });
+
+    it("wraps a line the same whatever was measured before it", () => {
+        // canvas-hypertxt judged a line from a prefix sized by the average
+        // glyph width of earlier text: after wide text, a long line of narrow
+        // glyphs passed as one line.
+        const narrow = Array.from({ length: 40 }, () => "iiiiiiiiii").join(" ");
+        const fresh = splitMultiLineText(ctx, narrow, "13px test", 104);
+        clearTextMetricsCache();
+        splitMultiLineText(ctx, "WWWWWWWWWW WWWWWWWWWW WWWWWWWWWW", "13px test", 104);
+        expect(splitMultiLineText(ctx, narrow, "13px test", 104)).toEqual(fresh);
+        expect(fresh.length).toBeGreaterThan(1);
+        for (const line of fresh) expect(ctx.measureText(line).width).toBeLessThanOrEqual(104);
     });
 });
 

@@ -10883,6 +10883,9 @@ export function GridShell({
         const em_of = (font: string): number => {
             let em = em_by_font.get(font);
             if (em === undefined) {
+                // Measured with the context's current font, and cached under
+                // `font` for the painters too: the font must be this one.
+                ctx.font = font;
                 em = getEmHeight(ctx, font);
                 em_by_font.set(font, em);
             }

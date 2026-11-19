@@ -192,9 +192,14 @@ vi.mock('../webview/glide-data-grid', () => {
             baseFontStyle: '13px',
             fontFamily: 'sans-serif',
         }),
-        getEmHeight: () => 13,
+        // Both measure with the context's current font, which must be the one named.
+        getEmHeight: (ctx: { font: string }, font: string) => {
+            if (ctx.font !== font) throw new Error(`em measured in ${ctx.font}, not ${font}`);
+            return 13;
+        },
         // 7px per character: hard lines, each wrapped at whole characters.
-        splitMultiLineText: (_ctx: unknown, data: string, _font: string, width: number) => {
+        splitMultiLineText: (ctx: { font: string }, data: string, font: string, width: number) => {
+            if (ctx.font !== font) throw new Error(`text measured in ${ctx.font}, not ${font}`);
             const per_line = Math.max(1, Math.floor(width / 7));
             return data.split('\n').flatMap((line) => {
                 const parts: string[] = [];

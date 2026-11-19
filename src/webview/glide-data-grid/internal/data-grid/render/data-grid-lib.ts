@@ -313,7 +313,7 @@ export function clearTextMetricsCache(): void {
     metricsSize = 0;
     metricsCache = {};
     biasCache.length = 0;
-    widestGlyphCache.clear();
+    wrapCache.clear();
     clearCache();
     textMetricsGeneration++;
 }
@@ -501,39 +501,66 @@ function truncateString(data: string, w: number): string {
     return data;
 }
 
-/** Widest glyph per font and text, for `splitMultiLineText`. Bounded like canvas-hypertxt's own cache. */
-const widestGlyphCache = new Map<string, number>();
+/** `splitMultiLineText` results by font, width and text. Bounded like canvas-hypertxt's own cache. */
+const wrapCache = new Map<string, readonly string[]>();
 
 /**
- * The widest single code point of `text` in `fontStyle` (and the first half
- * of each surrogate pair, which canvas-hypertxt can slice on its own).
+ * One hard line's visual lines at `width`: greedy, breaking after the last
+ * space that fits, and inside a word only when the word alone is wider than
+ * the line. A glyph wider than the line takes a line of its own.
+ *
+ * Widths are summed from measured words and glyphs rather than estimated, so
+ * the result does not depend on what was measured before. canvas-hypertxt
+ * judges whether a line fits from a prefix whose length comes from the
+ * average glyph width of earlier text, so after wide text a long line of
+ * narrow glyphs was taken whole and clipped; and it never returned when one
+ * glyph was wider than the line.
  */
-function widestGlyph(ctx: CanvasRenderingContext2D, text: string, fontStyle: string): number {
-    const key = `${fontStyle}\u0000${text}`;
-    const cached = widestGlyphCache.get(key);
-    if (cached !== undefined) return cached;
-    let widest = 0;
-    const seen = new Set<string>();
-    for (const glyph of text) {
-        for (const piece of glyph.length > 1 ? [glyph, glyph[0]] : [glyph]) {
-            if (seen.has(piece)) continue;
-            seen.add(piece);
-            const width = measureTextCached(piece, ctx, fontStyle).width;
-            if (width > widest) widest = width;
+function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, fontStyle: string, width: number): string[] {
+    const measure = (text: string) => measureTextCached(text, ctx, fontStyle).width;
+    if (line.length === 0 || measure(line) <= width) return [line];
+    const lines: string[] = [];
+    let current = "";
+    let currentWidth = 0;
+    // Each word keeps the spaces before it; trailing spaces are a word too.
+    for (const word of line.match(/ *[^ ]+| +$/g) ?? [line]) {
+        const wordWidth = measure(word);
+        if (current === "" || currentWidth + wordWidth <= width) {
+            current += word;
+            currentWidth += wordWidth;
+        } else {
+            lines.push(current);
+            current = word.trimStart();
+            currentWidth = measure(current);
         }
+        if (currentWidth <= width) continue;
+        // One word wider than the line: break it between glyphs.
+        let piece = "";
+        let pieceWidth = 0;
+        for (const glyph of current) {
+            const glyphWidth = measure(glyph);
+            if (piece !== "" && pieceWidth + glyphWidth > width) {
+                lines.push(piece);
+                piece = "";
+                pieceWidth = 0;
+            }
+            piece += glyph;
+            pieceWidth += glyphWidth;
+        }
+        current = piece;
+        currentWidth = pieceWidth;
     }
-    widestGlyphCache.set(key, widest);
-    if (widestGlyphCache.size > 500) {
-        const oldest = widestGlyphCache.keys().next().value;
-        if (oldest !== undefined) widestGlyphCache.delete(oldest);
-    }
-    return widest;
+    lines.push(current);
+    return lines;
 }
 
 /**
  * Fork addition: the visual lines `drawMultiLineText` draws `data` as, at
  * `availableWidth` (the cell width less both horizontal paddings). Exported so
- * row auto-fit counts exactly the lines the painter will draw.
+ * row auto-fit counts exactly the lines the painter will draw. The caller
+ * sets `ctx.font` to `fontStyle`.
+ *
+ * `hyperWrapping` keeps canvas-hypertxt's estimated layout, as upstream.
  */
 export function splitMultiLineText(
     ctx: CanvasRenderingContext2D,
@@ -542,38 +569,21 @@ export function splitMultiLineText(
     availableWidth: number,
     hyperWrapping = false
 ): readonly string[] {
-    // canvas-hypertxt never returns when one glyph is wider than the width it
-    // wraps to: its break search settles on index 0 and the line never
-    // shrinks. A column narrower than a wide glyph (an emoji, a large font)
-    // then hung the window. Wrapping at least as wide as the widest glyph
-    // keeps every break moving forward; such a glyph overhangs its line,
-    // clipped by the column, as it does when the row does not wrap.
-    availableWidth = Math.max(availableWidth, widestGlyph(ctx, data, fontStyle));
-    // canvas-hypertxt records average glyph width while splitting. Passing an
-    // empty hard line makes it divide 0px by 0 characters, poisoning that font's
-    // shared metric with NaN. The current width is already cached by then, so the
-    // failure appears only after a resize: every paragraph at the new width is
-    // incorrectly accepted as one unwrapped line. Preserve blank visual lines
-    // ourselves and only ask the dependency to measure non-empty hard lines.
-    let split: readonly string[];
-    const hasEmptyHardLine = data.startsWith("\n") || data.endsWith("\n") || data.includes("\n\n");
-    if (hasEmptyHardLine) {
-        const hardLines = data.split("\n");
-        const safeSplit: string[] = [];
-        for (const hardLine of hardLines) {
-            if (hardLine.length === 0) {
-                safeSplit.push("");
-            } else {
-                safeSplit.push(...splitText(ctx, hardLine, fontStyle, availableWidth, hyperWrapping));
-            }
-        }
-        // Match canvas-hypertxt's whole-value whitespace handling now that each
-        // hard line was sent through it independently.
-        split = safeSplit.map((line, index) => index === 0 ? line.trimEnd() : line.trim());
-    } else {
-        split = splitText(ctx, data, fontStyle, availableWidth, hyperWrapping);
+    if (hyperWrapping) return splitText(ctx, data, fontStyle, availableWidth, true);
+    if (availableWidth <= 0) return [];
+    const key = `${fontStyle}\u0000${availableWidth}\u0000${data}`;
+    const cached = wrapCache.get(key);
+    if (cached !== undefined) return cached;
+    const split: string[] = [];
+    for (const hardLine of data.split("\n")) split.push(...wrapHardLine(ctx, hardLine, fontStyle, availableWidth));
+    // canvas-hypertxt's whitespace handling, which the painter has always had.
+    const lines = split.map((line, index) => index === 0 ? line.trimEnd() : line.trim());
+    wrapCache.set(key, lines);
+    if (wrapCache.size > 500) {
+        const oldest = wrapCache.keys().next().value;
+        if (oldest !== undefined) wrapCache.delete(oldest);
     }
-    return split;
+    return lines;
 }
 
 function drawMultiLineText(
