@@ -8,6 +8,7 @@ import type { MergeRange } from '../types';
 import type { PendingStructuralChanges, RowIdentity } from '../pending-changes';
 import { create_pending_row_projection } from '../webview/pending-row-projection';
 import {
+    MERGE_SPLIT_MESSAGE,
     move_rows,
     probe_row_move_runs,
     type RowSelectionRun,
@@ -21,6 +22,7 @@ import {
     plan_row_insert,
     plan_row_move,
     resolve_row_structure_selection,
+    row_move_block_refusal,
     row_move_item_model,
     type RowStructureSelection,
 } from '../webview/row-structure-model';
@@ -431,5 +433,38 @@ describe('live_span_identities', () => {
                 : [...new Set([live[0]!, live[live.length - 1]!])].map(source);
             expect(live_span_identities(changes, runs), JSON.stringify({ removed, run })).toEqual(expected);
         }
+    });
+});
+
+describe('row_move_block_refusal', () => {
+    it('counts only a block’s live rows against a merge', () => {
+        // Rows 5-9 merged, rows 8 and 9 removed: its live rows are 5-7. A block
+        // over rows 6-10 holds two of them (6 and 7), not four.
+        const ctx = context({ merges: [{ startRow: 5, endRow: 9, startCol: 0, endCol: 1 }] });
+        const plan = plan_row_delete(EMPTY, context(), [source(8), source(9)], new Map());
+        if (!plan.ok) throw new Error(plan.message);
+        const changes = plan.outcome.next;
+        const base = resolve_row_structure_selection(projection_for(changes), [], {
+            bodyStart: BODY_START, isRemoved: () => false,
+        });
+        const block = (start: number, count: number): RowStructureSelection => ({
+            ...base,
+            count,
+            runs: [{ kind: 'source', start, count }],
+            removedSourceRuns: [],
+            removedCount: 0,
+            fixedRows: false,
+            tailRemovals: false,
+            contiguous: true,
+            bandRows: 0,
+        });
+        const refusal = (selection: RowStructureSelection) => row_move_block_refusal({
+            support: { supported: true }, ready: true, selection, changes, context: ctx,
+        });
+        expect(refusal(block(6, 5))).toBe(MERGE_SPLIT_MESSAGE);
+        // Every live row of it moves: whole.
+        expect(refusal(block(5, 6))).toBeUndefined();
+        expect(outcome(move_rows(changes, ctx, identities_of_runs([{ kind: 'source', start: 6, count: 5 }]), 'end')))
+            .toBe(`merge-split: ${MERGE_SPLIT_MESSAGE}`);
     });
 });
