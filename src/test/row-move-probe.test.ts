@@ -20,8 +20,10 @@ import {
     plan_row_insert,
     plan_row_move,
     resolve_row_structure_selection,
+    row_move_item_model,
+    type RowStructureSelection,
 } from '../webview/row-structure-model';
-import { probe_row_move } from '../worksheet-layout';
+import { MAX_ROW_LAYOUT_RUNS, probe_row_move } from '../worksheet-layout';
 
 const SOURCE_ROWS = 14;
 const BODY_START = 2;
@@ -216,5 +218,82 @@ describe('probe_row_move_runs', () => {
             const result = probe_row_move(layout, [bad], [], 'end');
             expect(result.ok ? 'ok' : result.refusal.reason, JSON.stringify(bad)).toBe('unknown-identity');
         }
+    });
+
+    it('decides the Move items for a million rows without listing them', () => {
+        const ctx = context({
+            sourceRowCount: 1_000_002,
+            structuralBasis: {
+                kind: 'delimited', byteLength: 40, digest: 'abc', sourceRowCount: 1_000_002, sourceColumnCount: 2,
+            },
+        });
+        const runs: RowSelectionRun[] = [{ kind: 'source', start: 10, count: 999_000 }];
+        const selection = resolve_row_structure_selection(
+            { rowCount: 1_000_001, row_at: () => undefined, source_row_runs: () => [], deletedBandStart: 1_000_001 },
+            [],
+            { bodyStart: BODY_START, isRemoved: () => false },
+        );
+        const huge: RowStructureSelection = {
+            ...selection,
+            count: 999_000,
+            runs,
+            get identities(): never {
+                throw new Error('listed every selected row');
+            },
+            removedSourceRuns: [],
+            removedCount: 0,
+            fixedRows: false,
+            tailRemovals: false,
+            contiguous: true,
+            bandRows: 0,
+        };
+        for (const direction of ['backward', 'forward'] as const) {
+            const model = row_move_item_model(
+                { support: { supported: true }, ready: true, selection: huge, changes: EMPTY, context: ctx },
+                direction,
+            );
+            expect(model.enabled, direction).toBe(true);
+        }
+    });
+
+    it('answers the run limit as move_rows does, at the limit', () => {
+        // A three-row run, then single moved rows (pairs swapped, so no two
+        // neighbours join): MAX_ROW_LAYOUT_RUNS - 1 runs. Taking the middle
+        // row of the first run to the end splits it and adds a run: one over.
+        const singles = MAX_ROW_LAYOUT_RUNS - 2;
+        const layout_runs: { kind: 'source'; start: number; count: number }[] = [
+            { kind: 'source', start: BODY_START, count: 3 },
+            ...Array.from({ length: singles }, (_, index) => ({
+                kind: 'source' as const,
+                start: BODY_START + 3 + (index % 2 === 0 ? index + 1 : index - 1),
+                count: 1,
+            })),
+        ];
+        if (singles % 2 === 1) layout_runs[singles] = { kind: 'source', start: BODY_START + 3 + singles - 1, count: 1 };
+        const rows = BODY_START + 3 + singles;
+        const changes: PendingStructuralChanges = {
+            ...EMPTY,
+            rowLayout: { runs: layout_runs, removedSourceRows: [], discardedPendingRows: [] },
+        };
+        const ctx = context({
+            sourceRowCount: rows,
+            structuralBasis: {
+                kind: 'delimited', byteLength: 40, digest: 'abc', sourceRowCount: rows, sourceColumnCount: 2,
+            },
+        });
+        const seen = new Set<string>();
+        for (const [run, before] of [
+            // Splits the first run and adds one at the end: over.
+            [{ kind: 'source', start: BODY_START + 1, count: 1 }, 'end'],
+            // The first run whole to the end: no more runs.
+            [{ kind: 'source', start: BODY_START, count: 3 }, 'end'],
+            // Its last row: splits nothing apart in the middle.
+            [{ kind: 'source', start: BODY_START + 2, count: 1 }, 'end'],
+        ] as [RowSelectionRun, RowIdentity | 'end'][]) {
+            const expected = outcome(move_rows(changes, ctx, identities_of_runs([run]), before));
+            expect(outcome(probe_row_move_runs(changes, ctx, [run], before)), JSON.stringify([run, before])).toBe(expected);
+            seen.add(expected.split(':')[0]!);
+        }
+        expect([...seen]).toContain('too-many-runs');
     });
 });
