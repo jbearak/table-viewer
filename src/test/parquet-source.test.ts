@@ -45,7 +45,7 @@ interface ExpectedColumn {
 }
 
 function expected_of(name: string): { rows: number; columns: ExpectedColumn[] } {
-    const text = fs.readFileSync(path.join(FIXTURES, 'expected', `${name}.json`), 'utf8');
+    const text = fs.readFileSync(path.join(FIXTURES, path.dirname(name), 'expected', `${path.basename(name)}.json`), 'utf8');
     return JSON.parse(text, function (this: unknown, _key, value, context?: { source?: string }) {
         return Array.isArray(this) && typeof value === 'number' && context?.source !== undefined
             ? { number: context.source }
@@ -83,6 +83,19 @@ function utc_text(count: bigint, unit: string): string {
 }
 
 /**
+ * A count of `unit` since 1970 as ISO text in `zone`, with its offset and the
+ * unit's fraction digits, by Temporal (Node's own), not by Table Viewer's code.
+ */
+function zoned_text(count: bigint, unit: string, zone: string): string {
+    const temporal = (globalThis as unknown as {
+        Temporal: { Instant: { fromEpochNanoseconds(ns: bigint): { toZonedDateTimeISO(zone: string): { toString(options: object): string } } } };
+    }).Temporal;
+    const nanoseconds = count * 10n ** BigInt(9 - UNIT_DIGITS[unit]);
+    return temporal.Instant.fromEpochNanoseconds(nanoseconds).toZonedDateTimeISO(zone)
+        .toString({ fractionalSecondDigits: UNIT_DIGITS[unit] });
+}
+
+/**
  * Check one fixture column cell by cell against pyarrow's reading. Numbers,
  * text, and nulls are compared directly; dates, timestamps, times, decimals,
  * and binary values through the conversion rules here.
@@ -90,9 +103,11 @@ function utc_text(count: bigint, unit: string): string {
 async function check_column(
     column: ExpectedColumn,
     cells: RenderedCell[],
-    variable: { type: string; columnKind: string | null; timeZone?: string },
+    variable: { type: string; columnKind: string | null },
+    fixture = '',
 ): Promise<void> {
     const type = column.arrow_type;
+    expect(cells, column.name).toHaveLength(column.values.length);
     for (let row = 0; row < column.values.length; row++) {
         const value = column.values[row];
         const cell = cells[row];
@@ -107,8 +122,14 @@ async function check_column(
             continue;
         }
         if (Array.isArray(value)) {
-            // Bytes: the preview, and the identity is the sha256 of exactly these bytes.
             const bytes = value.map((byte) => Number((byte as { number: string }).number));
+            if (ENUM_COLUMNS.has(`${fixture}:${column.name}`)) {
+                // An ENUM: pyarrow reads bytes, Table Viewer the text they hold.
+                const text = Buffer.from(bytes).toString('utf8');
+                expect(cell, where).toMatchObject({ raw: text, rawType: 'string', formatted: text });
+                continue;
+            }
+            // Bytes: the preview, and the identity is the sha256 of exactly these bytes.
             expect(cell.raw, where).toBe(binary_preview(bytes));
             const digest = createHash('sha256').update(Uint8Array.from(bytes)).digest('hex');
             await expect(binary_key(cell), where).resolves.toBe(`stata-binary:sha256:${digest}:${bytes.length}`);
@@ -119,10 +140,13 @@ async function check_column(
                 expect(cell, where).toMatchObject({ raw: 'NaN', rawType: 'number', formatted: 'NaN' });
             } else if (type.startsWith('decimal')) {
                 // At most 15 digits: the nearest double; more: every digit, as text.
-                if (variable.columnKind === 'string') {
-                    expect(cell, where).toMatchObject({ rawType: 'number', formatted: value });
+                const precision = Number(/^decimal\d*\((\d+)/u.exec(type)![1]);
+                if (precision > 15) {
+                    expect(cell, where).toMatchObject({ raw: value, rawType: 'number', formatted: value });
                 } else {
+                    expect(cell.rawType, where).toBe('number');
                     expect(Number(cell.raw), where).toBe(Number(value));
+                    expect(cell.formatted, where).toBe(cell.raw);
                 }
             } else {
                 expect(cell, where).toMatchObject({ raw: value, rawType: 'string', formatted: value });
@@ -145,11 +169,10 @@ async function check_column(
             const days = Number(digits);
             expect(cell.formatted, where).toBe(new Date(days * 86_400_000).toISOString().slice(0, 10));
         } else if (type.startsWith('timestamp')) {
-            const unit = /timestamp\[(\w+)/u.exec(type)![1];
-            const utc = utc_text(BigInt(digits), unit);
-            if (variable.timeZone === undefined) expect(cell.formatted, where).toBe(utc);
-            else if (variable.timeZone === 'UTC') expect(cell.formatted, where).toBe(`${utc}+00:00[UTC]`);
-            else expect(cell.formatted, where).toMatch(new RegExp(`[+-]\\d\\d:\\d\\d\\[${variable.timeZone}\\]$`, 'u'));
+            // The zone pyarrow reads; none for a local timestamp.
+            const [, unit, zone] = /^timestamp\[(\w+)(?:, tz=([^\]]+))?\]/u.exec(type)!;
+            if (zone === undefined) expect(cell.formatted, where).toBe(utc_text(BigInt(digits), unit));
+            else expect(cell.formatted, where).toBe(zoned_text(BigInt(digits), unit, zone));
         } else if (type.startsWith('time')) {
             const unit = /time\d+\[(\w+)/u.exec(type)![1];
             expect(cell.formatted, where).toBe(utc_text(BigInt(digits), unit).slice(11));
@@ -161,17 +184,41 @@ async function check_column(
     }
 }
 
+/** Each fixture from another library, as its path under `FIXTURES` without `.parquet`. */
+const OTHER_LIBRARIES = ['', 'parquet-testing/'].flatMap((dir) => fs.readdirSync(path.join(FIXTURES, dir))
+    .filter((file) => file.endsWith('.parquet'))
+    .map((file) => `${dir}${file.slice(0, -'.parquet'.length)}`))
+    .filter((name) => name !== 'parquet-testing/int96_from_spark')
+    .sort();
+
+/** Columns stored as ENUM, which pyarrow reads as bytes: `fixture:column`. */
+const ENUM_COLUMNS = new Set(['hyparquet_default:kind', 'hyparquet_delta:kind']);
+
+/** The warnings a fixture gives when it opens; the others give none. */
+const WARNINGS: Record<string, string[]> = {
+    pyarrow_nested: ['3 columns are not shown: "tags" (a list, map, or struct), "point" (a list, map, or struct), "props" (a list, map, or struct).'],
+    'parquet-testing/datapage_v2.snappy': ['A column is not shown: "e" (a list, map, or struct).'],
+    'parquet-testing/nulls.snappy': ['A column is not shown: "b_struct" (a list, map, or struct).'],
+    'parquet-testing/repeated_no_annotation': ['A column is not shown: "phoneNumbers" (a list, map, or struct).'],
+    // UUID on an INT32: shown as the integers it stores, as pyarrow reads it.
+    'parquet-testing/int32_with_uuid_logical_type': [
+        'column "int32_uuid": its annotation does not fit its physical type, which is read instead (Cannot annotate Uuid from INT32 for field \'int32_uuid\')',
+    ],
+};
+
 describe('Parquet files from other libraries', () => {
-    it.each([
-        ['pyarrow_default', []],
-        ['pyarrow_nested', ['3 columns are not shown: "tags" (a list, map, or struct), "point" (a list, map, or struct), "props" (a list, map, or struct).']],
-        ['pyarrow_types', []],
-        ['pyarrow_delta', []],
-        ['polars_default', []],
-        ['duckdb_default', []],
-        ['arrow_r_default', []],
-        ['fastparquet_default', []],
-    ])('reads %s as pyarrow does', async (name, warnings) => {
+    it('has fixtures named for each writer', () => {
+        const writers = new Set(OTHER_LIBRARIES.map((name) => path.basename(name).split('_')[0]));
+        expect([...writers].sort()).toEqual(expect.arrayContaining([
+            'arrow', 'duckdb', 'fastparquet', 'hyparquet', 'nanoparquet', 'pandas', 'parquet', 'parquet2', 'polars', 'pyarrow',
+        ]));
+        expect(OTHER_LIBRARIES).toEqual(expect.arrayContaining([
+            'arrow_r_default', 'arrow_rs_default', 'arrow_go_default', 'parquet_go_default', 'parquet_jl_default', 'parquet2_default',
+        ]));
+    });
+
+    it.each(OTHER_LIBRARIES)('reads %s as pyarrow does', async (name) => {
+        const warnings = WARNINGS[name] ?? [];
         const expected = expected_of(name);
         const file = path.join(FIXTURES, `${name}.parquet`);
         const source = await FileParquetDataSource.open(file);
@@ -182,16 +229,30 @@ describe('Parquet files from other libraries', () => {
             expect(sheet.columnNames).toEqual(expected.columns.map((column) => column.name));
             expect(source.warnings).toEqual(warnings);
             const rows = all_rows(source);
+            expect(rows).toHaveLength(expected.rows);
             const reader = openParquet(new Uint8Array(fs.readFileSync(file)));
             const readable = reader.variables.filter((variable) => variable.columnKind !== null);
             for (const [k, column] of expected.columns.entries()) {
-                await check_column(column, rows.map((row) => row[k]), readable[k]);
+                await check_column(column, rows.map((row) => row[k]), readable[k], name);
             }
             reader.close();
             expect(strip(all_rows(buffered))).toEqual(strip(rows));
         } finally {
             source.close();
             buffered.close();
+        }
+    });
+});
+
+describe('Parquet files Table Viewer cannot show in full', () => {
+    it('names the row of an INT96 timestamp after 2262 rather than show a wrong date', async () => {
+        // Spark writes 9999-12-31 so; nanoseconds since 1970 hold only 1677 to 2262.
+        const source = await FileParquetDataSource.open(path.join(FIXTURES, 'parquet-testing', 'int96_from_spark.parquet'));
+        try {
+            expect(source.warnings).toEqual([]);
+            expect(() => source.read_rows(0, 0, 6)).toThrow(/the INT96 timestamp in row 3 is 253402225200 seconds from 1970/u);
+        } finally {
+            source.close();
         }
     });
 });

@@ -1,0 +1,1 @@
+{"rows":5,"columns":[{"name":"a","arrow_type":"string","values":["abc","abc","abc",null,"abc"]},{"name":"b","arrow_type":"int32","values":[1,2,3,4,5]},{"name":"c","arrow_type":"double","values":[2.0,3.0,4.0,5.0,2.0]},{"name":"d","arrow_type":"bool","values":[true,true,true,false,true]}],"nested":["e"]}

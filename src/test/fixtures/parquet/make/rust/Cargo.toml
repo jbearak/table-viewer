@@ -1,0 +1,9 @@
+[package]
+name = "make_rust"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+arrow = { version = "=60.1.0", default-features = false }
+parquet = { version = "=60.1.0", default-features = false, features = ["arrow", "snap", "zstd"] }
