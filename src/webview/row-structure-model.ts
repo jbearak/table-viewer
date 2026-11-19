@@ -57,6 +57,7 @@ import {
     insert_rows,
     MERGE_SPLIT_MESSAGE,
     move_rows,
+    probe_row_move_runs,
     restore_rows,
     source_cells_removed_by,
     structure_exclusivity_message,
@@ -488,6 +489,8 @@ export interface RowStructureMenuInput {
      * band's last row; absent when appending would be admitted.
      */
     readonly appendRefusal?: string;
+    /** For a menu that shows no Move items (the cell menu): skip their dry runs. */
+    readonly withoutMove?: boolean;
 }
 
 function item(count: number, reason: string | undefined): StructureItemModel {
@@ -514,8 +517,9 @@ export function row_structure_menu_model(input: RowStructureMenuInput): RowStruc
             : refusal_message(plan_row_delete_runs(changes, context, selection.runs!, new Map())));
     const insertAbove = insert_item(input, shared_reason, 'before');
     const insertBelow = insert_item(input, shared_reason, 'after');
-    const moveUp = row_move_item_model(input, 'backward');
-    const moveDown = row_move_item_model(input, 'forward');
+    const unasked: MoveItemModel = Object.freeze({ count, enabled: false });
+    const moveUp = input.withoutMove === true ? unasked : row_move_item_model(input, 'backward');
+    const moveDown = input.withoutMove === true ? unasked : row_move_item_model(input, 'forward');
     if (selection.removedCount === 0) {
         return Object.freeze({ insertAbove, insertBelow, delete: item(count, delete_reason), moveUp, moveDown });
     }
@@ -628,9 +632,10 @@ export function row_move_item_model(
         }
         return disabled(appended_rows(changes).length > 0 ? APPENDED_BAND_MESSAGE : MOVE_AT_BOTTOM_MESSAGE);
     }
-    // A dry run gives the refusal the gesture would get (merges, run limit).
-    const probe = plan_row_move(changes, context, selection.identities!, before);
-    if (!probe.ok) return disabled(probe.message);
+    // A dry run gives the refusal the gesture would get (merges, run limit),
+    // by the selection's runs: never one identity per selected row.
+    const probe = probe_row_move_runs(changes, context, selection.runs!, before);
+    if (!probe.ok) return disabled(probe.refusal.message);
     return Object.freeze({ count, enabled: true, before });
 }
 

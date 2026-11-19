@@ -824,6 +824,30 @@ function move_items(
         else selected_pending.add(entry.id);
     }
     if (selected_sources.length === 0 && selected_pending.size === 0) return no_live_entry(axis);
+    return move_selected(index, intervals_of_sorted(sorted_unique(selected_sources)), selected_pending, before, axis);
+}
+
+type MovedItemsResult =
+    | {
+        ok: true;
+        items: Item[];
+        /** The first and last live rows of the moved block, which is contiguous in `items`. */
+        first: AxisEntry;
+        last: AxisEntry;
+    }
+    | { ok: false; refusal: LayoutRefusal };
+
+/**
+ * Move the live entries `selected` (sorted, merged source intervals, all
+ * live) and `selected_pending` (live IDs), not both empty, to before `before`.
+ */
+function move_selected(
+    index: AxisIndexInternals,
+    selected: readonly SourceInterval[],
+    selected_pending: ReadonlySet<string>,
+    before: AxisEntry | 'end',
+    axis: AxisName,
+): MovedItemsResult {
     let before_source: number | undefined;
     let before_pending: string | undefined;
     if (before !== 'end') {
@@ -831,7 +855,6 @@ function move_items(
         if (before.kind === 'source') before_source = before.source;
         else before_pending = before.id;
     }
-    const selected = intervals_of_sorted(sorted_unique(selected_sources));
 
     // Split live source segments so each item is wholly selected or not and
     // `before` starts an item; mark every item moved or staying.
@@ -880,14 +903,29 @@ function move_items(
     while (target < items.length && (!items[target]!.live || items[target]!.moved)) target++;
     const out: Item[] = [];
     const moving = items.filter((item) => item.moved);
+    // A loop, not a spread: a fragmented layout can move more items than
+    // a call takes arguments.
+    const push_moving = () => {
+        for (const item of moving) out.push(item);
+    };
     items.forEach((item, at) => {
-        if (at === target) out.push(...moving);
+        if (at === target) push_moving();
         if (!item.moved) out.push(item);
     });
-    if (target >= items.length) out.push(...moving);
-    return { ok: true, items: out.map((item): Item => item.kind === 'source'
-        ? { kind: 'source', start: item.start, count: item.count, live: item.live }
-        : { kind: 'pending', id: item.id, live: item.live }) };
+    if (target >= items.length) push_moving();
+    const live_moving = moving.filter((item) => item.live);
+    if (live_moving.length === 0) return no_live_entry(axis);
+    const entry_at = (item: MovingItem, end: 'first' | 'last'): AxisEntry => item.kind === 'source'
+        ? { kind: 'source', source: end === 'first' ? item.start : item.start + item.count - 1 }
+        : { kind: 'pending', id: item.id };
+    return {
+        ok: true,
+        items: out.map((item): Item => item.kind === 'source'
+            ? { kind: 'source', start: item.start, count: item.count, live: item.live }
+            : { kind: 'pending', id: item.id, live: item.live }),
+        first: entry_at(live_moving[0]!, 'first'),
+        last: entry_at(live_moving[live_moving.length - 1]!, 'last'),
+    };
 }
 
 /**
@@ -1373,6 +1411,87 @@ export function move_rows(
         'row',
     );
     return result.ok ? row_result(layout, result.items) : result;
+}
+
+/** The source rows a row layout's body spans: `[start, end)`, empty when it has none. */
+function row_body_range(layout: RowLayout): { start: number; end: number } {
+    let start = Infinity;
+    let end = -Infinity;
+    for (const run of layout.runs) {
+        if (run.kind !== 'source') continue;
+        start = Math.min(start, run.start);
+        end = Math.max(end, run.start + run.count);
+    }
+    return { start, end };
+}
+
+/** A row move's result by `probe_row_move`. */
+export type RowMoveProbe =
+    | {
+        readonly ok: true;
+        readonly layout: RowLayout;
+        /** The live source rows that move, sorted and merged. */
+        readonly movedSources: readonly SourceInterval[];
+        /** The first and last live rows of the moved block, in the resulting layout's order. */
+        readonly first: RowIdentity;
+        readonly last: RowIdentity;
+    }
+    | { readonly ok: false; readonly refusal: LayoutRefusal };
+
+/**
+ * `move_rows` for a selection given as source intervals and Pending Row IDs,
+ * in proportion to its intervals rather than its rows: the same layout and
+ * the same refusals in the same order (an unknown row, then no live row,
+ * then an unknown `before`, then the run limit). Each interval must be
+ * whole rows inside the body (`count >= 1`); the intervals may come in any
+ * order but must not overlap.
+ */
+export function probe_row_move(
+    layout: RowLayout,
+    sources: readonly SourceInterval[],
+    pending_ids: readonly PendingRowId[],
+    before: RowIdentity | 'end',
+): RowMoveProbe {
+    const body = row_body_range(layout);
+    for (const entry of sources) {
+        if (
+            !Number.isSafeInteger(entry.start)
+            || !Number.isSafeInteger(entry.count)
+            || entry.count < 1
+            || !Number.isSafeInteger(entry.start + entry.count)
+            || entry.start < body.start
+            || entry.start + entry.count > body.end
+        ) return unknown_identity('row');
+    }
+    const index = row_index_internals(layout);
+    const live_pending = new Set<string>();
+    for (const id of pending_ids) {
+        const found = index.segment_index_of({ kind: 'pending', id });
+        if (found === undefined) return unknown_identity('row');
+        if (index.segments[found]!.status === 'live') live_pending.add(id);
+    }
+    const live_sources = subtract_intervals(canonical_intervals(sources), canonical_intervals(layout.removedSourceRows));
+    if (live_sources.length === 0 && live_pending.size === 0) return no_live_entry('row');
+    const result = move_selected(
+        index,
+        live_sources,
+        live_pending,
+        before === 'end' ? 'end' : ROW_CODEC.read(before),
+        'row',
+    );
+    if (!result.ok) return result;
+    const moved = row_result(layout, result.items);
+    if (!moved.ok) return moved;
+    const identity = (entry: AxisEntry): RowIdentity => entry.kind === 'source'
+        ? ROW_CODEC.source(entry.source)
+        : ROW_CODEC.pending(entry.id);
+    return {
+        ok: true,
+        layout: moved.layout,
+        movedSources: Object.freeze(live_sources),
+        first: identity(result.first),
+        last: identity(result.last),
+    };
 }
 
 /** Drop discarded Pending Inserted Rows no stored Formula Anchor names. */
