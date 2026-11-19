@@ -440,6 +440,27 @@ export const TOO_MANY_HIDDEN_ROWS_MESSAGE = 'Too many hidden rows to persist.';
  */
 export const MAX_PERSISTED_ROW_HEIGHTS = 10_000;
 
+/**
+ * The one sentence a refused `setRowHeights` says, whichever bound it hit, and
+ * a refused row auto-fit with it (the window says it: see `setSourceRowHeights`).
+ *
+ * There are two enforcement points and they cannot be merged — one counts the rows a
+ * single request names, before `map_display_rows_to_source` allocates against them; the
+ * other counts the map the file would end up holding, which only the durable state can
+ * answer. But they are the same bound and the same disappointment, so they say the same
+ * thing: a user who reached the limit by one select-all and a user who reached it by a
+ * hundred small drags have the identical problem and the identical remedy.
+ *
+ * Names the number, on `MAX_HIGHLIGHTED_CELLS_PER_FILE`'s wording ("A file may contain
+ * at most …"), because "too many" alone is a dead end — it tells the user they are over
+ * a line without telling them where the line is, and there is no UI that shows them how
+ * many custom heights the sheet already holds. Locale is pinned so the message is
+ * stable in tests and in every host's log.
+ */
+export const ROW_HEIGHT_LIMIT_WARNING =
+    'Too many resized rows to persist: a sheet may keep at most '
+    + `${MAX_PERSISTED_ROW_HEIGHTS.toLocaleString('en-US')} custom row heights.`;
+
 /** A run of consecutive canonical source rows and one height. `null`: no custom height. */
 export interface SourceRowHeightRun {
     readonly start: number;
@@ -3712,6 +3733,12 @@ export type HostMessage =
         applied: boolean;
         sourceGeneration: number;
         change?: RowHeightsChange;
+        /**
+         * An applied `setSourceRowHeights`: the source rows its write changed
+         * and what each held before, as `RowHeightsChange.before`. The window
+         * knows what it asked each row to hold.
+         */
+        changedRows?: readonly SourceRowHeightRun[];
         refused?: 'limit' | 'unresolved';
     }
     /**

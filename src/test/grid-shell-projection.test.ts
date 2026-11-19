@@ -185,6 +185,39 @@ vi.mock('../webview/glide-data-grid', () => {
         }),
         GridCellKind: { Text: 'text', Custom: 'custom' },
         direction: () => 'ltr',
+        getDefaultTheme: () => ({
+            lineHeight: 1.4,
+            cellHorizontalPadding: 8,
+            cellVerticalPadding: 3,
+            baseFontStyle: '13px',
+            fontFamily: 'sans-serif',
+        }),
+        // Both measure with the context's current font, which must be the one named.
+        getEmHeight: (ctx: { font: string }, font: string) => {
+            if (ctx.font !== font) throw new Error(`em measured in ${ctx.font}, not ${font}`);
+            return 13;
+        },
+        // 7px per character ("i" 2px): hard lines, each wrapped at whole characters.
+        splitMultiLineText: (ctx: { font: string }, data: string, font: string, width: number) => {
+            if (ctx.font !== font) throw new Error(`text measured in ${ctx.font}, not ${font}`);
+            return data.split('\n').flatMap((line) => {
+                const parts: string[] = [];
+                let current = '';
+                let current_width = 0;
+                for (const glyph of line) {
+                    const glyph_width = glyph === 'i' ? 2 : 7;
+                    if (current !== '' && current_width + glyph_width > width) {
+                        parts.push(current);
+                        current = '';
+                        current_width = 0;
+                    }
+                    current += glyph;
+                    current_width += glyph_width;
+                }
+                parts.push(current);
+                return parts;
+            });
+        },
     };
 });
 
@@ -8007,6 +8040,227 @@ describe('GridShell stable rows during an edit session', () => {
             [0, 0], { kind: 'text', data: huge }));
 
         expect(already_capped).not.toHaveBeenCalled();
+    });
+});
+
+describe('GridShell row auto-fit', () => {
+    // Column 0 is 100px wide (84px of text, 12 characters a line at 7px),
+    // column 2 is 200px (26 characters). Three lines need 3 × 18 + 8 = 62px
+    // (the tooltip's budget, above the painter's 13 + 1.4 × 13 × 2 + 6), two
+    // need 44px, and one keeps the 24px default.
+    const cells = (first: string, last = 'short') => [
+        { raw: first, formatted: first, bold: false, italic: false },
+        { raw: 'hidden', formatted: 'hidden', bold: false, italic: false },
+        { raw: last, formatted: last, bold: false, italic: false },
+    ];
+    const render_fit = async (
+        rows: Record<number, string | undefined>,
+        overrides: Partial<GridShellProps> = {},
+    ) => {
+        const canvas_context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+            .mockReturnValue({
+                font: '',
+                // As the split mock measures: 7px a glyph, "i" 2px.
+                measureText: (text: string) => ({
+                    width: [...text].reduce((width, glyph) => width + (glyph === 'i' ? 2 : 7), 0),
+                }),
+            } as unknown as CanvasRenderingContext2D);
+        onTestFinished(() => canvas_context.mockRestore());
+        grid_mock.get_row.mockImplementation(((row: number) => {
+            const text = rows[row];
+            return text === undefined ? undefined : cells(text);
+        }) as any);
+        const on_row_fit = vi.fn();
+        fit_props = props({
+            sheet_meta: { ...props().sheet_meta, rowCount: 4, sourceRowCount: 4 },
+            row_count: 4,
+            on_row_fit,
+            ...overrides,
+        });
+        fit_shell = await render_grid(fit_props);
+        return on_row_fit;
+    };
+    let fit_props: GridShellProps;
+    let fit_shell: Awaited<ReturnType<typeof render_grid>>;
+    /** One press on a row border, released without moving it. */
+    const click_border = (row: number, height = 24) => act(() => {
+        window.dispatchEvent(new Event('pointerdown'));
+        (grid_mock.row_resize_props!.on_resize_start as (row: number, height: number) => void)(row, height);
+        (grid_mock.row_resize_props!.on_resize_end as (row: number, height: number) => void)(row, height);
+    });
+    /** The double-click itself, landing at `client_y` (the mocked grid puts every row's bottom at 46). */
+    const fit = (row: number, client_y = 46) => act(() =>
+        (grid_mock.row_resize_props!.on_fit as (row: number, client_y: number) => void)(row, client_y));
+    const double_click_border = (row: number, height = 24) => {
+        click_border(row, height);
+        click_border(row, height);
+        fit(row);
+    };
+    const select_rows = (rows: number[]) => act(() =>
+        (grid_mock.props!.onGridSelectionChange as (selection: unknown) => void)({
+            columns: compact([]),
+            rows: compact(rows),
+        }));
+
+    it('fits the row to the lines its cells paint, written by source row', async () => {
+        // Display row 1 is source row 3.
+        grid_mock.source_row_for_display = (display_row: number) => [2, 3, 0, 1][display_row];
+        const on_row_fit = await render_fit({ 0: 'a', 1: 'x'.repeat(30), 2: 'b', 3: 'c' });
+        double_click_border(1);
+        expect(on_row_fit).toHaveBeenCalledExactlyOnceWith(
+            [{ start: 3, end: 3, height: 62 }],
+            undefined,
+        );
+    });
+
+    it('fits every selected row to its own height, shrinking a row that fits the default', async () => {
+        const on_row_fit = await render_fit(
+            { 0: 'a', 1: 'x'.repeat(30), 2: 'two\nlines', 3: 'c' },
+            { row_heights: { 0: 80 } },
+        );
+        await select_rows([0, 1, 2]);
+        double_click_border(1);
+        expect(on_row_fit).toHaveBeenCalledExactlyOnceWith([
+            // At the default, the row keeps no custom height.
+            { start: 0, end: 0, height: null },
+            { start: 1, end: 1, height: 62 },
+            { start: 2, end: 2, height: 44 },
+        ], undefined);
+    });
+
+    it('keeps a row tall enough to wrap when one line would be cut at a quarter of its width in characters', async () => {
+        // 30 narrow glyphs fit 84px on one line, but the one-line painter
+        // draws at most 100 / 4 = 25 characters.
+        const on_row_fit = await render_fit({ 0: 'i'.repeat(30), 1: 'i'.repeat(25), 2: 'c', 3: 'd' });
+        await select_rows([0, 1]);
+        double_click_border(0);
+        expect(on_row_fit).toHaveBeenCalledExactlyOnceWith([
+            { start: 0, end: 0, height: 44 },
+            { start: 1, end: 1, height: null },
+        ], undefined);
+    });
+
+    it('gives blank lines after the last visible one no room', async () => {
+        const on_row_fit = await render_fit({ 0: 'a\n', 1: 'a\n\n  ', 2: 'a\n\nb', 3: 'd' });
+        await select_rows([0, 1, 2]);
+        double_click_border(0);
+        expect(on_row_fit).toHaveBeenCalledExactlyOnceWith([
+            { start: 0, end: 1, height: null },
+            { start: 2, end: 2, height: 62 },
+        ], undefined);
+    });
+
+    it('keeps the default for text that paints whole there, reaching into the right padding', async () => {
+        // 13 × 7 = 91px: two lines at the 84px wrap width, but whole at the
+        // default height, where it is clipped only at the cell's 92px edge.
+        const on_row_fit = await render_fit({ 0: 'x'.repeat(13), 1: 'x'.repeat(14), 2: 'c', 3: 'd' });
+        await select_rows([0, 1]);
+        double_click_border(0);
+        expect(on_row_fit).toHaveBeenCalledExactlyOnceWith([
+            { start: 0, end: 0, height: null },
+            { start: 1, end: 1, height: 44 },
+        ], undefined);
+    });
+
+    it('lets one line keep the default height when Auto-fit Columns has the default height wrap', async () => {
+        const on_row_fit = await render_fit({ 0: 'i'.repeat(30), 1: 'b', 2: 'c', 3: 'd' }, { auto_fit_active: true });
+        double_click_border(0);
+        expect(on_row_fit).toHaveBeenCalledExactlyOnceWith([{ start: 0, end: 0, height: null }], undefined);
+    });
+
+    it('fits only the row whose border it was when that row is not selected', async () => {
+        const on_row_fit = await render_fit({ 0: 'x'.repeat(30), 1: 'x'.repeat(30), 2: 'b', 3: 'c' });
+        await select_rows([2, 3]);
+        double_click_border(0);
+        expect(on_row_fit).toHaveBeenCalledExactlyOnceWith(
+            [{ start: 0, end: 0, height: 62 }],
+            undefined,
+        );
+    });
+
+    it('is not a double-click after a drag, or with a press elsewhere between the clicks', async () => {
+        const on_row_fit = await render_fit({ 0: 'x'.repeat(30), 1: 'b', 2: 'c', 3: 'd' });
+        // A drag that came back to where it started is still a drag.
+        act(() => {
+            window.dispatchEvent(new Event('pointerdown'));
+            (grid_mock.row_resize_props!.on_resize_start as (row: number, height: number) => void)(0, 24);
+            (grid_mock.row_resize_props!.on_resize as (row: number, height: number) => void)(0, 40);
+            (grid_mock.row_resize_props!.on_resize as (row: number, height: number) => void)(0, 24);
+            (grid_mock.row_resize_props!.on_resize_end as (row: number, height: number) => void)(0, 24);
+        });
+        click_border(0);
+        fit(0);
+        click_border(0);
+        act(() => window.dispatchEvent(new Event('pointerdown')));
+        click_border(0);
+        fit(0);
+        // Clicks on two different borders.
+        click_border(1);
+        click_border(0);
+        fit(0);
+        expect(on_row_fit).not.toHaveBeenCalled();
+        double_click_border(0);
+        expect(on_row_fit).toHaveBeenCalledOnce();
+    });
+
+    it('skips rows that are not loaded, and says how many', async () => {
+        const on_row_fit = await render_fit({ 0: 'a', 1: 'x'.repeat(30) });
+        await select_rows([1, 2, 3]);
+        double_click_border(1);
+        expect(on_row_fit).toHaveBeenCalledExactlyOnceWith(
+            [{ start: 1, end: 1, height: 62 }],
+            undefined,
+        );
+        expect(grid_mock.post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: 'Auto-fit skipped 2 rows that are not loaded. Scroll to them and try again.',
+        });
+    });
+
+    it('takes the border strip down when the grid scrolls under a still pointer', async () => {
+        await render_fit({ 0: 'a', 1: 'b', 2: 'c', 3: 'd' });
+        grid_mock.row_resize_set_target.mockClear();
+        // Glide scrolls an element inside the root; scroll does not bubble.
+        const root_element = container!.querySelector('.grid-shell-root')!;
+        // An editor's text scrolling inside the grid moves no row.
+        const textarea = document.createElement('textarea');
+        root_element.appendChild(textarea);
+        act(() => textarea.dispatchEvent(new Event('scroll')));
+        expect(grid_mock.row_resize_set_target).not.toHaveBeenCalled();
+        const scroller = document.createElement('div');
+        scroller.className = 'dvn-scroller';
+        root_element.appendChild(scroller);
+        act(() => scroller.dispatchEvent(new Event('scroll')));
+        expect(grid_mock.row_resize_set_target).toHaveBeenCalledWith(null);
+    });
+
+    it('fits only while the row\'s border is under the double-click, and drops a strip that is out of date', async () => {
+        const on_row_fit = await render_fit({ 0: 'x'.repeat(30), 1: 'b', 2: 'c', 3: 'd' });
+        grid_mock.row_resize_set_target.mockClear();
+        // Row 0 ends at 46 now, after an undo under a still pointer at 70.
+        click_border(0);
+        click_border(0);
+        fit(0, 70);
+        expect(on_row_fit).not.toHaveBeenCalled();
+        expect(grid_mock.row_resize_set_target).toHaveBeenCalledWith(null);
+        // Its border moved 3px (inside the strip): the double-click is on it.
+        click_border(0);
+        click_border(0);
+        fit(0, 49);
+        expect(on_row_fit).toHaveBeenCalledOnce();
+        // A grid that cannot say where the row is fits nothing.
+        grid_mock.get_bounds.mockImplementation(() => undefined);
+        double_click_border(0);
+        expect(on_row_fit).toHaveBeenCalledOnce();
+    });
+
+    it('fits nothing when the gesture may not start', async () => {
+        const on_row_fit = await render_fit(
+            { 0: 'x'.repeat(30), 1: 'b', 2: 'c', 3: 'd' },
+            { size_gesture_may_start: () => false },
+        );
+        double_click_border(0);
+        expect(on_row_fit).not.toHaveBeenCalled();
     });
 });
 

@@ -13,6 +13,7 @@ import {
     column_widths_view_step,
     columns_replay_target,
     columns_view_step,
+    row_fit_view_step,
     row_heights_replay_target,
     row_heights_view_step,
     header_replay_target,
@@ -496,6 +497,68 @@ describe('a row-height write as a view step', () => {
         });
         expect(row_heights_replay_target(delta, 'redo', 0)).toEqual({
             rows: [],
+            skipped: ['rows-gone'],
+        });
+    });
+});
+
+describe('a row auto-fit as a view step', () => {
+    const requested = [
+        { start: 0, end: 2, height: 60 },
+        { start: 3, end: 4, height: null },
+        { start: 7, end: 7, height: 42 },
+    ];
+
+    it('records each changed row\'s own height, and only the rows the write changed', () => {
+        // Rows 1 and 7 already held what the fit asked: the host left them out.
+        const step = row_fit_view_step(SHEET, requested, [
+            { start: 0, end: 0, height: null },
+            { start: 2, end: 3, height: 30 },
+            { start: 4, end: 4, height: 50 },
+        ]);
+        expect(step).toEqual({
+            label: 'Auto-fit 4 row heights',
+            delta: {
+                worksheet: SHEET,
+                slice: 'rowHeights',
+                after: [
+                    { start: 0, end: 0, height: 60 },
+                    { start: 2, end: 2, height: 60 },
+                    { start: 3, end: 4, height: null },
+                ],
+                before: [
+                    { start: 0, end: 0, height: null },
+                    { start: 2, end: 3, height: 30 },
+                    { start: 4, end: 4, height: 50 },
+                ],
+            },
+        });
+        expect(row_fit_view_step(SHEET, requested, [{ start: 7, end: 7, height: null }])?.label)
+            .toBe('Auto-fit row height');
+        expect(row_fit_view_step(SHEET, requested, [])).toBeUndefined();
+    });
+
+    it('undoes each row to what it held and redoes each to its own fitted height', () => {
+        const step = row_fit_view_step(SHEET, requested, [
+            { start: 1, end: 3, height: 30 },
+            { start: 7, end: 7, height: null },
+        ]);
+        if (step?.delta.slice !== 'rowHeights') throw new Error('expected a row-height step');
+        expect(row_heights_replay_target(step.delta, 'undo', 100)).toEqual({
+            rows: [{ start: 1, end: 3, height: 30 }, { start: 7, end: 7, height: null }],
+            skipped: [],
+        });
+        expect(row_heights_replay_target(step.delta, 'redo', 100)).toEqual({
+            rows: [
+                { start: 1, end: 2, height: 60 },
+                { start: 3, end: 3, height: null },
+                { start: 7, end: 7, height: 42 },
+            ],
+            skipped: [],
+        });
+        // Redo clips to the rows the worksheet still has.
+        expect(row_heights_replay_target(step.delta, 'redo', 3)).toEqual({
+            rows: [{ start: 1, end: 2, height: 60 }],
             skipped: ['rows-gone'],
         });
     });

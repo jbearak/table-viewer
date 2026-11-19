@@ -533,6 +533,79 @@ test('Reset row height is a step, undone and redone', async () => {
     await expect(plain).toHaveCount(0);
 });
 
+/** A sheet whose Notes need more than one line in a 120 px column: row 1 many, row 2 two. */
+const NOTES_CSV = [
+    'Name,Age,Notes',
+    'Alice,30,short',
+    'Bob,25,"A long note that cannot fit on one line of a column only one hundred and twenty pixels wide"',
+    'Charlie,35,"two\nlines"',
+    'Dora,28,Oslo',
+].join('\n') + '\n';
+
+/** Double-click the bottom border of a row, over a cell of the first column. */
+async function double_click_row_border(page: Page, shown: Layout, line: number): Promise<void> {
+    const box = await canvas_box(page);
+    const x = box.x + left_of(shown, 0) + 40;
+    const y = box.y + top_of(shown, line) + shown.heights[line] - 2;
+    await page.mouse.move(x, y + 12);
+    await page.mouse.move(x, y);
+    await expect(page.locator('.row-resize-strip')).toBeVisible();
+    await page.mouse.dblclick(x, y);
+    last_probe = undefined;
+}
+
+/** Wait for the file to remember `count` custom heights, and return them ascending. */
+async function stored_heights(file: string, count: number): Promise<number[]> {
+    let heights: number[] = [];
+    await expect.poll(() => {
+        heights = stored(file)?.heights ?? [];
+        return heights.length;
+    }, { message: `${count} custom heights are stored` }).toBe(count);
+    return heights;
+}
+
+test('a double-clicked row border fits the row to its wrapped text, one step undone and redone', async () => {
+    watch([], [1]);
+    const { file, page } = await open_file('fit-row.csv', NOTES_CSV);
+    await expect_sizes(page, file, { stored: NOTHING, shown: layout(), undo: 'Undo', redo: 'Redo' });
+
+    await double_click_row_border(page, layout(), 1);
+    const [fitted] = await stored_heights(file, 1);
+    // Several lines of wrapped text: well past two lines' 44 px.
+    expect(fitted).toBeGreaterThan(80);
+    const fit = { stored: { widths: {}, heights: [fitted] }, shown: layout([], [24, fitted]) };
+    await expect_sizes(page, file, { ...fit, undo: 'Undo Auto-fit row height', redo: 'Redo' });
+    await expect(save_button(page)).not.toHaveClass(/has-unsaved/);
+
+    await history(page, 'undo');
+    await expect_sizes(page, file, { stored: NOTHING, shown: layout(), undo: 'Undo', redo: 'Redo Auto-fit row height' });
+    await history(page, 'redo');
+    await expect_sizes(page, file, { ...fit, undo: 'Undo Auto-fit row height', redo: 'Redo' });
+});
+
+test('a double-clicked border of a selected row fits every selected row to its own height', async () => {
+    watch([], [0, 1, 2]);
+    const { file, page } = await open_file('fit-rows.csv', NOTES_CSV);
+    // Row 0 dragged taller first: its one line fits the default, so the fit shrinks it back.
+    await drag_row_border(page, layout(), 0, 30);
+    const dragged = { stored: { widths: {}, heights: [54] }, shown: layout([], [54]) };
+    await expect_sizes(page, file, { ...dragged, undo: 'Undo Resize row', redo: 'Redo' });
+
+    await click_row_marker(page, dragged.shown, 0);
+    await click_row_marker(page, dragged.shown, 2, true);
+    await double_click_row_border(page, dragged.shown, 2);
+    const [two_lines, fitted] = await stored_heights(file, 2);
+    expect(two_lines).toBe(44);
+    expect(fitted).toBeGreaterThan(80);
+    const fit = { stored: { widths: {}, heights: [44, fitted] }, shown: layout([], [24, fitted, 44]) };
+    await expect_sizes(page, file, { ...fit, undo: 'Undo Auto-fit 3 row heights', redo: 'Redo' });
+
+    await history(page, 'undo');
+    await expect_sizes(page, file, { ...dragged, undo: 'Undo Resize row', redo: 'Redo Auto-fit 3 row heights' });
+    await history(page, 'redo');
+    await expect_sizes(page, file, { ...fit, undo: 'Undo Auto-fit 3 row heights', redo: 'Redo' });
+});
+
 test('a row border reached from inside its own cell offers the drag', async () => {
     watch([], [1]);
     const { file, page } = await open_file('inside.csv', CSV);

@@ -28,6 +28,10 @@ import {
     type Item,
     type ProvideEditorCallback,
     type Rectangle,
+    direction,
+    getDefaultTheme,
+    getEmHeight,
+    splitMultiLineText,
 } from './glide-data-grid';
 import type { RenderedCell, SheetMeta } from '../data-source/interface';
 import {
@@ -48,6 +52,7 @@ import {
     type SheetCellHighlightState,
     type SheetTransformState,
     type SortDirection,
+    type SourceRowHeightRun,
     type WorksheetTarget,
     type WorksheetPendingChanges,
 } from '../types';
@@ -164,7 +169,18 @@ function next_value_edit_order(after_order = 0): number {
     last_value_edit_order = next;
     return last_value_edit_order;
 }
-import { is_rich_text_cell, rich_text_cell_renderer } from './rich-text-cell-renderer';
+import {
+    is_rich_text_cell,
+    rich_cell_fit,
+    rich_text_cell_renderer,
+} from './rich-text-cell-renderer';
+import {
+    fit_row_height,
+    lines_to_last_visible,
+    source_height_runs,
+    type FittedSourceRow,
+    type MeasuredCell,
+} from './fit-row-model';
 import { parse_http_external_url } from '../external-url';
 import type { CellHyperlink } from '../cell-content';
 import { HyperlinkDialog, type HyperlinkDialogHandle } from './hyperlink-dialog';
@@ -1497,6 +1513,42 @@ interface RowResizePreview {
     height: number;
     /** `pending_selection_topology_key` as the drag began: which row a display index names. */
     topology_key: string;
+    /** Which press in the window this is: see `window_press_count_ref`. */
+    ordinal: number;
+    /** The border moved at some point of the press, even if it came back. */
+    moved: boolean;
+}
+
+/** A finished press on a row border, for telling a double-click from two drags. */
+interface RowBorderPress {
+    readonly row: number;
+    readonly moved: boolean;
+    readonly topology_key: string;
+    readonly ordinal: number;
+}
+
+/**
+ * Whether the last two presses on a row border were a double-click on `row`'s
+ * border, the rule `border_was_double_clicked` keeps for columns: both on
+ * it, neither moving it, no other press anywhere in between, and both on the
+ * rows `topology_key` names now (an insert or an undo between the clicks can
+ * put another row at that index).
+ */
+function row_border_was_double_clicked(
+    presses: readonly RowBorderPress[],
+    row: number,
+    topology_key: string,
+): boolean {
+    const [last, previous] = presses;
+    return last !== undefined
+        && previous !== undefined
+        && !last.moved
+        && !previous.moved
+        && last.row === row
+        && previous.row === row
+        && last.topology_key === topology_key
+        && previous.topology_key === topology_key
+        && last.ordinal === previous.ordinal + 1;
 }
 
 export interface GridShellProps {
@@ -1605,6 +1657,16 @@ export interface GridShellProps {
             readonly gesture: boolean;
             readonly on_result?: (applied: boolean) => void;
         },
+    ) => void;
+    /**
+     * A row auto-fit (a double-click on a row border), as ascending runs of
+     * source rows each with its own height (`null`: the row fits the default
+     * and keeps no custom height). By source row because only resident rows
+     * are fitted, and the grid knows theirs. A step in undo history.
+     */
+    on_row_fit?: (
+        runs: readonly SourceRowHeightRun[],
+        on_result?: (applied: boolean) => void,
     ) => void;
     merges: MergeRange[];
     preview_mode?: boolean;
@@ -1925,6 +1987,7 @@ export function GridShell({
     row_heights,
     row_height_overlay,
     on_row_resize,
+    on_row_fit,
     merges,
     preview_mode = false,
     editing_session_held = false,
@@ -2087,6 +2150,8 @@ export function GridShell({
     const grid_root_ref = useRef<HTMLDivElement | null>(null);
     const row_resize_ref = useRef<RowResizeOverlayHandle | null>(null);
     const row_resize_preview_ref = useRef<RowResizePreview | null>(null);
+    /** The last two finished presses on a row border, newest first. */
+    const row_border_presses_ref = useRef<readonly RowBorderPress[]>([]);
     const [row_resize_preview, set_row_resize_preview] =
         useState<RowResizePreview | null>(null);
     const visible_ref = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
@@ -2711,6 +2776,52 @@ export function GridShell({
         const record = history_capture.history.stage_record({ label, changes });
         commit_staged_transaction([record]);
     }, [history_capture]);
+    /**
+     * Give Pending Rows their heights (by Pending Row ID) together with the
+     * saved rows' write that `post` makes, all or nothing.
+     *
+     * `post` is handed the commit of the Pending Rows half when there is one,
+     * to call with the host's answer, and says whether it posted anything;
+     * when it did not, the Pending Rows half commits at once. Pending Row
+     * heights are view state, stored without a step in undo history.
+     */
+    const write_row_heights_with_pending_rows = useCallback((
+        pending_heights: ReadonlyMap<string, number>,
+        post: (on_result?: (applied: boolean) => void) => boolean,
+    ): void => {
+        if (pending_heights.size === 0) {
+            post();
+            return;
+        }
+        const before = pending_store.snapshot();
+        const after: PendingStructuralChanges = {
+            ...before,
+            appendedRows: stored_pending_rows(before).map((row) => {
+                const height = pending_heights.get(row.id);
+                return height === undefined ? row : { ...row, viewerRowHeight: height };
+            }),
+        };
+        // Stage first. This is both envelope preflight and the compare-and-swap
+        // reservation that keeps a mixed source/pending resize all-or-nothing.
+        const refusal_before = envelope_refusal_sequence_ref.current;
+        const pending_stage = pending_store.stage_replace(edit_session_id, before, after);
+        if (pending_stage === undefined) {
+            if (envelope_refusal_sequence_ref.current !== refusal_before) {
+                show_pending_size_warning();
+            }
+            return;
+        }
+        const finish = (applied: boolean): void => {
+            if (!applied || !pending_stage.valid()) return;
+            pending_stage.commit();
+            pending_stage.notify();
+        };
+        if (!post(finish)) finish(true);
+    }, [
+        edit_session_id,
+        pending_store,
+        show_pending_size_warning,
+    ]);
     const apply_row_resize = useCallback((
         intervals: readonly DisplayRowInterval[],
         height: number,
@@ -2758,44 +2869,22 @@ export function GridShell({
         const source_intervals = projection.source_display_intervals(
             compressed_source_intervals,
         );
-        if (pending_ids.size === 0) {
-            if (source_intervals.length > 0) on_row_resize(source_intervals, height, { gesture });
-            return;
-        }
-        const before = pending_store.snapshot();
-        const after: PendingStructuralChanges = {
-            ...before,
-            appendedRows: stored_pending_rows(before).map((row) => pending_ids.has(row.id)
-                ? { ...row, viewerRowHeight: height }
-                : row),
-        };
-        // Stage first. This is both envelope preflight and the compare-and-swap
-        // reservation that keeps a mixed source/pending resize all-or-nothing.
-        const refusal_before = envelope_refusal_sequence_ref.current;
-        const pending_stage = pending_store.stage_replace(edit_session_id, before, after);
-        if (pending_stage === undefined) {
-            if (envelope_refusal_sequence_ref.current !== refusal_before) {
-                show_pending_size_warning();
-            }
-            return;
-        }
-        const finish = (applied: boolean): void => {
-            if (!applied || !pending_stage.valid()) return;
-            pending_stage.commit();
-            pending_stage.notify();
-        };
-        if (source_intervals.length > 0) {
-            on_row_resize(source_intervals, height, { gesture, on_result: finish });
-        } else {
-            finish(true);
-        }
+        write_row_heights_with_pending_rows(
+            new Map([...pending_ids].map((id) => [id, height])),
+            (on_result) => {
+                if (source_intervals.length === 0) return false;
+                on_row_resize(source_intervals, height, {
+                    gesture,
+                    ...(on_result === undefined ? {} : { on_result }),
+                });
+                return true;
+            },
+        );
     }, [
-        edit_session_id,
         gestures_admitted,
         on_row_resize,
-        pending_store,
-        show_pending_size_warning,
         size_gesture_may_start,
+        write_row_heights_with_pending_rows,
     ]);
     const has_row_layout = pending_rows.rowLayout !== undefined;
     /**
@@ -10669,6 +10758,9 @@ export function GridShell({
             start_height: height,
             height,
             topology_key: pending_selection_topology_key_ref.current,
+            // Counted in the capture phase, before this press reached the strip.
+            ordinal: window_press_count_ref.current,
+            moved: false,
         };
         row_resize_preview_ref.current = preview;
     }, []);
@@ -10677,7 +10769,7 @@ export function GridShell({
         (row: number, height: number) => {
             const current = row_resize_preview_ref.current;
             if (!current || current.row !== row || current.height === height) return;
-            const preview = { ...current, height };
+            const preview = { ...current, height, moved: true };
             row_resize_preview_ref.current = preview;
             set_row_resize_preview(preview);
             const visible = visible_ref.current;
@@ -10711,6 +10803,17 @@ export function GridShell({
         const preview = row_resize_preview_ref.current;
         row_resize_preview_ref.current = null;
         set_row_resize_preview(null);
+        if (preview) {
+            row_border_presses_ref.current = [
+                {
+                    row: preview.row,
+                    moved: preview.moved || height !== preview.start_height,
+                    topology_key: preview.topology_key,
+                    ordinal: preview.ordinal,
+                },
+                ...row_border_presses_ref.current.slice(0, 1),
+            ];
+        }
         if (!preview || preview.row !== row || height === preview.start_height) return;
         // The drag names rows by display index, the dragged one and the row
         // selection it resizes with, and resolves them only now. If another
@@ -10738,6 +10841,243 @@ export function GridShell({
             : null;
         apply_row_resize(selected ?? [{ start: row, end: row }], height, 'gesture');
     }, [apply_row_resize]);
+
+    /**
+     * Fit rows to the lines their cells paint: a double-click on `row`'s
+     * border fits `row`, or every selected row when the selection holds it,
+     * each to its own height. Shrinks as well as grows.
+     *
+     * Measures what the grid paints (`get_cell_content`: edits, formula
+     * results, Pending Rows and Columns, Diff and Git compare text), split
+     * into lines the way the painters split it once the row is tall enough to
+     * wrap, at each column's width. Synchronous from the gate to the write,
+     * so the display rows cannot move under it. Only rows whose content is
+     * loaded can be measured; the rest are left as they are and counted in a
+     * warning, as Copy does.
+     */
+    const fit_row_heights = useCallback((row: number): void => {
+        if (on_row_fit === undefined) return;
+        // App folds an open editor first. What the fold commits renders
+        // before anything is measured, and the measuring is done by this
+        // render's callbacks, which paint it.
+        if (size_gesture_may_start !== undefined && !size_gesture_may_start()) return;
+        flushSync(() => {});
+        fit_rows_now_ref.current(row);
+    }, [on_row_fit, size_gesture_may_start]);
+    /** `fit_row_heights` past its gate, measuring with the cells this render paints. */
+    const fit_rows_now = useCallback((row: number): void => {
+        if (on_row_fit === undefined) return;
+        const projection = pending_projection_ref.current;
+        const selected_rows = grid_selection_ref.current.rows;
+        const intervals = selected_rows.hasIndex(row)
+            ? selected_display_row_intervals(
+                { columns: CompactSelection.empty(), rows: selected_rows },
+                projection.rowCount,
+            ) ?? [{ start: row, end: row }]
+            : [{ start: row, end: row }];
+        if (!measure_ctx_ref.current) {
+            measure_ctx_ref.current = document.createElement('canvas').getContext('2d');
+        }
+        const ctx = measure_ctx_ref.current;
+        if (!ctx) return;
+        const glide_theme = { ...getDefaultTheme(), ...theme };
+        const em_by_font = new Map<string, number>();
+        const em_of = (font: string): number => {
+            let em = em_by_font.get(font);
+            if (em === undefined) {
+                // Measured with the context's current font, and cached under
+                // `font` for the painters too: the font must be this one.
+                ctx.font = font;
+                em = getEmHeight(ctx, font);
+                em_by_font.set(font, em);
+            }
+            return em;
+        };
+        const metrics = {
+            em_height: em_of(`${glide_theme.baseFontStyle} ${glide_theme.fontFamily}`),
+            line_height_ratio: glide_theme.lineHeight,
+            cell_vertical_padding: glide_theme.cellVerticalPadding,
+            tooltip_line_height: line_height_for_font(font_size_px),
+            default_row_height,
+        };
+        const padding = glide_theme.cellHorizontalPadding;
+        const measure_cell = (display_row: number, display_column: number): MeasuredCell => {
+            const cell = get_cell_content([display_column, display_row]);
+            const width = get_cell_width(display_row, display_column);
+            const available = Math.max(0, width - 2 * padding);
+            // Whether a cell paints all of its text at the default height. It
+            // wraps there only with Auto-fit Columns on (a Text cell also on a
+            // line break); otherwise it paints its value on one line, cut at a
+            // quarter of its width in characters (both painters do, to bound
+            // the work of a huge value) and clipped at the cell's edge.
+            if (cell.kind === GridCellKind.Text) {
+                const text = cell.displayData;
+                if (text === '') return { lines: 1, fits_default: true };
+                // The Text cell paints in its own font (bold or italic), and
+                // takes its line metric from that font too.
+                const font = `${cell.themeOverride?.baseFontStyle ?? glide_theme.baseFontStyle} ${glide_theme.fontFamily}`;
+                // Measured in the context's font and direction, as the Text
+                // cell paints: right to left for right-to-left text.
+                ctx.font = font;
+                let lines: number;
+                let fits_default: boolean;
+                try {
+                    ctx.direction = direction(text) === 'rtl' ? 'rtl' : 'inherit';
+                    lines = lines_to_last_visible(
+                        splitMultiLineText(ctx, text, font, available),
+                        (line) => /\S/.test(line),
+                    );
+                    if (auto_fit_active || has_line_break(text)) {
+                        fits_default = lines <= 1;
+                    } else {
+                        // Glide's truncateString keeps `slice(0, width / 4)`,
+                        // and drawTextCell takes the direction from that.
+                        const drawn = text.slice(0, width / 4);
+                        const visible_past_cut = /\S/g;
+                        visible_past_cut.lastIndex = drawn.length;
+                        ctx.direction = direction(drawn) === 'rtl' ? 'rtl' : 'inherit';
+                        // Drawn from the left padding, clipped at the cell's edge.
+                        fits_default = !visible_past_cut.test(text)
+                            && ctx.measureText(drawn.trimEnd()).width <= width - padding;
+                    }
+                } finally {
+                    ctx.direction = 'inherit';
+                }
+                return { lines, fits_default, em_height: em_of(font) };
+            }
+            if (cell.kind === GridCellKind.Custom && is_rich_text_cell(cell)) {
+                // The rich renderer takes its line metric from the base font.
+                return rich_cell_fit(ctx, cell.data, width, padding, glide_theme.fontFamily, auto_fit_active);
+            }
+            return { lines: 1, fits_default: true };
+        };
+        const fitted_height = (display_row: number): number => {
+            const counts: MeasuredCell[] = [];
+            let keep_at_least: number | undefined;
+            for (let display_column = 0; display_column < display_column_count; display_column += 1) {
+                const merge = merge_index.entry_at(display_row, display_column);
+                if (merge !== null) {
+                    // A vertical merge paints across rows this fit does not
+                    // size: the row keeps at least the height it has.
+                    if (merge.endRow > merge.startRow) {
+                        keep_at_least = effective_row_height(display_row, false);
+                        continue;
+                    }
+                    if (merge.startCol !== display_column) continue;
+                }
+                counts.push(measure_cell(display_row, display_column));
+            }
+            return fit_row_height(counts, metrics, keep_at_least);
+        };
+        const source_rows: FittedSourceRow[] = [];
+        const pending_heights = new Map<string, number>();
+        let skipped = 0;
+        for (const interval of intervals) {
+            for (let display_row = interval.start; display_row <= interval.end; display_row += 1) {
+                const projected = projection.row_at(display_row);
+                if (projected?.kind === 'removal') continue;
+                if (projected?.kind === 'pending' || projected?.kind === 'replacement') {
+                    if (!pending_rendered_rows.has(projected.row.id)) {
+                        skipped += 1;
+                        continue;
+                    }
+                    pending_heights.set(projected.row.id, fitted_height(display_row));
+                    continue;
+                }
+                const source_display_row = projected?.sourceDisplayRow ?? display_row;
+                const source_row = get_row(source_display_row) === undefined
+                    ? undefined
+                    : projected?.identity?.sourceRow ?? get_source_row(source_display_row);
+                if (source_row === undefined) {
+                    skipped += 1;
+                    continue;
+                }
+                const height = fitted_height(display_row);
+                source_rows.push({
+                    source_row,
+                    // At the default, the row keeps no custom height.
+                    height: height === default_row_height ? null : height,
+                });
+            }
+        }
+        if (skipped > 0) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: skipped === 1
+                    ? 'Auto-fit skipped 1 row that is not loaded. Scroll to it and try again.'
+                    : `Auto-fit skipped ${skipped.toLocaleString('en-US')} rows that are not loaded. Scroll to them and try again.`,
+            });
+        }
+        const runs = source_height_runs(source_rows);
+        write_row_heights_with_pending_rows(pending_heights, (on_result) => {
+            if (runs.length === 0) return false;
+            on_row_fit(runs, on_result);
+            return true;
+        });
+    }, [
+        auto_fit_active,
+        default_row_height,
+        display_column_count,
+        effective_row_height,
+        font_size_px,
+        get_cell_content,
+        get_cell_width,
+        get_row,
+        get_source_row,
+        merge_index,
+        on_row_fit,
+        pending_rendered_rows,
+        theme,
+        write_row_heights_with_pending_rows,
+    ]);
+    const fit_rows_now_ref = useRef(fit_rows_now);
+    fit_rows_now_ref.current = fit_rows_now;
+    // The strip sits where a border was when the pointer last moved. A scroll
+    // moves the rows under a still pointer, so the strip would name a row
+    // that is no longer there: take it down until the pointer moves again.
+    // (Ignored mid-drag: `set_target` is pinned while a border is held.)
+    useEffect(() => {
+        const grid_root = grid_root_ref.current;
+        if (!grid_root) return;
+        const clear = (event: Event) => {
+            // The grid's own scroller, not an editor's text scrolling inside it.
+            if ((event.target as Element | null)?.classList?.contains('dvn-scroller')) {
+                row_resize_ref.current?.set_target(null);
+            }
+        };
+        grid_root.addEventListener('scroll', clear, true);
+        return () => grid_root.removeEventListener('scroll', clear, true);
+        // The root is another element once every column is hidden or shown.
+    }, [has_visible_columns]);
+    /**
+     * A double-click on a row border: fits the row (see `fit_row_heights`).
+     * `client_y` is where it landed. Heights can change under a still pointer
+     * (an undo, a delivery), leaving the strip where another row's border is
+     * now: the fit is taken only while the row's bottom edge is as near the
+     * double-click as a hover would need to arm the strip. Otherwise the
+     * strip is out of date, and is taken down for the next hover to re-arm.
+     */
+    const handle_row_border_double_click = useCallback((row: number, client_y: number): void => {
+        const double_clicked = row_border_was_double_clicked(
+            row_border_presses_ref.current,
+            row,
+            pending_selection_topology_key_ref.current,
+        );
+        row_border_presses_ref.current = [];
+        if (!double_clicked) return;
+        // The row marker's cell: never merged, so its bottom is the row's.
+        const bounds = grid_ref.current?.getBounds(-1, row);
+        if (
+            bounds === undefined
+            || Math.abs(bounds.y + bounds.height - client_y) > ROW_RESIZE_TOLERANCE_PX
+        ) {
+            row_resize_ref.current?.set_target(null);
+            return;
+        }
+        // The strip's row height and border position are about to change.
+        row_resize_ref.current?.set_target(null);
+        fit_row_heights(row);
+    }, [fit_row_heights]);
 
     // Armed by a header mousedown (Glide selects the column and reports it via
     // onGridSelectionChange before any drag movement); consumed by hover events
@@ -12932,6 +13272,7 @@ export function GridShell({
                 on_resize_start={handle_row_resize_start}
                 on_resize={handle_row_resize_drag}
                 on_resize_end={handle_row_resize_end}
+                on_fit={on_row_fit === undefined ? undefined : handle_row_border_double_click}
             />
             {cell_tooltip && (
                 <div

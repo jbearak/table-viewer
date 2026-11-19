@@ -33,6 +33,12 @@ export interface RowResizeOverlayProps {
     on_resize: (row: number, height: number) => void;
     /** Called when the drag ends or is interrupted, including at its start height. */
     on_resize_end?: (row: number, height: number) => void;
+    /**
+     * Called on a double-click on the border, after both presses have ended
+     * (each through `on_resize_end`). Whether it was a double-click on this
+     * row's border, and not two drags, is the caller's to judge from them.
+     */
+    on_fit?: (row: number, client_y: number) => void;
 }
 
 interface DragState {
@@ -60,6 +66,7 @@ export const RowResizeOverlay = forwardRef<
     on_resize_start,
     on_resize,
     on_resize_end,
+    on_fit,
 }, ref): React.JSX.Element {
     const wrapper_ref = useRef<HTMLDivElement | null>(null);
     const [target, set_target_state] = useState<RowResizeTarget | null>(null);
@@ -186,6 +193,12 @@ export const RowResizeOverlay = forwardRef<
                 <div
                     className="row-resize-strip"
                     onMouseDown={on_mouse_down}
+                    onDoubleClick={(e) => {
+                        if (e.button !== 0 || drag_ref.current || !target) return;
+                        e.preventDefault();
+                        e.stopPropagation();
+                        on_fit?.(target.row, e.clientY);
+                    }}
                     onContextMenu={(e) => {
                         // Suppress the OS cut/copy/paste menu on the row-header
                         // border; nothing should happen here.

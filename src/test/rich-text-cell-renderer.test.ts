@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
     is_rich_text_cell,
+    rich_cell_fit,
+    rich_cell_unwrapped_hides_text,
     rich_text_cell_renderer,
     type RichTextGridCell,
 } from '../webview/rich-text-cell-renderer';
@@ -55,11 +57,12 @@ const width_with_padding = (content_width: number): number =>
 interface CellOptions {
     readonly hyperlink?: boolean;
     readonly allow_wrapping?: boolean;
+    readonly wraps_on_break?: boolean;
 }
 
 function make_cell(
     lines: RichTextLine[],
-    { hyperlink = false, allow_wrapping = false }: CellOptions = {},
+    { hyperlink = false, allow_wrapping = false, wraps_on_break = false }: CellOptions = {},
 ): RichTextGridCell {
     return {
         kind: GridCellKind.Custom,
@@ -71,6 +74,7 @@ function make_cell(
                 ? { hyperlink: { kind: 'external' as const, target: 'https://x.example/' } }
                 : {}),
             ...(allow_wrapping ? { allow_wrapping: true as const } : {}),
+            ...(wraps_on_break ? { wraps_on_break: true as const } : {}),
         },
         copyData: 'x',
         allowOverlay: false,
@@ -338,5 +342,86 @@ describe('rich_text_cell_renderer.draw — code-review regressions', () => {
         // leftward (each segment is 2 chars * 10px wide).
         expect(calls[0].x).toBe(200 - theme.cellHorizontalPadding);
         expect(calls[1].x).toBe(200 - theme.cellHorizontalPadding - 20);
+    });
+});
+
+describe('rich_cell_unwrapped_hides_text', () => {
+    /** What `draw` leaves undrawn of the cell's visible text on one unwrapped line. */
+    const hidden_by_draw = (cell: RichTextGridCell, width: number): boolean => {
+        const drawn = draw(cell, { x: 0, y: 0, width, height: 24 }).calls
+            .map((call) => call.text).join('').replace(/\s/g, '');
+        const all = cell.data.lines.flat().map((segment) => segment.text).join('').replace(/\s/g, '');
+        return drawn !== all;
+    };
+    const hides = (cell: RichTextGridCell, width: number): boolean =>
+        rich_cell_unwrapped_hides_text(stub_ctx().ctx, cell.data, width, theme.cellHorizontalPadding, 'sans');
+
+    it.each([
+        ['everything fits', [[{ text: 'ab' }, { text: 'cd' }]], 200, false],
+        // Cut at ceil(40 / 4) = 10 characters in its trailing spaces: the line stops there.
+        ['a cut segment stops the line', [[{ text: 'ab' + ' '.repeat(12) }, { text: 'cd' }]], 40, true],
+        // Cut at ceil(60 / 4) = 15 characters, in spaces, with nothing after it.
+        ['a cut through spaces alone, last', [[{ text: 'ab' }, { text: 'cd' + ' '.repeat(20) }]], 60, false],
+        ['indentation pushes text past the edge', [[{ text: ' '.repeat(20) + 'x' }]], 100, true],
+        // Past the right padding but inside the cell, which is where Glide clips.
+        ['text into the right padding is still painted', [[{ text: '  x' }]], 40, false],
+        ['a later segment past the edge', [[{ text: 'abcdefghij' }, { text: 'klmnop' }]], 120, true],
+    ] as const)('says whether draw hides text: %s', (_name, lines, width, expected) => {
+        const cell = make_cell(lines.map((line) => [...line]));
+        expect(hides(cell, width)).toBe(expected);
+        // `draw` clips at the cell, not at its padding, so only the cut is
+        // checked against it: everything it does not draw, the mirror reports.
+        if (!expected) expect(hidden_by_draw(cell, width)).toBe(false);
+    });
+
+    it('agrees with draw that a cut segment stops the line', () => {
+        const cell = make_cell([[{ text: 'ab' + ' '.repeat(12) }, { text: 'cd' }]]);
+        expect(hidden_by_draw(cell, 40)).toBe(true);
+    });
+});
+
+describe('rich_cell_fit', () => {
+    /** 10px a glyph, "i" 2px. */
+    const narrow = () => stub_ctx((text) => [...text].reduce((width, glyph) => width + (glyph === 'i' ? 2 : 10), 0)).ctx;
+    const fit = (lines: RichTextLine[], width: number, auto_fit_columns = false) =>
+        rich_cell_fit(
+            narrow(),
+            // As cell-renderer marks it: a line break in what it paints.
+            make_cell(lines, { wraps_on_break: lines.length > 1 }).data,
+            width,
+            theme.cellHorizontalPadding,
+            'sans',
+            auto_fit_columns,
+        );
+
+    it('counts a line of spaces that paints an underline or strikethrough', () => {
+        expect(fit([[{ text: 'a' }], [], [{ text: '   ', style: { underline: true } }]], 200))
+            .toEqual({ lines: 3, fits_default: false });
+        expect(fit([[{ text: 'a' }], [], [{ text: '   ' }]], 200)).toEqual({ lines: 1, fits_default: true });
+    });
+
+    it('does not grow for underlined spaces past the edge, which wrapping drops too', () => {
+        const underlined = make_cell([[{ text: 'b' + ' '.repeat(10), style: { underline: true } }]]);
+        expect(fit(underlined.data.lines as RichTextLine[], 100).fits_default).toBe(true);
+        // A taller row shows no more of them: its wrapped line keeps "b" and
+        // the spaces that fit, and drops the rest.
+        const tall = draw(
+            make_cell(underlined.data.lines as RichTextLine[], { allow_wrapping: true }),
+            { x: 0, y: 0, width: 100, height: 44 },
+            stub_ctx((text) => [...text].length * 10),
+        );
+        expect(tall.calls.map((call) => call.text).join('').trimEnd()).toBe('b');
+        expect(fit([[{ text: 'a' }, { text: ' '.repeat(27), style: { underline: true } }]], 100).fits_default)
+            .toBe(true);
+    });
+
+    it('takes a line break as wrapping at the default height, with no character cap', () => {
+        // 27 narrow glyphs in 100px: past ceil(100 / 4) = 25 characters, but
+        // a cell that paints a line break wraps there and draws them all.
+        expect(fit([[{ text: 'i'.repeat(27) }], []], 100)).toEqual({ lines: 1, fits_default: true });
+        // Without one it draws one line, cut at 25.
+        expect(fit([[{ text: 'i'.repeat(27) }]], 100)).toEqual({ lines: 1, fits_default: false });
+        // Auto-fit Columns has the default height wrap.
+        expect(fit([[{ text: 'i'.repeat(27) }]], 100, true)).toEqual({ lines: 1, fits_default: true });
     });
 });

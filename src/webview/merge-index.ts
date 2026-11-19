@@ -55,6 +55,12 @@ export class MergeIndex {
         return this.anchors.get(key(row, col)) ?? null;
     }
 
+    /** The merge (row, col) is part of, anchor or covered, or null. */
+    entry_at(row: number, col: number): MergeEntry | null {
+        if (this.size === 0) return null;
+        return this.cellToEntry.get(key(row, col)) ?? null;
+    }
+
     /** True when (row, col) is inside a merge but is not its anchor. */
     is_covered(row: number, col: number): boolean {
         if (this.size === 0) return false;

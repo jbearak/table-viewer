@@ -20,6 +20,7 @@ import {
 } from './glide-data-grid';
 import type { CellTextStyle } from '../cell-content';
 import { canvas_font } from './fit-column-model';
+import { lines_to_last_visible } from './fit-row-model';
 import {
     rich_lines_max_width,
     wrap_rich_text_lines,
@@ -129,6 +130,107 @@ function visual_lines(
         });
     }
     return lines;
+}
+
+/**
+ * The visual lines this renderer draws `data` as once its row is tall enough
+ * to wrap, at `available_width` (the cell width less both horizontal
+ * paddings): what row auto-fit counts. Wraps whatever `allow_wrapping` says
+ * now, because a fit sizes the row for the wrapped layout it will get.
+ */
+export function rich_cell_wrapped_lines(
+    ctx: CanvasRenderingContext2D,
+    data: RichCellData,
+    available_width: number,
+    font_family: string,
+): readonly RichTextLine[] {
+    return visual_lines(
+        ctx,
+        data.allow_wrapping === true ? data : { ...data, allow_wrapping: true },
+        available_width,
+        font_variants(data.font_size_px, font_family),
+    );
+}
+
+/** Whether a segment paints something: visible text, or spaces under an underline or strikethrough (a link's too). */
+function segment_paints(data: RichCellData): (segment: RichTextLine[number]) => boolean {
+    const linked = data.hyperlink !== undefined;
+    return (segment) => /\S/.test(segment.text)
+        || (segment.text !== ''
+            && (linked || segment.style?.underline === true || segment.style?.strikethrough === true));
+}
+
+/**
+ * Whether this renderer, drawing `data` unwrapped on one line in a cell
+ * `width` wide (what it does at the default row height), would leave visible
+ * text undrawn: text past the cell's right padding, or past a segment cut at
+ * `ceil(width / 4)` characters, after which the line stops. Mirrors `draw`.
+ *
+ * Visible text only: spaces past the edge, even under an underline, are not
+ * shown by a taller row either, whose wrapped lines keep spaces only where
+ * they fit (`wrap_rich_text_lines`), so they are no reason to grow it.
+ */
+export function rich_cell_unwrapped_hides_text(
+    ctx: CanvasRenderingContext2D,
+    data: RichCellData,
+    width: number,
+    horizontal_padding: number,
+    font_family: string,
+): boolean {
+    const visible = (segment: RichTextLine[number]) => /\S/.test(segment.text);
+    const line = data.lines[0] ?? [];
+    const variants = font_variants(data.font_size_px, font_family);
+    const max_chars = Math.ceil(width / 4);
+    // From `left` to `right` in `draw`: where it stops starting segments.
+    const room = width - 2 * horizontal_padding - 0.5;
+    // From `left` to the cell's edge: where Glide clips what it paints.
+    const clip = width - horizontal_padding - 0.5;
+    const direction = ctx.direction;
+    ctx.direction = data.rtl === true ? 'rtl' : 'inherit';
+    try {
+        let pen = 0;
+        for (let index = 0; index < line.length; index += 1) {
+            const later_visible = () => line.slice(index + 1).some(visible);
+            const segment = line[index];
+            if (pen >= room) return visible(segment) || later_visible();
+            const truncated = segment.text.length > max_chars;
+            const text = truncated ? segment.text.slice(0, max_chars) : segment.text;
+            ctx.font = variant_of(variants, segment.style);
+            if (pen + ctx.measureText(text.trimEnd()).width > clip + 0.5) return true;
+            if (truncated) return visible({ ...segment, text: segment.text.slice(max_chars) }) || later_visible();
+            pen += ctx.measureText(text).width;
+        }
+        return false;
+    } finally {
+        ctx.direction = direction;
+    }
+}
+
+/**
+ * What row auto-fit needs of a rich cell `width` wide: its lines once the row
+ * is tall enough to wrap, through the last that paints something, and whether
+ * it paints all of its text at the default height. It wraps there with
+ * Auto-fit Columns on, or when it paints a line break (`wraps_on_break`);
+ * otherwise it draws one line (see `rich_cell_unwrapped_hides_text`).
+ */
+export function rich_cell_fit(
+    ctx: CanvasRenderingContext2D,
+    data: RichCellData,
+    width: number,
+    horizontal_padding: number,
+    font_family: string,
+    auto_fit_columns: boolean,
+): { lines: number; fits_default: boolean } {
+    const paints = segment_paints(data);
+    const available = Math.max(0, width - 2 * horizontal_padding);
+    const lines = lines_to_last_visible(
+        rich_cell_wrapped_lines(ctx, data, available, font_family),
+        (line) => line.some(paints),
+    );
+    const fits_default = auto_fit_columns || data.wraps_on_break === true
+        ? lines <= 1
+        : !rich_cell_unwrapped_hides_text(ctx, data, width, horizontal_padding, font_family);
+    return { lines, fits_default };
 }
 
 export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {

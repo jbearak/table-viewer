@@ -48,6 +48,7 @@ import {
     columns_view_step,
     header_step_label,
     header_view_delta,
+    row_fit_view_step,
     row_heights_view_step,
     transform_view_step,
     type HeaderViewDelta,
@@ -352,6 +353,39 @@ describe('a size step in the stack', () => {
         for (const entry of state.undoStack) {
             expect(Object.isFrozen(view_step_change(entry.action)!.delta)).toBe(true);
         }
+    });
+
+    it('keeps an auto-fit\'s own height for each row through Undo and Redo', () => {
+        const fit = action_of(row_fit_view_step(
+            SHEET,
+            [{ start: 0, end: 1, height: 60 }, { start: 2, end: 2, height: null }, { start: 5, end: 5, height: 42 }],
+            [{ start: 0, end: 2, height: 30 }, { start: 5, end: 5, height: null }],
+        ));
+        let state = recorded(empty_history_stack(), fit);
+        // The gesture's own arrays change afterwards; the stack's do not.
+        const given = (fit.changes[0] as Extract<HistoryChange, { kind: 'view' }>).delta;
+        if (given.slice !== 'rowHeights' || !Array.isArray(given.after)) {
+            throw new Error('expected per-row heights');
+        }
+        (given.after as { start: number; end: number; height: number | null }[]).length = 0;
+        const expected = {
+            worksheet: SHEET,
+            slice: 'rowHeights',
+            after: [
+                { start: 0, end: 1, height: 60 },
+                { start: 2, end: 2, height: null },
+                { start: 5, end: 5, height: 42 },
+            ],
+            before: [{ start: 0, end: 2, height: 30 }, { start: 5, end: 5, height: null }],
+        };
+        expect(view_step_change(state.undoStack[0].action)!.delta).toEqual(expected);
+        const owned = view_step_change(state.undoStack[0].action)!.delta;
+        if (owned.slice !== 'rowHeights') throw new Error('expected a row-height delta');
+        expect(Object.isFrozen(owned.after)).toBe(true);
+        state = moved(state, 'undo');
+        expect(view_step_change(state.redoStack[0].action)!.delta).toEqual(expected);
+        state = moved(state, 'redo');
+        expect(view_step_change(state.undoStack[0].action)!.delta).toEqual(expected);
     });
 
     it('holds one width change per worksheet when a gesture spans worksheets', () => {

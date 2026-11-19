@@ -313,6 +313,8 @@ export function clearTextMetricsCache(): void {
     metricsSize = 0;
     metricsCache = {};
     biasCache.length = 0;
+    wrapCache.clear();
+    wrapCacheChars = 0;
     clearCache();
     textMetricsGeneration++;
 }
@@ -500,6 +502,203 @@ function truncateString(data: string, w: number): string {
     return data;
 }
 
+/**
+ * Whitespace a line may break at: what `\s` matches, but the no-break spaces
+ * (U+00A0, U+2007, U+202F, U+FEFF). Every one is a single UTF-16 unit.
+ */
+const BREAK_SPACES = new Set(
+    Array.from("\t\n\v\f\r \u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2008\u2009\u200a\u2028\u2029\u205f\u3000", (space) => space.charCodeAt(0))
+);
+
+function isBreakSpace(text: string, at: number): boolean {
+    return BREAK_SPACES.has(text.charCodeAt(at));
+}
+
+/**
+ * A line's words, each with the break space before it, then its trailing
+ * break space if any. Scanned rather than matched: a regular expression that
+ * excludes the no-break spaces from a word needs a lookahead per character,
+ * which ran out of stack on a value of millions of characters.
+ */
+function* breakableWords(line: string): Generator<string> {
+    let at = 0;
+    while (at < line.length) {
+        const start = at;
+        while (at < line.length && isBreakSpace(line, at)) at++;
+        while (at < line.length && !isBreakSpace(line, at)) at++;
+        yield line.slice(start, at);
+    }
+}
+
+/** `splitMultiLineText` results by font, direction, width and text, least recently used first. */
+const wrapCache = new Map<string, readonly string[]>();
+/** The characters of `wrapCache`'s keys, which hold whole cell values. */
+let wrapCacheChars = 0;
+const WRAP_CACHE_MAX_ENTRIES = 500;
+const WRAP_CACHE_MAX_CHARS = 4_000_000;
+
+const graphemeSegmenter = typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+    : undefined;
+
+/**
+ * Where a word may break: the offset of each grapheme cluster (each code point
+ * without `Intl.Segmenter`), then the word's length.
+ */
+function graphemeBoundaries(text: string): number[] {
+    const boundaries: number[] = [];
+    if (graphemeSegmenter === undefined) {
+        let offset = 0;
+        for (const point of text) {
+            boundaries.push(offset);
+            offset += point.length;
+        }
+    } else {
+        for (const { index } of graphemeSegmenter.segment(text)) boundaries.push(index);
+    }
+    boundaries.push(text.length);
+    return boundaries;
+}
+
+/**
+ * One hard line's visual lines at `width`: greedy, breaking after the last
+ * space that fits, and inside a word only when the word alone is wider than
+ * the line. A glyph wider than the line takes a line of its own.
+ *
+ * Every candidate line is measured whole, in the context's font and
+ * direction, so kerning and shaping across words count as they paint, and
+ * the result does not depend on what was measured before. canvas-hypertxt
+ * judged whether a line fits from a prefix whose length came from the average
+ * glyph width of earlier text, so after wide text a long line of narrow
+ * glyphs was taken whole and clipped; and it never returned when one glyph
+ * was wider than the line.
+ */
+function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, width: number): string[] {
+    // Not `measureTextCached`: candidates are one-off strings, and its key
+    // names neither the direction nor, for a long line, a short string.
+    const fits = (text: string) => ctx.measureText(text).width <= width;
+    // Whitespace alone draws nothing, however many lines it would take.
+    if (/^\s*$/.test(line) || fits(line)) return [line];
+    // Trailing whitespace is trimmed off the line it ends, so it takes none
+    // of its own (a no-break space or BOM after spaces would have).
+    line = line.trimEnd();
+    const lines: string[] = [];
+    let current = "";
+    // Each word keeps the whitespace before it; trailing whitespace is a word
+    // too. No-break spaces belong to the word they are in.
+    for (const word of breakableWords(line)) {
+        let fitting: boolean;
+        if (current === "") {
+            current = word;
+            fitting = fits(current);
+        } else if (fits(current + word)) {
+            current += word;
+            fitting = true;
+        } else {
+            lines.push(current);
+            current = word.trimStart();
+            fitting = fits(current);
+        }
+        if (fitting) continue;
+        // One word wider than the line: break it between graphemes, each line
+        // the longest run that fits (at least one grapheme), found by
+        // galloping and then halving, so a long unbroken value (a URL, base64)
+        // costs a few measurements a line rather than one a grapheme.
+        const boundaries = graphemeBoundaries(current);
+        const count = boundaries.length - 1;
+        const run = (from: number, length: number) =>
+            current.slice(boundaries[from], boundaries[from + length]);
+        let from = 0;
+        for (;;) {
+            const remaining = count - from;
+            let good = 1;
+            let bad = remaining + 1;
+            for (let step = 1; good < remaining; step *= 2) {
+                const next = Math.min(good + step, remaining);
+                if (!fits(run(from, next))) {
+                    bad = next;
+                    break;
+                }
+                good = next;
+            }
+            while (bad - good > 1) {
+                const middle = (good + bad) >> 1;
+                if (fits(run(from, middle))) good = middle;
+                else bad = middle;
+            }
+            if (good === remaining) break;
+            // Indentation wider than the line would be a line of nothing.
+            const piece = run(from, good);
+            if (!/^\s*$/.test(piece)) lines.push(piece);
+            from += good;
+            // The next line is drawn trimmed: whitespace it starts with (a
+            // no-break space, which is not a break) takes no width.
+            while (from < count - 1 && /^\s+$/.test(run(from, 1))) from += 1;
+        }
+        current = run(from, count - from);
+    }
+    lines.push(current);
+    return lines;
+}
+
+/**
+ * Fork addition: the visual lines `drawMultiLineText` draws `data` as, at
+ * `availableWidth` (the cell width less both horizontal paddings). Exported so
+ * row auto-fit counts exactly the lines the painter will draw. The caller
+ * sets `ctx.font` to `fontStyle`, and `ctx.direction` as the painter does.
+ *
+ * `hyperWrapping` keeps canvas-hypertxt's estimated layout, as upstream.
+ */
+export function splitMultiLineText(
+    ctx: CanvasRenderingContext2D,
+    data: string,
+    fontStyle: string,
+    availableWidth: number,
+    hyperWrapping = false
+): readonly string[] {
+    if (hyperWrapping) {
+        // canvas-hypertxt divides by a hard line's length while learning its
+        // glyph widths, so an empty one poisons them: blank lines are kept here.
+        const split: string[] = [];
+        for (const hardLine of data.split("\n")) {
+            if (hardLine.length === 0) split.push("");
+            else for (const line of splitText(ctx, hardLine, fontStyle, availableWidth, true)) split.push(line);
+        }
+        return split.map((line, index) => index === 0 ? line.trimEnd() : line.trim());
+    }
+    if (availableWidth <= 0) return [];
+    const key = `${fontStyle}\u0000${ctx.direction}\u0000${availableWidth}\u0000${data}`;
+    const cached = wrapCache.get(key);
+    if (cached !== undefined) {
+        // Most recently used last, so a viewport's cells outlive one scan.
+        wrapCache.delete(key);
+        wrapCache.set(key, cached);
+        return cached;
+    }
+    const split: string[] = [];
+    // Appended one by one: a long value wraps to more lines than a spread can pass.
+    // Every visual line but the first is drawn trimmed, so a later hard
+    // line's indentation takes no width.
+    data.split("\n").forEach((hardLine, index) => {
+        for (const line of wrapHardLine(ctx, index === 0 ? hardLine : hardLine.trimStart(), availableWidth)) {
+            split.push(line);
+        }
+    });
+    // canvas-hypertxt's whitespace handling, which the painter has always had.
+    const lines = split.map((line, index) => index === 0 ? line.trimEnd() : line.trim());
+    // A value too long for the whole cache is not kept: it would evict everything first.
+    if (key.length > WRAP_CACHE_MAX_CHARS) return lines;
+    wrapCache.set(key, lines);
+    wrapCacheChars += key.length;
+    while (wrapCache.size > WRAP_CACHE_MAX_ENTRIES || wrapCacheChars > WRAP_CACHE_MAX_CHARS) {
+        const oldest = wrapCache.keys().next().value;
+        if (oldest === undefined) break;
+        wrapCache.delete(oldest);
+        wrapCacheChars -= oldest.length;
+    }
+    return lines;
+}
+
 function drawMultiLineText(
     ctx: CanvasRenderingContext2D,
     data: string,
@@ -514,30 +713,7 @@ function drawMultiLineText(
 ) {
     const fontStyle = theme.baseFontFull;
     const availableWidth = w - theme.cellHorizontalPadding * 2;
-    // canvas-hypertxt records average glyph width while splitting. Passing an
-    // empty hard line makes it divide 0px by 0 characters, poisoning that font's
-    // shared metric with NaN. The current width is already cached by then, so the
-    // failure appears only after a resize: every paragraph at the new width is
-    // incorrectly accepted as one unwrapped line. Preserve blank visual lines
-    // ourselves and only ask the dependency to measure non-empty hard lines.
-    let split: readonly string[];
-    const hasEmptyHardLine = data.startsWith("\n") || data.endsWith("\n") || data.includes("\n\n");
-    if (hasEmptyHardLine) {
-        const hardLines = data.split("\n");
-        const safeSplit: string[] = [];
-        for (const hardLine of hardLines) {
-            if (hardLine.length === 0) {
-                safeSplit.push("");
-            } else {
-                safeSplit.push(...splitText(ctx, hardLine, fontStyle, availableWidth, hyperWrapping ?? false));
-            }
-        }
-        // Match canvas-hypertxt's whole-value whitespace handling now that each
-        // hard line was sent through it independently.
-        split = safeSplit.map((line, index) => index === 0 ? line.trimEnd() : line.trim());
-    } else {
-        split = splitText(ctx, data, fontStyle, availableWidth, hyperWrapping ?? false);
-    }
+    const split = splitMultiLineText(ctx, data, fontStyle, availableWidth, hyperWrapping ?? false);
 
     const emHeight = getEmHeight(ctx, fontStyle);
     const lineHeight = theme.lineHeight * emHeight;
