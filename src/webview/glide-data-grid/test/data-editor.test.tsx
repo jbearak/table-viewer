@@ -1094,6 +1094,104 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         expect(spy).toHaveBeenCalledWith([1, 1], expect.anything());
     });
 
+    // Fork test: a row-height callable carrying a prefix index is asked only
+    // for the rows near the viewport, never walked over the sheet.
+    test("Indexed row heights are not walked over every row", async () => {
+        const rows = 1_000_000;
+        const tall = (r: number) => (r % 1000 === 1 ? 64 : 32);
+        let calls = 0;
+        const counted = (r: number) => {
+            calls++;
+            return tall(r);
+        };
+        // top(row): 32 a row, plus 32 more for each row r < row with r % 1000 === 1.
+        const top = (row: number) => row * 32 + (row <= 1 ? 0 : Math.floor((row - 2) / 1000) + 1) * 32;
+        const indexed = Object.assign((r: number) => counted(r), {
+            rowHeightIndex: {
+                top,
+                rowAtY: (y: number) => {
+                    if (!(y > 0)) return 0;
+                    if (y === Number.POSITIVE_INFINITY) return y;
+                    let row = Math.floor(y / 32);
+                    while (row > 0 && top(row) > y) row--;
+                    while (top(row + 1) <= y) row++;
+                    return row;
+                },
+            },
+        });
+        vi.useFakeTimers();
+        render(<DataEditor {...basicProps} rows={rows} rowHeight={indexed} />, { wrapper: Context });
+        prep();
+        expect(calls).toBeLessThan(5000);
+
+        // The same callable without its index is walked over every row.
+        cleanup();
+        vi.useFakeTimers();
+        calls = 0;
+        render(<DataEditor {...basicProps} rows={rows} rowHeight={counted} />, { wrapper: Context });
+        prep();
+        expect(calls).toBeGreaterThanOrEqual(rows);
+    });
+
+    test("Uneven indexed rows cell click", async () => {
+        const spy = vi.fn();
+        const height = (r: number) => (r % 2 === 0 ? 32 : 64);
+        const top = (row: number) => Math.ceil(row / 2) * 32 + Math.floor(row / 2) * 64;
+        const indexed = Object.assign(height, {
+            rowHeightIndex: {
+                top,
+                rowAtY: (y: number) => {
+                    let row = 0;
+                    while (top(row + 1) <= y) row++;
+                    return row;
+                },
+            },
+        });
+        vi.useFakeTimers();
+        render(<DataEditor {...basicProps} onCellClicked={spy} rowHeight={indexed} />, { wrapper: Context });
+        prep();
+        sendClick(screen.getByTestId("data-grid-canvas"), { clientX: 300, clientY: 36 + 64 + 16 });
+        expect(spy).toHaveBeenCalledWith([1, 1], expect.anything());
+    });
+
+    // Fork test: scaling to a root rem other than 16 px wraps the callable,
+    // which drops its index; the grid then walks the scaled heights as
+    // upstream does and lands clicks where they are.
+    test("Indexed rows scaled to rem fall back to the walk", async () => {
+        const spy = vi.fn();
+        const height = (r: number) => (r % 2 === 0 ? 32 : 64);
+        // Deliberately wrong for scaled rows: a grid that read it would misplace the click.
+        const top = vi.fn((row: number) => row * 32);
+        const rowAtY = vi.fn((y: number) => Math.floor(y / 32));
+        const indexed = Object.assign(height, { rowHeightIndex: { top, rowAtY } });
+        const computed = window.getComputedStyle.bind(window);
+        const style = vi.spyOn(window, "getComputedStyle").mockImplementation((element, pseudo) => {
+            const declaration = computed(element, pseudo);
+            if (element !== document.documentElement) return declaration;
+            return new Proxy(declaration, {
+                get(target, key) {
+                    if (key === "fontSize") return "20px";
+                    const value = Reflect.get(target, key, target);
+                    return typeof value === "function" ? value.bind(target) : value;
+                },
+            });
+        });
+        try {
+            vi.useFakeTimers();
+            render(<DataEditor {...basicProps} scaleToRem={true} onCellClicked={spy} rowHeight={indexed} />, {
+                wrapper: Context,
+            });
+            prep();
+            // Rows scale by 20 / 16: row 0 is 40 px, row 1 is 80 px, the header 45 px.
+            sendClick(screen.getByTestId("data-grid-canvas"), { clientX: 300, clientY: 45 + 40 + 20 });
+            expect(spy).toHaveBeenCalledWith([1, 1], expect.anything());
+            expect(top).not.toHaveBeenCalled();
+            expect(rowAtY).not.toHaveBeenCalled();
+        } finally {
+            style.mockRestore();
+        }
+    });
+
     test("Emits finished editing", async () => {
         const spy = vi.fn();
         vi.useFakeTimers();
