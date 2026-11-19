@@ -41,6 +41,38 @@ function compact_to_array(selection: GridSelection['columns']): number[] {
     return [];
 }
 
+/**
+ * The one index `next` holds that `previous` does not, 'none' when there is
+ * none, or 'many'. Both are `[start, end)` slices, ascending and disjoint as
+ * CompactSelection keeps them; the walk is linear in the slice counts.
+ */
+function single_added_index(
+    previous: readonly (readonly [number, number])[],
+    next: readonly (readonly [number, number])[],
+): number | 'none' | 'many' {
+    let found: number | undefined;
+    let at = 0;
+    for (const [start, end] of next) {
+        let cursor = start;
+        while (at < previous.length && previous[at][1] <= cursor) at += 1;
+        // Walk the parts of [start, end) that no previous slice covers.
+        let scan = at;
+        while (cursor < end) {
+            const covering = scan < previous.length ? previous[scan] : undefined;
+            if (covering !== undefined && covering[0] <= cursor) {
+                cursor = Math.max(cursor, covering[1]);
+                scan += 1;
+                continue;
+            }
+            const gap_end = Math.min(end, covering === undefined ? end : covering[0]);
+            if (gap_end - cursor > 1 || found !== undefined) return 'many';
+            found = cursor;
+            cursor = gap_end;
+        }
+    }
+    return found ?? 'none';
+}
+
 /** Derive the drag state a header mousedown arms. Glide applies the click's
  *  selection before any drag movement, so the anchor is the column the click
  *  added — or the sole selected column when a re-click added nothing. Returns
@@ -49,6 +81,22 @@ export function header_drag_state_for_selection(
     previous_columns: GridSelection['columns'],
     next_columns: GridSelection['columns'],
 ): HeaderDragState | null {
+    const whole = (ranges: readonly (readonly [number, number])[]) =>
+        ranges.every(([start, end]) => Number.isInteger(start) && Number.isInteger(end));
+    const previous_ranges = typeof previous_columns.toRanges === 'function' ? previous_columns.toRanges() : undefined;
+    const next_ranges = typeof next_columns.toRanges === 'function' ? next_columns.toRanges() : undefined;
+    if (previous_ranges !== undefined && next_ranges !== undefined && whole(previous_ranges) && whole(next_ranges)) {
+        // By ranges, never by index: a row-marker click can land on a
+        // selection of a million rows. (Grid gestures give whole indices;
+        // anything else is listed, as before.)
+        const added = single_added_index(previous_ranges, next_ranges);
+        // The sole selected index, read from the first slice that holds one.
+        const sole = next_columns.length === 1
+            ? next_ranges.find(([start, end]) => end > start)?.[0]
+            : undefined;
+        const anchor = added === 'none' || added === 'many' ? sole : added;
+        return anchor === undefined ? null : { anchor, base: next_columns };
+    }
     const next = compact_to_array(next_columns);
     const added = next.filter((column) => !compact_selection_contains(previous_columns, column));
     const anchor = added.length === 1

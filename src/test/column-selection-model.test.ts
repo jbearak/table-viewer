@@ -214,3 +214,84 @@ describe('multi column context menu model', () => {
         expect(props.on_sort).toHaveBeenCalledWith('desc');
     });
 });
+
+describe('header_drag_state_for_selection by ranges', () => {
+    /** The rule as it was written over listed indices: the oracle. */
+    function listed_rule(previous: CompactSelection, next: CompactSelection): number | undefined {
+        const values = next.toArray();
+        const added = values.filter((value) => !previous.hasIndex(value));
+        return added.length === 1 ? added[0] : values.length === 1 ? values[0] : undefined;
+    }
+
+    function unexpandable(selection: CompactSelection): CompactSelection {
+        const guarded = Object.create(selection) as CompactSelection;
+        const refuse = () => {
+            throw new Error('expanded a CompactSelection index by index');
+        };
+        Object.defineProperty(guarded, 'toArray', { value: refuse });
+        Object.defineProperty(guarded, Symbol.iterator, { value: refuse });
+        return guarded;
+    }
+
+    it('anchors a click that adds one row to a million selected, without expanding them', () => {
+        const previous = unexpandable(CompactSelection.fromSingleSelection([0, 1_000_000]));
+        const next = unexpandable(CompactSelection.fromSingleSelection([0, 1_000_000]).add(1_000_005));
+        expect(header_drag_state_for_selection(previous, next)?.anchor).toBe(1_000_005);
+        expect(header_drag_state_for_selection(next, next)).toBeNull();
+        expect(header_drag_state_for_selection(CompactSelection.empty(), previous)).toBeNull();
+    });
+
+    it('anchors on the sole selected index past an empty slice', () => {
+        const ranges = (slices: [number, number][]) => ({
+            length: slices.reduce((total, [start, end]) => total + end - start, 0),
+            toRanges: () => slices,
+            first: () => slices[0]?.[0],
+            hasIndex: (index: number) => slices.some(([start, end]) => index >= start && index < end),
+        }) as unknown as CompactSelection;
+        // Row 5 was already selected: nothing is added, and 5 is the only row.
+        expect(header_drag_state_for_selection(ranges([[5, 6]]), ranges([[0, 0], [5, 6]]))?.anchor).toBe(5);
+    });
+
+    it('lists slices that do not start and end on whole indices, as before', () => {
+        const fractional = (ranges: [number, number][], values: number[]) => ({
+            length: values.length,
+            toRanges: () => ranges,
+            toArray: () => values,
+            // As CompactSelection answers: inside one of its slices.
+            hasIndex: (index: number) => ranges.some(([start, end]) => index >= start && index < end),
+            first: () => values[0],
+            last: () => values.at(-1),
+        }) as unknown as CompactSelection;
+        const previous = fractional([[0.5, 1.5]], [0.5]);
+        const next = fractional([[0, 2]], [0, 1]);
+        expect(header_drag_state_for_selection(previous, next)?.anchor).toBe(0);
+    });
+
+    it('agrees with the listed rule over random selections', () => {
+        let state = 402;
+        const next_random = () => {
+            state = (state * 1664525 + 1013904223) >>> 0;
+            return state / 2 ** 32;
+        };
+        const random_compact = () => {
+            let selection = CompactSelection.empty();
+            const pieces = Math.floor(next_random() * 4);
+            for (let piece = 0; piece < pieces; piece++) {
+                const start = Math.floor(next_random() * 12);
+                const length = 1 + Math.floor(next_random() * 3);
+                selection = next_random() < 0.7
+                    ? selection.add([start, start + length])
+                    : selection.remove([start, start + length]);
+            }
+            return selection;
+        };
+        for (let trial = 0; trial < 1000; trial++) {
+            const previous = random_compact();
+            let next = next_random() < 0.5 ? previous : random_compact();
+            if (next_random() < 0.5) next = next.add(Math.floor(next_random() * 14));
+            const expected = listed_rule(previous, next);
+            const state_by_ranges = header_drag_state_for_selection(unexpandable(previous), unexpandable(next));
+            expect(state_by_ranges?.anchor, `trial ${trial}`).toBe(expected);
+        }
+    });
+});

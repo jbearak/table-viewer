@@ -2,7 +2,9 @@ import { CompactSelection, type GridSelection } from '../webview/glide-data-grid
 import { describe, expect, it, vi } from 'vitest';
 import { plan_cell_highlight_mutation } from '../cell-highlight-command';
 import { create_column_projection } from '../webview/column-projection';
+import { create_pending_row_projection } from '../webview/pending-row-projection';
 import {
+    compact_intervals,
     grid_selection_contains_cell,
     grid_selection_contains_row,
     highlight_selection_may_have_renderable_highlight,
@@ -352,5 +354,253 @@ describe('highlight_selection_from_grid', () => {
         expect(highlight_selection_from_grid(current(0, 0), 0, projection, [])).toBeNull();
         expect(highlight_selection_from_grid(current(0, 0), 10, create_column_projection(0), []))
             .toBeNull();
+    });
+});
+
+/** A real CompactSelection that refuses to be expanded index by index. */
+function unexpandable(selection: CompactSelection): CompactSelection {
+    const guarded = Object.create(selection) as CompactSelection;
+    const refuse = () => {
+        throw new Error('expanded a CompactSelection index by index');
+    };
+    Object.defineProperty(guarded, 'toArray', { value: refuse });
+    Object.defineProperty(guarded, Symbol.iterator, { value: refuse });
+    return guarded;
+}
+
+/** A small seeded generator, so a failure names its case. */
+function random_source(seed: number): () => number {
+    let state = seed >>> 0;
+    return () => {
+        state = (state * 1664525 + 1013904223) >>> 0;
+        return state / 2 ** 32;
+    };
+}
+
+function random_compact(next: () => number, limit: number): CompactSelection {
+    let selection = CompactSelection.empty();
+    const pieces = Math.floor(next() * 5);
+    for (let piece = 0; piece < pieces; piece++) {
+        const start = Math.floor(next() * (limit + 4)) - 2;
+        const length = 1 + Math.floor(next() * 4);
+        selection = next() < 0.75
+            ? selection.add([start, start + length])
+            : selection.remove([start, start + length]);
+    }
+    return selection;
+}
+
+describe('compact_intervals', () => {
+    it('reads a million-row selection by its slices, without expanding it', () => {
+        const rows = unexpandable(CompactSelection.fromSingleSelection([0, 1_000_000]).add([2_000_000, 2_000_003]));
+        expect(compact_intervals(rows, 2_000_002)).toEqual([
+            { start: 0, end: 999_999 },
+            { start: 2_000_000, end: 2_000_001 },
+        ]);
+        expect(selected_display_row_intervals({ ...empty(), rows }, 1_000_000))
+            .toEqual([{ start: 0, end: 999_999 }]);
+        expect(highlight_selection_from_grid({ ...empty(), rows }, 1_000_000, projection, []))
+            .toMatchObject({
+                selection: { displayRows: [{ start: 0, end: 999_999 }], sourceColumns: [0, 2, 3] },
+                estimatedCellCount: 3_000_000,
+            });
+    });
+
+    it('clamps to the limit and merges adjacent and overlapping slices', () => {
+        const rows = { length: 9, toRanges: () => [[8, 12], [-3, 2], [2, 4], [1, 3]] } as unknown as GridSelection['rows'];
+        expect(compact_intervals(rows, 10)).toEqual([{ start: 0, end: 3 }, { start: 8, end: 9 }]);
+        expect(compact_intervals(rows, 0)).toEqual([]);
+        // As listing them: a slice from 2.5 holds 2.5, 3.5, 4.5, no whole index;
+        // one from 6 to 7.5 holds 6 and 7.
+        const fractional = { length: 3, toRanges: () => [[2.5, 5], [6, 7.5]] } as unknown as GridSelection['rows'];
+        expect(compact_intervals(fractional, 10)).toEqual([{ start: 6, end: 7 }]);
+        // A limit between two indices keeps the one below it, as `< limit` did.
+        const two = { length: 2, toRanges: () => [[0, 2]] } as unknown as GridSelection['rows'];
+        expect(compact_intervals(two, 1.5)).toEqual([{ start: 0, end: 1 }]);
+        expect(compact_intervals(CompactSelection.empty(), 10)).toEqual([]);
+    });
+
+    it('agrees with listing the indices, over random selections', () => {
+        const next = random_source(307);
+        for (let trial = 0; trial < 500; trial++) {
+            const limit = 1 + Math.floor(next() * 20);
+            const selection = random_compact(next, limit);
+            const listed = [...new Set(selection.toArray())]
+                .filter((index) => index >= 0 && index < limit)
+                .sort((a, b) => a - b);
+            const expected: { start: number; end: number }[] = [];
+            for (const index of listed) {
+                const last = expected.at(-1);
+                if (last !== undefined && last.end + 1 === index) last.end = index;
+                else expected.push({ start: index, end: index });
+            }
+            expect(compact_intervals(unexpandable(selection), limit), `trial ${trial}`).toEqual(expected);
+        }
+    });
+});
+
+describe('highlight_selection_from_grid over random selections', () => {
+    it('accepts exactly the selections whose cells form rows × columns, and counts them', () => {
+        const next = random_source(401);
+        const all_columns = create_column_projection(5);
+        for (let trial = 0; trial < 400; trial++) {
+            const row_count = 1 + Math.floor(next() * 12);
+            const rows = random_compact(next, row_count);
+            const columns = next() < 0.3 ? random_compact(next, 5) : CompactSelection.empty();
+            const rect = () => {
+                const x = Math.floor(next() * 5);
+                const y = Math.floor(next() * row_count);
+                return {
+                    x,
+                    y,
+                    width: 1 + Math.floor(next() * (5 - x)),
+                    height: 1 + Math.floor(next() * (row_count - y)),
+                };
+            };
+            const range = next() < 0.5 ? rect() : undefined;
+            const selection: GridSelection = {
+                rows: unexpandable(rows),
+                columns,
+                ...(range === undefined
+                    ? {}
+                    : { current: { cell: [range.x, range.y], range, rangeStack: next() < 0.3 ? [rect()] : [] } }),
+            };
+            // The cells the selection covers, listed one by one.
+            const cells = new Set<string>();
+            for (const row of rows.toArray()) {
+                if (row < 0 || row >= row_count) continue;
+                for (let column = 0; column < 5; column++) cells.add(`${row}:${column}`);
+            }
+            for (const column of columns.toArray()) {
+                if (column < 0 || column >= 5) continue;
+                for (let row = 0; row < row_count; row++) cells.add(`${row}:${column}`);
+            }
+            for (const area of range === undefined ? [] : [range, ...selection.current!.rangeStack]) {
+                for (let row = area.y; row < Math.min(row_count, area.y + area.height); row++) {
+                    for (let column = area.x; column < Math.min(5, area.x + area.width); column++) {
+                        cells.add(`${row}:${column}`);
+                    }
+                }
+            }
+            const covered_rows = new Set([...cells].map((cell) => Number(cell.split(':')[0])));
+            const covered_columns = new Set([...cells].map((cell) => Number(cell.split(':')[1])));
+            const rectangular = cells.size > 0 && cells.size === covered_rows.size * covered_columns.size;
+            const result = highlight_selection_from_grid(selection, row_count, all_columns, []);
+            if (!rectangular) {
+                expect(result, `trial ${trial}`).toBeNull();
+                continue;
+            }
+            expect(result?.estimatedCellCount, `trial ${trial}`).toBe(cells.size);
+            const listed_rows: number[] = [];
+            for (const interval of result!.selection.displayRows) {
+                for (let row = interval.start; row <= interval.end; row++) listed_rows.push(row);
+            }
+            expect(listed_rows, `trial ${trial}`).toEqual([...covered_rows].sort((a, b) => a - b));
+        }
+    });
+});
+
+describe('highlight_selection_may_have_renderable_highlight by source runs', () => {
+    /**
+     * The layout of row-fit-targets.test.ts: fixed rows 0-1, then source 2,
+     * an inserted row and a discarded one, 3 (removed), 6-11, 4, 5 (removed),
+     * then an appended row.
+     */
+    const layout = create_pending_row_projection({
+        sourceDisplayRowCount: 12,
+        sourceRowAt: (row) => (row === 1 ? undefined : row),
+        displayRowForSource: (source) => source,
+        sourceRowCount: 12,
+        bodyStart: 2,
+        bodyViewTransformed: false,
+        changes: {
+            formatTemplates: [{ id: 'plain', format: { kind: 'none' } }],
+            appendedRows: [
+                { id: 'ins', origin: 'insert', cells: {}, formatTemplateId: 'plain', createdOrder: 1 },
+                { id: 'app', cells: {}, formatTemplateId: 'plain', createdOrder: 3 },
+            ],
+            tailRemovals: [],
+            conflicts: [],
+            rowLayout: {
+                runs: [
+                    { kind: 'source', start: 2, count: 1 },
+                    { kind: 'pending', ids: ['gone', 'ins'] },
+                    { kind: 'source', start: 3, count: 1 },
+                    { kind: 'source', start: 6, count: 6 },
+                    { kind: 'source', start: 4, count: 2 },
+                ],
+                removedSourceRows: [{ start: 3, count: 1 }, { start: 5, count: 1 }],
+                discardedPendingRows: [{ id: 'gone', createdOrder: 2 }],
+            },
+        },
+    });
+    // As GridShell resolves a grid row to its source row.
+    const source_row_of = (display_row: number) => {
+        const projected = layout.row_at(display_row);
+        if (projected?.kind === 'source') return projected.identity?.sourceRow;
+        return undefined;
+    };
+    const runs = { deleted_band_start: layout.deletedBandStart, source_row_runs: layout.source_row_runs };
+
+    it('answers as the row walk does, over random selections and highlights', () => {
+        let state = 13;
+        const next = () => {
+            state = (state * 1664525 + 1013904223) >>> 0;
+            return state / 2 ** 32;
+        };
+        let seen_true = 0;
+        for (let trial = 0; trial < 600; trial++) {
+            const display_rows: { start: number; end: number }[] = [];
+            let row = Math.floor(next() * layout.rowCount);
+            for (let count = 1 + Math.floor(next() * 2); count > 0 && row < layout.rowCount; count--) {
+                const end = Math.min(layout.rowCount - 1, row + Math.floor(next() * 4));
+                display_rows.push({ start: row, end });
+                row = end + 2 + Math.floor(next() * 3);
+            }
+            const cells: Record<string, 'yellow'> = {};
+            for (let source = 0; source < 14; source++) {
+                if (next() < 0.15) cells[`${source}:${next() < 0.7 ? 2 : 1}`] = 'yellow';
+            }
+            const selection = { displayRows: display_rows, sourceColumns: [0, 2] };
+            const expected = highlight_selection_may_have_renderable_highlight(selection, cells, source_row_of);
+            if (expected) seen_true += 1;
+            expect(
+                highlight_selection_may_have_renderable_highlight(selection, cells, source_row_of, runs),
+                `trial ${trial} ${JSON.stringify(display_rows)} ${Object.keys(cells).join(' ')}`,
+            ).toBe(expected);
+        }
+        expect(seen_true).toBeGreaterThan(50);
+        expect(seen_true).toBeLessThan(550);
+    });
+
+    it('reads a million saved rows by their run, not row by row', () => {
+        const get_source_row = vi.fn((display_row: number) => display_row);
+        const million = {
+            deleted_band_start: 1_000_000,
+            source_row_runs: () => [{ kind: 'source' as const, displayStart: 0, count: 1_000_000, sourceRow: 0 }],
+        };
+        const selection = { displayRows: [{ start: 0, end: 999_999 }], sourceColumns: [2] };
+        expect(highlight_selection_may_have_renderable_highlight(selection, { '2000000:2': 'blue' }, get_source_row, million))
+            .toBe(false);
+        expect(highlight_selection_may_have_renderable_highlight(selection, { '999999:2': 'blue' }, get_source_row, million))
+            .toBe(true);
+        expect(get_source_row).not.toHaveBeenCalled();
+    });
+});
+
+describe('highlight_selection_from_grid over many disjoint rows', () => {
+    it('checks the rows x columns shape in about one step per interval', () => {
+        // 100,000 separate rows: checking every pair of regions takes
+        // billions of steps; the sweep, hundreds of thousands.
+        const slices = Array.from({ length: 100_000 }, (_, index) => [2 * index, 2 * index + 1] as [number, number]);
+        const rows = {
+            length: slices.length,
+            toRanges: () => slices,
+            hasIndex: (index: number) => index % 2 === 0,
+        } as unknown as GridSelection['rows'];
+        const started = performance.now();
+        const result = highlight_selection_from_grid({ ...empty(), rows }, 200_000, projection, []);
+        expect(performance.now() - started).toBeLessThan(2_000);
+        expect(result?.selection.displayRows).toHaveLength(100_000);
     });
 });

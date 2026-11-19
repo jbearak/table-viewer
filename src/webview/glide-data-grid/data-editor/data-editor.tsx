@@ -632,6 +632,19 @@ export interface DataEditorProps extends Props, Pick<DataGridSearchProps, "image
      */
     readonly getCellsForSelection?: DataGridSearchProps["getCellsForSelection"] | true;
 
+    /**
+     * Fork addition: the most whole rows a native copy or cut of a row
+     * selection reads. Past it a copy takes the first rows only and a cut
+     * takes nothing, and `onCopyRowsLimited` says which. Unset, no limit.
+     */
+    readonly maxCopyRows?: number;
+    /** Fork addition: a row selection's copy was clipped, or its cut refused, by `maxCopyRows`. */
+    readonly onCopyRowsLimited?: (event: {
+        readonly action: "copy" | "cut";
+        readonly selected: number;
+        readonly copied: number;
+    }) => void;
+
     /** The number of columns which should remain in place when scrolling horizontally. The row marker column, if
      * enabled is always frozen and is not included in this count.
      * @defaultValue 0
@@ -856,6 +869,8 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         className,
         onHeaderContextMenu,
         getCellsForSelection: getCellsForSelectionIn,
+        maxCopyRows,
+        onCopyRowsLimited,
         onGroupHeaderContextMenu,
         onGroupHeaderRenamed,
         onCellEdited,
@@ -4226,6 +4241,20 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             };
 
             if (focused && getCellsForSelection !== undefined) {
+                // Fork: a cut of more whole rows than the host allows takes
+                // nothing, and is refused before this operation replaces the
+                // last one, whose payload stays on the clipboard.
+                const rowLimit = maxCopyRows ?? Number.POSITIVE_INFINITY;
+                if (
+                    action === "cut"
+                    && gridSelection.current === undefined
+                    && selectedRows !== undefined
+                    && selectedRows.length > rowLimit
+                ) {
+                    e?.preventDefault();
+                    onCopyRowsLimited?.({ action, selected: selectedRows.length, copied: 0 });
+                    return;
+                }
                 operationId = globalThis.crypto.randomUUID();
                 pendingClipboardOperationIdRef.current = operationId;
                 pendingCutOperationIdRef.current = action === "cut" ? operationId : undefined;
@@ -4243,7 +4272,15 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                         )
                     );
                 } else if (selectedRows !== undefined && selectedRows.length > 0) {
-                    const toCopy = [...selectedRows];
+                    // Fork: read no more rows than the host allows (a cut past
+                    // it was refused above).
+                    const selected = selectedRows.length;
+                    const toCopy: number[] = [];
+                    for (const rowIndex of selectedRows) {
+                        if (toCopy.length >= rowLimit) break;
+                        toCopy.push(rowIndex);
+                    }
+                    if (toCopy.length < selected) onCopyRowsLimited?.({ action, selected, copied: toCopy.length });
                     const cells = toCopy.map(rowIndex => {
                         const thunk = getCellsForSelection(
                             {
@@ -4296,7 +4333,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 }
             }
         },
-        [columnsIn, getCellsForSelection, gridSelection, keybindings.copy, rowMarkerOffset, rows, copyHeaders, mergedCells]
+        [columnsIn, getCellsForSelection, gridSelection, keybindings.copy, rowMarkerOffset, rows, copyHeaders, mergedCells, maxCopyRows, onCopyRowsLimited]
     );
 
     useEventListener("copy", onCopy, safeWindow, false, false);

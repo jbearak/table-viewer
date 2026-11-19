@@ -110,6 +110,16 @@ export interface PendingRowProjection {
      * of `from` in band mode.
      */
     nearest_live_display_row(from: number, limit?: number): number | undefined;
+    /**
+     * The first display row in `[start, end]` that is not a Pending Row
+     * Removal or tail removal, or undefined; reads no further than `end`. In
+     * layout mode removed runs are skipped whole; band mode reads row by row,
+     * stopping at the first row not known removed. Over the source band (as
+     * Auto-fit's offer reads it) a row whose page is not loaded has no state,
+     * so that is at most the rows the loader holds and one more; over the
+     * deleted band it is every row read.
+     */
+    first_live_display_row_in(start: number, end: number): number | undefined;
     /** Expand compressed source-band intervals back into host display space. */
     source_display_intervals(
         intervals: readonly { readonly start: number; readonly end: number }[],
@@ -428,6 +438,13 @@ function create_band_row_projection(
         },
         nearest_live_display_row: (from, limit = NEAREST_LIVE_ROW_SCAN_LIMIT) =>
             nearest_live_by_state(projection, from, limit),
+        first_live_display_row_in: (start, end) => {
+            for (let row = Math.max(0, start); row <= Math.min(end, rowCount - 1); row += 1) {
+                const state = projection.row_state(row);
+                if (state !== 'removed' && state !== 'tail-removal') return row;
+            }
+            return undefined;
+        },
         display_row_for_tail_removal_id: (append_history_id: string): number | undefined => {
             const deleted_index = deleted_index_by_removal_id.get(append_history_id);
             if (deleted_index !== undefined) return deletedBandStart + deleted_index;
@@ -658,6 +675,21 @@ function create_layout_row_projection(
                 return fixed_count > 0 ? fixed_count - 1 : undefined;
             };
             return live_at_or_after(start) ?? (start > 0 ? live_at_or_before(start - 1) : undefined);
+        },
+        first_live_display_row_in: (start, end) => {
+            const first = Math.max(0, start);
+            const last = Math.min(end, rowCount - 1);
+            if (first > last) return undefined;
+            // Fixed rows and the band are live.
+            if (first < fixed_count || first >= layout_end) return first;
+            const last_index = Math.min(last, layout_end - 1) - fixed_count;
+            for (let at = segment_at_display_index(first - fixed_count); at < displayed.length; at++) {
+                const segment = displayed[at]!;
+                if (segment.displayBefore > last_index) break;
+                if (segment.status !== 'live') continue;
+                return fixed_count + Math.max(segment.displayBefore, first - fixed_count);
+            }
+            return layout_end <= last ? layout_end : undefined;
         },
         inline_pending_display_rows: (start, end) => {
             let low = 0;

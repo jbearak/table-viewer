@@ -8,6 +8,7 @@ import type {
 import { parse_cell_highlight_key } from '../cell-highlights';
 import type { ColumnProjection } from './column-projection';
 import { expand_glide_selection } from './selection-glide';
+import type { SourceRowRun } from './pending-row-projection';
 
 export interface HighlightSelectionResult {
     /** The source cells; `sourceColumns` is empty when only Pending Columns are selected. */
@@ -19,14 +20,31 @@ export interface HighlightSelectionResult {
 }
 
 /**
+ * How a projection groups grid rows by their source rows (see
+ * `PendingRowProjection.source_row_runs`), so a probe can read a selection
+ * by its runs rather than its rows.
+ */
+export interface SelectionSourceRuns {
+    /** Grid rows from here on are past the source band, read one by one. */
+    readonly deleted_band_start: number;
+    readonly source_row_runs: (start: number, end: number) => readonly SourceRowRun[];
+}
+
+/**
  * Whether clearing the effective selection could remove a renderable highlight.
  * Unknown display-to-source rows are conservative, but only after a highlight
  * candidate has been found in one of the selected source columns.
+ *
+ * With `runs`, a run of consecutive source rows is checked against the
+ * highlighted rows in one step, so a selection of a million rows in the
+ * layout costs as much as its runs; rows that resolve one at a time are
+ * read one at a time, as without it.
  */
 export function highlight_selection_may_have_renderable_highlight(
     selection: CellHighlightSelection | null,
     cells: Readonly<Record<string, CellHighlightColor>> | undefined,
     get_source_row: (display_row: number) => number | undefined,
+    runs?: SelectionSourceRuns,
 ): boolean {
     if (!selection || !cells || selection.displayRows.length === 0) return false;
     const selected_columns = new Set(selection.sourceColumns);
@@ -41,13 +59,45 @@ export function highlight_selection_may_have_renderable_highlight(
     }
     if (highlighted_source_rows.size === 0) return false;
 
+    const row_may_have = (display_row: number): boolean => {
+        const source_row = get_source_row(display_row);
+        return source_row === undefined || highlighted_source_rows.has(source_row);
+    };
+    const rows_may_have = (start: number, end: number): boolean => {
+        for (let display_row = start; display_row <= end; display_row++) {
+            if (row_may_have(display_row)) return true;
+        }
+        return false;
+    };
+    if (runs === undefined) {
+        return selection.displayRows.some((interval) => rows_may_have(interval.start, interval.end));
+    }
+    const sorted = [...highlighted_source_rows].sort((left, right) => left - right);
+    // Whether a highlighted source row lies in [first, first + count).
+    const highlighted_in = (first: number, count: number): boolean => {
+        let low = 0;
+        let high = sorted.length;
+        while (low < high) {
+            const middle = (low + high) >>> 1;
+            if (sorted[middle] < first) low = middle + 1;
+            else high = middle;
+        }
+        return low < sorted.length && sorted[low] < first + count;
+    };
     for (const interval of selection.displayRows) {
-        for (let display_row = interval.start; display_row <= interval.end; display_row++) {
-            const source_row = get_source_row(display_row);
-            if (source_row === undefined || highlighted_source_rows.has(source_row)) {
-                return true;
+        const source_end = Math.min(interval.end, runs.deleted_band_start - 1);
+        if (interval.start <= source_end) {
+            for (const run of runs.source_row_runs(interval.start, source_end)) {
+                if (run.kind === 'source') {
+                    if (highlighted_in(run.sourceRow, run.count)) return true;
+                } else if (run.kind === 'row') {
+                    if (row_may_have(run.displayRow)) return true;
+                } else if (rows_may_have(run.displayStart, run.displayStart + run.count - 1)) {
+                    return true;
+                }
             }
         }
+        if (rows_may_have(Math.max(interval.start, runs.deleted_band_start), interval.end)) return true;
     }
     return false;
 }
@@ -124,7 +174,7 @@ function compact_indices(selection: GridSelection['rows'], limit: number): numbe
         values = Array.from(selection as Iterable<number>);
     } else {
         // Compatibility for reduced test doubles. Real CompactSelection exposes
-        // toArray and an iterator, so production work scales with selection size.
+        // toRanges, which `compact_intervals` reads instead.
         const first = typeof selection.first === 'function' ? selection.first() : undefined;
         const last = typeof selection.last === 'function' ? selection.last() : undefined;
         if (first === undefined || last === undefined || typeof selection.hasIndex !== 'function') {
@@ -150,11 +200,40 @@ function coalesce_indices(indices: readonly number[]): DisplayRowInterval[] {
     return intervals;
 }
 
+/**
+ * A CompactSelection's indices in `[0, limit)` as ascending, disjoint,
+ * non-adjacent inclusive intervals. Reads the selection's own `[start, end)`
+ * slices, so a selection of a million rows costs as much as one of a few: it
+ * is never expanded into an index per row. Doubles without `toRanges` fall
+ * back to listing their indices.
+ */
+export function compact_intervals(
+    selection: GridSelection['rows'],
+    limit: number,
+): DisplayRowInterval[] {
+    if (limit <= 0 || selection.length === 0) return [];
+    if (typeof selection.toRanges !== 'function') {
+        return coalesce_indices(compact_indices(selection, limit));
+    }
+    const clamped: DisplayRowInterval[] = [];
+    for (const [start, end] of selection.toRanges()) {
+        // A slice lists start, start + 1, ... below end; only whole indices
+        // count, so a slice that starts between two holds none.
+        if (!Number.isInteger(start)) continue;
+        const first = Math.max(0, start);
+        const last = Math.min(Math.ceil(limit) - 1, Math.ceil(end) - 1);
+        if (Number.isSafeInteger(first) && Number.isSafeInteger(last) && first <= last) {
+            clamped.push({ start: first, end: last });
+        }
+    }
+    return merge_display_row_intervals(clamped);
+}
+
 export function selected_display_row_intervals(
     selection: GridSelection,
     row_count: number,
 ): DisplayRowInterval[] | null {
-    const explicit = coalesce_indices(compact_indices(selection.rows, row_count));
+    const explicit = compact_intervals(selection.rows, row_count);
     if (explicit.length > 0) return explicit;
     const current = selection.current;
     if (!current) return null;
@@ -214,33 +293,48 @@ function add_rect(
     }
 }
 
+/**
+ * The number of cells the regions cover together. Regions are grouped by
+ * their column span (a row selection's regions all span every column), and
+ * one sweep over the groups' merged row intervals adds each slab's covered
+ * width, so a selection of many row intervals costs about one step per
+ * interval rather than one per pair.
+ */
 function region_union_area(regions: readonly DisplayRegion[]): bigint {
-    const row_boundaries = [...new Set(regions.flatMap((region) => [
-        region.rows.start,
-        region.rows.end + 1,
-    ]))].sort((a, b) => a - b);
-    const column_boundaries = [...new Set(regions.flatMap((region) => [
-        region.firstColumn,
-        region.lastColumn + 1,
-    ]))].sort((a, b) => a - b);
-    let area = 0n;
-    for (let row_index = 0; row_index + 1 < row_boundaries.length; row_index++) {
-        const row = row_boundaries[row_index];
-        const row_height = row_boundaries[row_index + 1] - row;
-        for (
-            let column_index = 0;
-            column_index + 1 < column_boundaries.length;
-            column_index++
-        ) {
-            const column = column_boundaries[column_index];
-            if (!regions.some((region) =>
-                row >= region.rows.start
-                && row <= region.rows.end
-                && column >= region.firstColumn
-                && column <= region.lastColumn)) continue;
-            area += BigInt(row_height)
-                * BigInt(column_boundaries[column_index + 1] - column);
+    const groups = new Map<string, { firstColumn: number; lastColumn: number; rows: DisplayRowInterval[] }>();
+    for (const region of regions) {
+        const key = `${region.firstColumn}:${region.lastColumn}`;
+        let group = groups.get(key);
+        if (group === undefined) {
+            group = { firstColumn: region.firstColumn, lastColumn: region.lastColumn, rows: [] };
+            groups.set(key, group);
         }
+        group.rows.push(region.rows);
+    }
+    const spans = [...groups.values()].map((group) => ({
+        firstColumn: group.firstColumn,
+        lastColumn: group.lastColumn,
+        rows: merge_display_row_intervals(group.rows),
+    }));
+    const boundaries = [...new Set(spans.flatMap((span) => span.rows.flatMap((rows) => [
+        rows.start,
+        rows.end + 1,
+    ])))].sort((a, b) => a - b);
+    const cursors = spans.map(() => 0);
+    let area = 0n;
+    for (let index = 0; index + 1 < boundaries.length; index++) {
+        const row = boundaries[index];
+        const columns: DisplayRowInterval[] = [];
+        spans.forEach((span, at) => {
+            while (cursors[at] < span.rows.length && span.rows[cursors[at]].end < row) cursors[at] += 1;
+            const rows = span.rows[cursors[at]];
+            if (rows !== undefined && rows.start <= row) {
+                columns.push({ start: span.firstColumn, end: span.lastColumn });
+            }
+        });
+        let width = 0;
+        for (const covered of merge_display_row_intervals(columns)) width += covered.end - covered.start + 1;
+        area += BigInt(boundaries[index + 1] - row) * BigInt(width);
     }
     return area;
 }
@@ -257,7 +351,7 @@ export function highlight_selection_from_grid(
 
     const display_merges = project_merges_to_display(merges, column_projection);
     const regions: DisplayRegion[] = [];
-    for (const rows of coalesce_indices(compact_indices(grid_selection.rows, row_count))) {
+    for (const rows of compact_intervals(grid_selection.rows, row_count)) {
         add_rect(
             {
                 x: 0,
@@ -272,9 +366,7 @@ export function highlight_selection_from_grid(
             regions,
         );
     }
-    for (const columns of coalesce_indices(
-        compact_indices(grid_selection.columns, display_column_count),
-    )) {
+    for (const columns of compact_intervals(grid_selection.columns, display_column_count)) {
         add_rect(
             {
                 x: columns.start,
