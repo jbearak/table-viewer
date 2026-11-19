@@ -577,7 +577,9 @@ describe('highlight_selection_may_have_renderable_highlight by source runs', () 
         const get_source_row = vi.fn((display_row: number) => display_row);
         const million = {
             deleted_band_start: 1_000_000,
-            source_row_runs: () => [{ kind: 'source' as const, displayStart: 0, count: 1_000_000, sourceRow: 0 }],
+            source_row_runs: () => [{
+                kind: 'source' as const, displayStart: 0, count: 1_000_000, sourceRow: 0, sourceDisplayStart: 0,
+            }],
         };
         const selection = { displayRows: [{ start: 0, end: 999_999 }], sourceColumns: [2] };
         expect(highlight_selection_may_have_renderable_highlight(selection, { '2000000:2': 'blue' }, get_source_row, million))

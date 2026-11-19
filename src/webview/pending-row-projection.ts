@@ -76,6 +76,11 @@ export interface PendingRowProjection {
     readonly rowCount: number;
     /** Whether the layout mode is in use (see the module comment). */
     readonly layoutMode: boolean;
+    /**
+     * Rows `[0, fixedRowCount)` are the rows above the body in layout mode,
+     * where display row and source-display row are the same; band mode has none.
+     */
+    readonly fixedRowCount: number;
     row_at(display_row: number): PendingProjectedRow | undefined;
     /** Undefined outside the grid, or for a source row whose identity is not yet resident. */
     row_state(display_row: number): ProjectedRowState | undefined;
@@ -128,7 +133,14 @@ export interface PendingRowProjection {
 
 /** See `PendingRowProjection.source_row_runs`. */
 export type SourceRowRun =
-    | { readonly kind: 'source'; readonly displayStart: number; readonly count: number; readonly sourceRow: number }
+    | {
+        readonly kind: 'source';
+        readonly displayStart: number;
+        readonly count: number;
+        readonly sourceRow: number;
+        /** The source-display row of `sourceRow`; the run's rows follow it one for one. */
+        readonly sourceDisplayStart: number;
+    }
     | { readonly kind: 'sourceDisplay'; readonly displayStart: number; readonly count: number; readonly sourceDisplayStart: number }
     | { readonly kind: 'row'; readonly displayRow: number };
 
@@ -344,6 +356,7 @@ function create_band_row_projection(
         pendingBandStart,
         rowCount,
         layoutMode: false,
+        fixedRowCount: 0,
         row_state: (display_row) => {
             const projected = projection.row_at(display_row);
             if (projected === undefined) return undefined;
@@ -542,6 +555,7 @@ function create_layout_row_projection(
         pendingBandStart: layout_end,
         rowCount,
         layoutMode: true,
+        fixedRowCount: fixed_count,
         row_at: (display_row) => {
             if (!Number.isSafeInteger(display_row) || display_row < 0 || display_row >= rowCount) {
                 return undefined;
@@ -642,11 +656,13 @@ function create_layout_row_projection(
                 const low = Math.max(low_index, segment.displayBefore);
                 const high = Math.min(high_index, segment.displayBefore + segment.count - 1);
                 if (high < low) continue;
+                const sourceRow = segment.start + low - segment.displayBefore;
                 runs.push({
                     kind: 'source',
                     displayStart: fixed_count + low,
                     count: high - low + 1,
-                    sourceRow: segment.start + low - segment.displayBefore,
+                    sourceRow,
+                    sourceDisplayStart: source_display_row_of(sourceRow)!,
                 });
             }
             return runs;

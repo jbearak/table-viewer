@@ -2,7 +2,7 @@
 /* eslint-disable unicorn/no-for-loop */
 import { deepEqual } from "../../../common/support.js";
 import { type Rectangle } from "../data-grid-types.js";
-import { getStickyWidth, type MappedGridColumn, getFreezeTrailingHeight } from "./data-grid-lib.js";
+import { getStickyWidth, type MappedGridColumn, getFreezeTrailingHeight, rowSpanHeight } from "./data-grid-lib.js";
 import { walkColumns } from "./data-grid-render.walk.js";
 import type { DrawGridArg } from "./draw-grid-arg.js";
 
@@ -46,14 +46,8 @@ export function blitLastFrame(
     ctx.imageSmoothingEnabled = false;
     const minY = Math.min(last.cellYOffset, cellYOffset);
     const maxY = Math.max(last.cellYOffset, cellYOffset);
-    let deltaY = 0;
-    if (typeof getRowHeight === "number") {
-        deltaY += (maxY - minY) * getRowHeight;
-    } else {
-        for (let i = minY; i < maxY; i++) {
-            deltaY += getRowHeight(i);
-        }
-    }
+    // Fork change: by arithmetic or the callable's prefix index when it has one.
+    let deltaY = rowSpanHeight(getRowHeight, minY, maxY);
     if (cellYOffset > last.cellYOffset) {
         deltaY = -deltaY;
     }

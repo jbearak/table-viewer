@@ -21,6 +21,7 @@ import {
     cellIsInRange,
     getFreezeTrailingHeight,
     drawLastUpdateUnderlay,
+    rowSpanHeight,
 } from "./data-grid-lib.js";
 import type { SpriteManager } from "../data-grid-sprites.js";
 import { mergeAndRealizeTheme, type FullTheme, type Theme } from "../../../common/styles.js";
@@ -271,16 +272,13 @@ export function drawCells(
                             if (c.sticky) handledStickyMerges = handled;
                             else handledMerges = handled;
                         }
-                        // Walk the merge's rows once, summing its height and
-                        // backing drawY up to the anchor row (which may sit
-                        // above the viewport).
-                        let mergeY = drawY;
-                        let mergeH = 0;
-                        for (let r = mergeRange.y; r < mergeRange.y + mergeRange.height; r++) {
-                            const rowH = getRowHeight(r);
-                            mergeH += rowH;
-                            if (r < row) mergeY -= rowH;
-                        }
+                        // The merge's height, and drawY backed up to the anchor
+                        // row (which may sit above the viewport). Fork change:
+                        // by prefix differences when the heights carry an
+                        // index (a number always does, see drawGrid), so a
+                        // tall merge costs no walk of its rows.
+                        const mergeH = rowSpanHeight(getRowHeight, mergeRange.y, mergeRange.y + mergeRange.height);
+                        const mergeY = drawY - rowSpanHeight(getRowHeight, mergeRange.y, Math.min(row, mergeRange.y + mergeRange.height));
                         let area: Rectangle | undefined;
                         if (mergeRange.width === 1) {
                             // Single-column (vertical) merge: the bounds are

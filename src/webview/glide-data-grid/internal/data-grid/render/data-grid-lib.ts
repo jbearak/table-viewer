@@ -182,6 +182,66 @@ export function getStickyWidth(
     return result;
 }
 
+/**
+ * Fork addition: a row-height callable may carry a prefix index of its heights
+ * (`rowHeightIndex`), so code that would add up every row above a point asks
+ * it instead. `top(row)` is the sum of the heights of rows `[0, row)` and
+ * `rowAtY(y)` the first row `r >= 0` with `top(r + 1) > y`; both agree exactly
+ * with a running sum of the callable's own heights from row 0.
+ */
+export interface RowHeightPrefix {
+    top(row: number): number;
+    rowAtY(y: number): number;
+}
+
+/** Fork addition: the prefix index a row-height callable carries, if any. */
+export function rowHeightPrefixOf(
+    rowHeight: number | ((row: number) => number)
+): RowHeightPrefix | undefined {
+    if (typeof rowHeight === "number") return undefined;
+    return (rowHeight as { readonly rowHeightIndex?: RowHeightPrefix }).rowHeightIndex;
+}
+
+/**
+ * Fork addition: a uniform row height as a callable carrying its prefix index.
+ */
+export function uniformRowHeight(height: number): ((row: number) => number) & {
+    readonly rowHeightIndex: RowHeightPrefix;
+} {
+    const callable = () => height;
+    return Object.assign(callable, {
+        rowHeightIndex: {
+            top: (row: number) => row * height,
+            rowAtY: (y: number) => {
+                if (Number.isNaN(y) || y <= 0) return 0;
+                if (y === Number.POSITIVE_INFINITY) return y;
+                let row = Math.floor(y / height);
+                while (row > 0 && row * height > y) row--;
+                while ((row + 1) * height <= y) row++;
+                return row;
+            },
+        },
+    });
+}
+
+/**
+ * Fork addition: the sum of the heights of rows `[start, end)`: arithmetic for
+ * a number, prefix differences for an indexed callable, else row by row.
+ */
+export function rowSpanHeight(
+    rowHeight: number | ((row: number) => number),
+    start: number,
+    end: number
+): number {
+    if (end <= start) return 0;
+    if (typeof rowHeight === "number") return (end - start) * rowHeight;
+    const prefix = rowHeightPrefixOf(rowHeight);
+    if (prefix !== undefined) return prefix.top(end) - prefix.top(start);
+    let total = 0;
+    for (let row = start; row < end; row++) total += rowHeight(row);
+    return total;
+}
+
 export function getFreezeTrailingHeight(
     rows: number,
     freezeTrailingRows: number,
@@ -1048,15 +1108,13 @@ export function computeBounds(
         }
         result.height += 1;
     } else {
-        const dir = cellYOffset > row ? -1 : 1;
-        if (typeof rowHeight === "number") {
-            const delta = row - cellYOffset;
-            result.y += delta * rowHeight;
-        } else {
-            for (let r = cellYOffset; r !== row; r += dir) {
-                result.y += rowHeight(r) * dir;
-            }
-        }
+        // Fork change: the rows between `cellYOffset` and `row`, by arithmetic
+        // or the callable's prefix index when it has one. Upstream's loop,
+        // for a row above `cellYOffset`, subtracted the heights of rows
+        // `row + 1 … cellYOffset` rather than `row … cellYOffset - 1`.
+        result.y += row >= cellYOffset
+            ? rowSpanHeight(rowHeight, cellYOffset, row)
+            : -rowSpanHeight(rowHeight, row, cellYOffset);
         result.height = (typeof rowHeight === "number" ? rowHeight : rowHeight(row)) + 1;
     }
 

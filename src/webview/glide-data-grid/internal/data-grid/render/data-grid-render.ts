@@ -2,7 +2,7 @@
 /* eslint-disable unicorn/no-for-loop */
 import { type Rectangle } from "../data-grid-types.js";
 import { CellSet } from "../cell-set.js";
-import { getEffectiveColumns, type MappedGridColumn, rectBottomRight } from "./data-grid-lib.js";
+import { getEffectiveColumns, type MappedGridColumn, rectBottomRight, uniformRowHeight } from "./data-grid-lib.js";
 import { blend } from "../color-parser.js";
 import { assert } from "../../../common/support.js";
 import type { DrawGridArg } from "./draw-grid-arg.js";
@@ -237,7 +237,9 @@ export function drawGrid(arg: DrawGridArg, lastArg: DrawGridArg | undefined) {
     const targetBuffer = targetCtx.canvas;
     const blitSource = doubleBuffer ? (targetBuffer === bufferA ? bufferB : bufferA) : canvas;
 
-    const getRowHeight = typeof rowHeight === "number" ? () => rowHeight : rowHeight;
+    // Fork change: a number becomes a callable carrying its prefix index, so
+    // code summing rows (a merged cell's height) does it by arithmetic.
+    const getRowHeight = typeof rowHeight === "number" ? uniformRowHeight(rowHeight) : rowHeight;
 
     overlayCtx.save();
     targetCtx.save();

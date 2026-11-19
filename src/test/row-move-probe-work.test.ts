@@ -228,7 +228,11 @@ describe('probe_row_move_runs work', () => {
                 deletedBandStart: runs,
                 row_at: () => undefined,
                 source_row_runs: (start, end) => Array.from({ length: end - start + 1 }, (_, offset) => ({
-                    kind: 'source' as const, displayStart: start + offset, count: 1, sourceRow: BODY_START + start + offset,
+                    kind: 'source' as const,
+                    displayStart: start + offset,
+                    count: 1,
+                    sourceRow: BODY_START + start + offset,
+                    sourceDisplayStart: start + offset,
                 })),
             },
             [{ start: 0, end: runs - 1 }],

@@ -2,6 +2,71 @@ import * as React from "react";
 import DataGridDnd, { type DataGridDndProps } from "../data-grid-dnd/data-grid-dnd.js";
 import type { Rectangle } from "../data-grid/data-grid-types.js";
 import { InfiniteScroller } from "./infinite-scroller.js";
+import { rowHeightPrefixOf, rowSpanHeight } from "../data-grid/render/data-grid-lib.js";
+
+/**
+ * Fork addition: the vertical part of `processArgs`, pure. The first visible
+ * row `cellY`, one past the last `cellBottom`, and the offset `ty` of the
+ * first row's top from the viewport's (zero or negative) for a viewport `y`
+ * px down the rows and `height` px tall. With a prefix-indexed callable it
+ * starts the walk at the row holding `y` instead of at row 0: every row
+ * before it ends at or above `y`, which is the walk's first branch, so the
+ * result is the same and only the visible rows are walked.
+ */
+export function verticalRegion(
+    y: number,
+    height: number,
+    rows: number,
+    rowHeight: number | ((row: number) => number),
+    smoothScrollY: boolean | undefined
+): { readonly cellY: number; readonly cellBottom: number; readonly ty: number } {
+    let ty = 0;
+    let cellY = 0;
+    let cellBottom = 0;
+    if (typeof rowHeight === "number") {
+        if (smoothScrollY) {
+            cellY = Math.floor(y / rowHeight);
+            ty = cellY * rowHeight - y;
+        } else {
+            cellY = Math.ceil(y / rowHeight);
+        }
+        cellBottom = Math.ceil(height / rowHeight) + cellY;
+        if (ty < 0) cellBottom++;
+        return { cellY, cellBottom, ty };
+    }
+    let start = 0;
+    let top = 0;
+    const prefix = rowHeightPrefixOf(rowHeight);
+    if (prefix !== undefined) {
+        start = Math.min(prefix.rowAtY(y), rows);
+        top = prefix.top(start);
+        cellY = start;
+        cellBottom = start;
+    }
+    for (let row = start; row < rows; row++) {
+        const rh = rowHeight(row);
+        const cy = top + (smoothScrollY ? 0 : rh / 2);
+        if (y >= top + rh) {
+            top += rh;
+            cellY++;
+            cellBottom++;
+        } else if (y > cy) {
+            top += rh;
+            if (smoothScrollY) {
+                ty += cy - y;
+            } else {
+                cellY++;
+            }
+            cellBottom++;
+        } else if (y + height > rh / 2 + top) {
+            top += rh;
+            cellBottom++;
+        } else {
+            break;
+        }
+    }
+    return { cellY, cellBottom, ty };
+}
 
 type Props = Omit<DataGridDndProps, "width" | "height" | "eventTargetRef">;
 
@@ -152,13 +217,8 @@ const GridScroller: React.FunctionComponent<ScrollingDataGridProps> = p => {
     const scrollWidth = Math.max(scrollContentWidth, resizeScrollWidthFloor ?? 0);
 
     let height = enableGroups ? headerHeight + groupHeaderHeight : headerHeight;
-    if (typeof rowHeight === "number") {
-        height += rows * rowHeight;
-    } else {
-        for (let r = 0; r < rows; r++) {
-            height += rowHeight(r);
-        }
-    }
+    // Fork change: by arithmetic or the callable's prefix index when it has one.
+    height += rowSpanHeight(rowHeight, 0, rows);
     if (overscrollY !== undefined) {
         height += overscrollY;
     }
@@ -203,43 +263,8 @@ const GridScroller: React.FunctionComponent<ScrollingDataGridProps> = p => {
             }
         }
 
-        let ty = 0;
-        let cellY = 0;
-        let cellBottom = 0;
-        if (typeof rowHeight === "number") {
-            if (smoothScrollY) {
-                cellY = Math.floor(args.y / rowHeight);
-                ty = cellY * rowHeight - args.y;
-            } else {
-                cellY = Math.ceil(args.y / rowHeight);
-            }
-            cellBottom = Math.ceil(args.height / rowHeight) + cellY;
-            if (ty < 0) cellBottom++;
-        } else {
-            let y = 0;
-            for (let row = 0; row < rows; row++) {
-                const rh = rowHeight(row);
-                const cy = y + (smoothScrollY ? 0 : rh / 2);
-                if (args.y >= y + rh) {
-                    y += rh;
-                    cellY++;
-                    cellBottom++;
-                } else if (args.y > cy) {
-                    y += rh;
-                    if (smoothScrollY) {
-                        ty += cy - args.y;
-                    } else {
-                        cellY++;
-                    }
-                    cellBottom++;
-                } else if (args.y + args.height > rh / 2 + y) {
-                    y += rh;
-                    cellBottom++;
-                } else {
-                    break;
-                }
-            }
-        }
+        // Fork change: see `verticalRegion`.
+        const { cellY, cellBottom, ty } = verticalRegion(args.y, args.height, rows, rowHeight, smoothScrollY);
 
         const rect: Rectangle = {
             x: cellX,

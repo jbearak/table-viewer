@@ -8519,6 +8519,105 @@ describe('GridShell row auto-fit', () => {
 });
 
 describe('GridShell row resizing', () => {
+    type IndexedHeight = ((row: number) => number) & {
+        readonly rowHeightIndex: { top(row: number): number; height(row: number): number; rowAtY(y: number): number };
+    };
+    const indexed_height = () => {
+        const row_height = grid_mock.props!.rowHeight;
+        expect(typeof row_height).toBe('function');
+        return row_height as IndexedHeight;
+    };
+    const six_rows = (overrides: Partial<GridShellProps> = {}) => props({
+        sheet_meta: { ...props().sheet_meta, rowCount: 6, sourceRowCount: 6 },
+        row_count: 6,
+        ...overrides,
+    });
+
+    it('hands the grid its row heights with an index that agrees with them', async () => {
+        await render_grid(six_rows({
+            row_heights: { 1: 36, 3: 52, 9: 99 },
+            row_height_overlay: [{ rows: [{ start: 3, end: 4 }], height: 40, requestId: 'drag' }],
+        }));
+        const row_height = indexed_height();
+        const expected = [24, 36, 24, 40, 40, 24];
+        expect(expected.map((_, row) => row_height(row))).toEqual(expected);
+        expect(expected.map((_, row) => row_height.rowHeightIndex.height(row))).toEqual(expected);
+        // Past the last row every row takes the default, whatever is stored at its number.
+        expect(row_height(9)).toBe(24);
+        let top = 0;
+        for (let row = 0; row <= expected.length; row++) {
+            expect(row_height.rowHeightIndex.top(row)).toBe(top);
+            top += expected[row] ?? 24;
+        }
+        expect(row_height.rowHeightIndex.rowAtY(24 + 36 + 1)).toBe(2);
+    });
+
+    it('keeps the same row heights across a page arrival, and changes them with the stored heights', async () => {
+        const shell_props = six_rows({ row_heights: { 1: 36 } });
+        const GridShell = await render_grid(shell_props);
+        const before = indexed_height();
+        grid_mock.loader_version = 1;
+        await act(async () => {
+            root!.render(React.createElement(GridShell, { ...shell_props }));
+        });
+        expect(grid_mock.props!.rowHeight).toBe(before);
+        // Another record with the same heights: still the same.
+        await act(async () => {
+            root!.render(React.createElement(GridShell, { ...shell_props, row_heights: { 1: 36 } }));
+        });
+        expect(grid_mock.props!.rowHeight).toBe(before);
+        await act(async () => {
+            root!.render(React.createElement(GridShell, { ...shell_props, row_heights: { 1: 36, 2: 48 } }));
+        });
+        const after = indexed_height();
+        expect(after).not.toBe(before);
+        expect(after(2)).toBe(48);
+        expect(after.rowHeightIndex.top(3)).toBe(24 + 36 + 48);
+    });
+
+    it('follows a pending row whose height changes, through the store', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['band-a'], { id: 'plain', format: { kind: 'none' } }, 1);
+        await render_grid(six_rows({
+            row_heights: { 0: 30 },
+            editing_session_held: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+        }));
+        expect(indexed_height()(6)).toBe(24);
+        await act(async () => {
+            pending.set_row_heights('session', new Set(['band-a']), 64);
+        });
+        const row_height = indexed_height();
+        expect(row_height(6)).toBe(64);
+        expect(row_height.rowHeightIndex.top(7)).toBe(30 + 5 * 24 + 64);
+    });
+
+    it('starts a border drag at the drawn height of a row taller than the grid draws', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['band-a'], { id: 'plain', format: { kind: 'none' } }, 1);
+        pending.set_row_heights('session', new Set(['band-a']), 8192);
+        await render_grid(six_rows({
+            row_heights: { 0: 30 },
+            editing_session_held: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+        }));
+        expect(indexed_height()(6)).toBe(4096);
+        // A drag on its bottom border starts from the 4,096 px the grid draws,
+        // so the guide does not jump to 8,192 px less on its first move.
+        const on_mouse_move = grid_mock.props!.onMouseMove as (args: Record<string, unknown>) => void;
+        grid_mock.row_resize_set_target.mockClear();
+        on_mouse_move({
+            kind: 'cell', location: [0, 6], buttons: 0,
+            bounds: { x: 30, y: 60, width: 100, height: 4096 },
+            localEventX: 10, localEventY: 4094,
+        });
+        expect(grid_mock.row_resize_set_target).toHaveBeenLastCalledWith({ row: 6, boundary_y: 60 + 4096, height: 4096 });
+    });
+
     it('resizes every selected row when the dragged row belongs to the selection', async () => {
         const on_row_resize = vi.fn();
         await render_grid(props({

@@ -324,10 +324,20 @@ import {
     line_height_for_font,
     natural_row_height,
     custom_height_row_count,
-    resolved_row_height,
+    DEFAULT_ROW_HEIGHT_PX,
     type RowHeightLayer,
     type RowHeightOverrides,
 } from './row-heights';
+import { create_row_height_index, geometry_row_height, indexed_row_height, type RowHeightIndex } from './row-height-index';
+import {
+    display_height_runs,
+    preview_row_height_index,
+    raw_row_height_of,
+    same_row_heights,
+    source_display_height_runs,
+    type RowHeightInputs,
+    type RowHeightPreview,
+} from './row-height-runs';
 
 /** Pixel proximity to a row border that arms the resize strip. */
 const ROW_RESIZE_TOLERANCE_PX = 5;
@@ -2152,7 +2162,10 @@ export function GridShell({
     // The configured font size, resolved once from the theme so cell painting,
     // canvas measurement, and default row heights all agree.
     const font_size_px = theme_font_size_px(theme);
-    const default_row_height = default_row_height_for_font(font_size_px);
+    // Clamped like every drawn height (`geometry_row_height`), so the number
+    // handed to the grid, the index, the merge and wrap checks and the fit's
+    // "is it the default" all see one value.
+    const default_row_height = geometry_row_height(default_row_height_for_font(font_size_px), DEFAULT_ROW_HEIGHT_PX);
     const grid_ref = useRef<DataEditorRef | null>(null);
     // Saving folds a link dialog through this handle before snapshotting the
     // workbook, just as it folds Glide's cell overlay through read_live_edit.
@@ -7990,39 +8003,29 @@ export function GridShell({
         }
         return undefined;
     }, [pending_payload_revision, pending_projection, pending_template_formats]);
+    const row_height_inputs = useMemo((): RowHeightInputs => ({
+        projection: pending_projection,
+        rowHeights: row_heights,
+        layers: row_height_overlay,
+        defaultHeight: default_row_height,
+        structuralHeight: structural_row_height,
+    }), [default_row_height, pending_projection, row_heights, row_height_overlay, structural_row_height]);
+    const row_height_preview = useMemo((): RowHeightPreview | undefined => (
+        row_resize_preview
+            ? { row: row_resize_preview.row, rows: row_resize_preview.preview_rows, height: row_resize_preview.height }
+            : undefined
+    ), [row_resize_preview]);
+    /**
+     * A row's height as it is saved and fitted (`raw_row_height_of`): the
+     * preview unless `include_preview` is false, an unsaved row's own height,
+     * the layers, the stored height, the default.
+     */
     const effective_row_height = useCallback((
         row: number,
         include_preview = true,
-    ): number => {
-        if (
-            include_preview
-            && row_resize_preview
-            && (
-                row_resize_preview.row === row
-                || row_resize_preview.preview_rows?.hasIndex(row)
-            )
-        ) return row_resize_preview.height;
-        const projected = pending_projection.row_at(row);
-        // The stored heights and the layers over them are the host's, keyed
-        // by its display rows. An unsaved row is not one of those: with no
-        // height of its own it takes the default, not the height of the
-        // saved row that its place in the grid happens to number.
-        if (projected !== undefined && projected.kind !== 'source') {
-            return structural_row_height(row) ?? default_row_height;
-        }
-        return resolved_row_height(
-            row_heights,
-            row_height_overlay,
-            projected?.sourceDisplayRow ?? row,
-            default_row_height,
-        );
-    }, [
-        default_row_height,
-        row_heights,
-        row_height_overlay,
-        pending_projection,
-        row_resize_preview,
-        structural_row_height,
+    ): number => raw_row_height_of(row_height_inputs, row_height_preview, row, include_preview), [
+        row_height_inputs,
+        row_height_preview,
     ]);
 
     const planned_auto_grow_height = useCallback((
@@ -8322,24 +8325,32 @@ export function GridShell({
         }
         return default_row_height;
     }, [default_row_height, pending_rows, row_height_overlay, row_heights, row_resize_preview]);
-    const get_row_height = useMemo(() => {
-        // Glide walks the visible rows once per column and getCellContent runs for
-        // every cell. Keep row-height layer searches at roughly once per row, as
-        // row-heights.ts budgets, without retaining an unbounded sheet-sized map.
-        const cache = new Map<number, number>();
-        return (row: number): number => {
-            const cached = cache.get(row);
-            if (cached !== undefined) return cached;
-            const height = effective_row_height(row);
-            // A 512-row viewport is already over 12,000px at the minimum row
-            // height. Clear rather than let non-paint consumers grow this forever.
-            if (cache.size >= 512) cache.clear();
-            cache.set(row, height);
-            return height;
-        };
-    }, [
-        effective_row_height,
-    ]);
+    // Every row's drawn height as an index (`row-height-runs.ts`), rebuilt in
+    // proportion to the stored heights, the layers, the projection's runs and
+    // the unsaved rows, never to the rows. The stored heights under the layers
+    // first, which page arrivals and edits leave alone.
+    const source_display_runs = useMemo(
+        () => source_display_height_runs(row_heights, row_height_overlay, default_row_height),
+        [default_row_height, row_heights, row_height_overlay],
+    );
+    const base_row_height_index_ref = useRef<RowHeightIndex | null>(null);
+    const base_row_height_index = useMemo((): RowHeightIndex => {
+        const next = create_row_height_index(
+            row_height_inputs.projection.rowCount,
+            default_row_height,
+            display_height_runs(row_height_inputs, source_display_runs),
+        );
+        // Heights do not depend on loaded pages: a rebuild that changes no
+        // height keeps the previous index, so what the grid keys on it holds.
+        const previous = base_row_height_index_ref.current;
+        return previous !== null && same_row_heights(previous, next) ? previous : next;
+    }, [default_row_height, row_height_inputs, source_display_runs]);
+    base_row_height_index_ref.current = base_row_height_index;
+    /** The grid's row heights: the index's, with the drag preview painted over them. */
+    const get_row_height = useMemo(
+        () => indexed_row_height(preview_row_height_index(base_row_height_index, row_height_preview)),
+        [base_row_height_index, row_height_preview],
+    );
 
     const get_cell_height = useCallback((row: number, display_column: number): number => {
         // Glide requests a merged block at its anchor coordinates, but paints it
@@ -8347,9 +8358,8 @@ export function GridShell({
         // the span, not merely the anchor row's height.
         const entry = merge_index.is_anchor(row, display_column);
         const last_row = entry?.endRow ?? row;
-        let height = 0;
-        for (let r = row; r <= last_row; r++) height += get_row_height(r);
-        return height;
+        const index = get_row_height.rowHeightIndex;
+        return index.top(last_row + 1) - index.top(row);
     }, [get_row_height, merge_index]);
 
     const get_cell_width = useCallback((row: number, display_column: number): number => {
@@ -10708,11 +10718,14 @@ export function GridShell({
                 ? {
                       row: hit.row,
                       boundary_y: hit.boundary_y,
-                      height: effective_row_height(hit.row, false),
+                      // The drawn height, so the guide starts at the border
+                      // the grid paints; a drag that ends where it started
+                      // writes nothing, so a stored height stays as it was.
+                      height: geometry_row_height(effective_row_height(hit.row, false), default_row_height),
                   }
                 : null,
         );
-    }, [effective_row_height]);
+    }, [default_row_height, effective_row_height]);
 
     // The hover half of the row-resize strip (see `on_mouse_move` for the
     // other), and the truncated-cell tooltip: dwell on an overflowing cell
