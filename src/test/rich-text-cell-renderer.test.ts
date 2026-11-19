@@ -406,6 +406,10 @@ describe('rich_cell_fit', () => {
         expect(fit([[{ text: 'a' }, { text: ' '.repeat(27), style: { underline: true } }]], 100).fits_default)
             .toBe(false);
         expect(fit([[{ text: 'a' }, { text: ' '.repeat(27) }]], 100).fits_default).toBe(true);
+        // Text and its trailing spaces in one underlined segment: the
+        // underline runs across the spaces, past the edge of a 100px cell.
+        expect(fit([[{ text: 'b' + ' '.repeat(10), style: { underline: true } }]], 100).fits_default).toBe(false);
+        expect(fit([[{ text: 'b' + ' '.repeat(10) }]], 100).fits_default).toBe(true);
     });
 
     it('takes a line break as wrapping at the default height, with no character cap', () => {
