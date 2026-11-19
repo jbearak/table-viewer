@@ -8233,9 +8233,14 @@ describe('GridShell row auto-fit', () => {
         expect(grid_mock.row_resize_set_target).toHaveBeenCalledWith(null);
     });
 
-    it('takes the border strip down when row heights change under it', async () => {
+    it('takes the border strip down when row heights change under it, and only then', async () => {
         await render_fit({ 0: 'a', 1: 'b', 2: 'c', 3: 'd' }, { row_heights: { 0: 72 } });
         grid_mock.row_resize_set_target.mockClear();
+        // A render for something else leaves it where it is.
+        await act(async () => {
+            root!.render(React.createElement(fit_shell, { ...fit_props, show_formatting: true }));
+        });
+        expect(grid_mock.row_resize_set_target).not.toHaveBeenCalled();
         await act(async () => {
             root!.render(React.createElement(fit_shell, { ...fit_props, row_heights: {} }));
         });
