@@ -172,7 +172,7 @@ export function row_fit_targets(
 export function rows_hold_fit_target(
     projection: Pick<
         PendingRowProjection,
-        'layoutMode' | 'nearest_live_display_row' | 'row_state' | 'rowCount' | 'deletedBandStart' | 'pendingBandStart'
+        'layoutMode' | 'first_live_display_row_in' | 'row_state' | 'rowCount' | 'deletedBandStart' | 'pendingBandStart'
     >,
     rows: readonly DisplayRowInterval[],
 ): boolean {
@@ -181,8 +181,7 @@ export function rows_hold_fit_target(
         const end = Math.min(projection.rowCount - 1, interval.end);
         if (start > end) continue;
         if (projection.layoutMode) {
-            const live = projection.nearest_live_display_row(start);
-            if (live !== undefined && live >= start && live <= end) return true;
+            if (projection.first_live_display_row_in(start, end) !== undefined) return true;
             continue;
         }
         if (end >= projection.pendingBandStart) return true;

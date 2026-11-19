@@ -301,4 +301,59 @@ describe('rows_hold_fit_target', () => {
         expect(rows_hold_fit_target(sorted_removed(undefined), every_row)).toBe(false);
         expect(rows_hold_fit_target(sorted_removed(15_000), every_row)).toBe(true);
     });
+
+    it('finds the first live row of an interval as a row walk does, in every projection', () => {
+        const projections = [
+            band_projection([8, 9, 10, 11], ['replacement']),
+            sorted_projection_with_removals(),
+            layout_projection(),
+            layout_projection(true),
+        ];
+        for (const [index, projection] of projections.entries()) {
+            for (let start = 0; start < projection.rowCount; start++) {
+                for (let end = start; end < projection.rowCount; end++) {
+                    let expected: number | undefined;
+                    for (let row = start; row <= end && expected === undefined; row++) {
+                        const state = projection.row_state(row);
+                        if (state !== 'removed' && state !== 'tail-removal') expected = row;
+                    }
+                    expect(projection.first_live_display_row_in(start, end), `projection ${index} [${start}, ${end}]`)
+                        .toBe(expected);
+                }
+            }
+        }
+    });
+
+    it('reads no further than each interval when many removed runs follow one another', () => {
+        // 200,000 moved rows: the even ones first, all removed, then the odd
+        // ones. A search from each removed row to the next live one would
+        // read on through every removed run after it.
+        const count = 200_000;
+        const runs = [
+            ...Array.from({ length: count / 2 }, (_, index) => ({ kind: 'source' as const, start: 2 * index, count: 1 })),
+            ...Array.from({ length: count / 2 }, (_, index) => ({ kind: 'source' as const, start: 2 * index + 1, count: 1 })),
+        ];
+        const projection = create_pending_row_projection({
+            sourceDisplayRowCount: count,
+            sourceRowAt: (row) => row,
+            displayRowForSource: (source) => source,
+            sourceRowCount: count,
+            bodyViewTransformed: false,
+            changes: {
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+                rowLayout: {
+                    runs,
+                    removedSourceRows: Array.from({ length: count / 2 }, (_, index) => ({ start: 2 * index, count: 1 })),
+                    discardedPendingRows: [],
+                },
+            },
+        });
+        const removed_rows = Array.from({ length: count / 4 }, (_, index) => ({ start: 2 * index, end: 2 * index }));
+        const started = performance.now();
+        expect(rows_hold_fit_target(projection, removed_rows)).toBe(false);
+        expect(performance.now() - started).toBeLessThan(1_000);
+    });
 });
