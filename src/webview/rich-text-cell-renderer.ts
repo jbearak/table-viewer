@@ -151,6 +151,46 @@ export function rich_cell_wrapped_lines(
     );
 }
 
+/**
+ * Whether this renderer, drawing `data` unwrapped on one line in a cell
+ * `width` wide (what it does at the default row height), would leave visible
+ * text undrawn: text past the cell's right padding, or past a segment cut at
+ * `ceil(width / 4)` characters, after which the line stops. Mirrors `draw`.
+ */
+export function rich_cell_unwrapped_hides_text(
+    ctx: CanvasRenderingContext2D,
+    data: RichCellData,
+    width: number,
+    horizontal_padding: number,
+    font_family: string,
+): boolean {
+    const visible = (text: string) => /\S/.test(text);
+    const line = data.lines[0] ?? [];
+    const variants = font_variants(data.font_size_px, font_family);
+    const max_chars = Math.ceil(width / 4);
+    // From `left` to `right` in `draw`.
+    const room = width - 2 * horizontal_padding - 0.5;
+    const direction = ctx.direction;
+    ctx.direction = data.rtl === true ? 'rtl' : 'inherit';
+    try {
+        let pen = 0;
+        for (let index = 0; index < line.length; index += 1) {
+            const later_visible = () => line.slice(index + 1).some((segment) => visible(segment.text));
+            const segment = line[index];
+            if (pen >= room) return visible(segment.text) || later_visible();
+            const truncated = segment.text.length > max_chars;
+            const text = truncated ? segment.text.slice(0, max_chars) : segment.text;
+            ctx.font = variant_of(variants, segment.style);
+            if (pen + ctx.measureText(text.trimEnd()).width > room + 0.5) return true;
+            if (truncated) return visible(segment.text.slice(max_chars)) || later_visible();
+            pen += ctx.measureText(text).width;
+        }
+        return false;
+    } finally {
+        ctx.direction = direction;
+    }
+}
+
 export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
     kind: GridCellKind.Custom,
     isMatch: is_rich_text_cell,

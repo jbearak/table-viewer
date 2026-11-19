@@ -171,6 +171,7 @@ function next_value_edit_order(after_order = 0): number {
 }
 import {
     is_rich_text_cell,
+    rich_cell_unwrapped_hides_text,
     rich_cell_wrapped_lines,
     rich_text_cell_renderer,
 } from './rich-text-cell-renderer';
@@ -10921,30 +10922,34 @@ export function GridShell({
                 // Measured in the context's font and direction, as the Text
                 // cell paints: right to left for right-to-left text.
                 ctx.font = font;
-                ctx.direction = direction(text) === 'rtl' ? 'rtl' : 'inherit';
-                let lines = splitMultiLineText(ctx, text, font, available).length;
-                if (unwrapped_at_default(lines, has_line_break(text) ? 2 : 1)) {
-                    // Glide's truncateString keeps `slice(0, width / 4)`.
-                    const drawn = text.slice(0, width / 4);
-                    if (
-                        text.slice(drawn.length).trim() !== ''
-                        || ctx.measureText(drawn.trimEnd()).width > available
-                    ) lines = 2;
+                let lines: number;
+                try {
+                    ctx.direction = direction(text) === 'rtl' ? 'rtl' : 'inherit';
+                    lines = splitMultiLineText(ctx, text, font, available).length;
+                    if (unwrapped_at_default(lines, has_line_break(text) ? 2 : 1)) {
+                        // Glide's truncateString keeps `slice(0, width / 4)`,
+                        // and drawTextCell takes the direction from that.
+                        const drawn = text.slice(0, width / 4);
+                        const visible_past_cut = /\S/g;
+                        visible_past_cut.lastIndex = drawn.length;
+                        ctx.direction = direction(drawn) === 'rtl' ? 'rtl' : 'inherit';
+                        if (
+                            visible_past_cut.test(text)
+                            || ctx.measureText(drawn.trimEnd()).width > available
+                        ) lines = 2;
+                    }
+                } finally {
+                    ctx.direction = 'inherit';
                 }
-                ctx.direction = 'inherit';
                 return { lines, em_height: em_of(font) };
             }
             if (cell.kind === GridCellKind.Custom && is_rich_text_cell(cell)) {
                 // The rich renderer takes its line metric from the base font.
                 let lines = rich_cell_wrapped_lines(ctx, cell.data, available, glide_theme.fontFamily).length;
-                if (unwrapped_at_default(lines, cell.data.lines.length)) {
-                    // The rich renderer cuts each segment at `ceil(width / 4)`;
-                    // its one wrapped line fits the width, so nothing clips.
-                    const cap = Math.ceil(width / 4);
-                    const cut = cell.data.lines.some((line) =>
-                        line.some((segment) => segment.text.slice(cap).trim() !== ''));
-                    if (cut) lines = 2;
-                }
+                if (
+                    unwrapped_at_default(lines, cell.data.lines.length)
+                    && rich_cell_unwrapped_hides_text(ctx, cell.data, width, padding, glide_theme.fontFamily)
+                ) lines = 2;
                 return { lines };
             }
             return { lines: 1 };

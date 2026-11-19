@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
     is_rich_text_cell,
+    rich_cell_unwrapped_hides_text,
     rich_text_cell_renderer,
     type RichTextGridCell,
 } from '../webview/rich-text-cell-renderer';
@@ -338,5 +339,38 @@ describe('rich_text_cell_renderer.draw — code-review regressions', () => {
         // leftward (each segment is 2 chars * 10px wide).
         expect(calls[0].x).toBe(200 - theme.cellHorizontalPadding);
         expect(calls[1].x).toBe(200 - theme.cellHorizontalPadding - 20);
+    });
+});
+
+describe('rich_cell_unwrapped_hides_text', () => {
+    /** What `draw` leaves undrawn of the cell's visible text on one unwrapped line. */
+    const hidden_by_draw = (cell: RichTextGridCell, width: number): boolean => {
+        const drawn = draw(cell, { x: 0, y: 0, width, height: 24 }).calls
+            .map((call) => call.text).join('').replace(/\s/g, '');
+        const all = cell.data.lines.flat().map((segment) => segment.text).join('').replace(/\s/g, '');
+        return drawn !== all;
+    };
+    const hides = (cell: RichTextGridCell, width: number): boolean =>
+        rich_cell_unwrapped_hides_text(stub_ctx().ctx, cell.data, width, theme.cellHorizontalPadding, 'sans');
+
+    it.each([
+        ['everything fits', [[{ text: 'ab' }, { text: 'cd' }]], 200, false],
+        // Cut at ceil(40 / 4) = 10 characters in its trailing spaces: the line stops there.
+        ['a cut segment stops the line', [[{ text: 'ab' + ' '.repeat(12) }, { text: 'cd' }]], 40, true],
+        // Cut at ceil(60 / 4) = 15 characters, in spaces, with nothing after it.
+        ['a cut through spaces alone, last', [[{ text: 'ab' }, { text: 'cd' + ' '.repeat(20) }]], 60, false],
+        ['indentation pushes text past the edge', [[{ text: ' '.repeat(20) + 'x' }]], 100, true],
+        ['a later segment past the edge', [[{ text: 'abcdefghij' }, { text: 'klmnop' }]], 120, true],
+    ] as const)('says whether draw hides text: %s', (_name, lines, width, expected) => {
+        const cell = make_cell(lines.map((line) => [...line]));
+        expect(hides(cell, width)).toBe(expected);
+        // `draw` clips at the cell, not at its padding, so only the cut is
+        // checked against it: everything it does not draw, the mirror reports.
+        if (!expected) expect(hidden_by_draw(cell, width)).toBe(false);
+    });
+
+    it('agrees with draw that a cut segment stops the line', () => {
+        const cell = make_cell([[{ text: 'ab' + ' '.repeat(12) }, { text: 'cd' }]]);
+        expect(hidden_by_draw(cell, 40)).toBe(true);
     });
 });

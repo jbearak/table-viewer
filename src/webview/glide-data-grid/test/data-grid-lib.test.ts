@@ -229,6 +229,15 @@ describe("splitMultiLineText", () => {
         expect(calls).toBeLessThan(2_000);
     });
 
+    it("splits a value of millions of characters without running out of stack", () => {
+        const flat = {
+            font: "",
+            measureText: (text: string) => ({ width: text.length }),
+        } as unknown as CanvasRenderingContext2D;
+        const lines = splitMultiLineText(flat, "a".repeat(10_000_000), "13px test", 1_000_000);
+        expect(lines).toHaveLength(10);
+    });
+
     it("wraps a value into more lines than a spread can pass", () => {
         const lines = splitMultiLineText(ctx, "ab ".repeat(150_000), "13px test", 25);
         expect(lines).toHaveLength(150_000);

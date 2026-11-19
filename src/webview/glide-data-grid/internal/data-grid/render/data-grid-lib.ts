@@ -502,11 +502,33 @@ function truncateString(data: string, w: number): string {
     return data;
 }
 
-/** Whitespace a line may break at: any but the no-break spaces (U+00A0, U+2007, U+202F). */
-const BREAK_SPACE = "[^\\S\\u00a0\\u2007\\u202f]";
-/** Words with the break space before them, and a line's trailing break space. */
-const BREAKABLE_WORDS = new RegExp(`${BREAK_SPACE}*(?:(?!${BREAK_SPACE})[\\s\\S])+|${BREAK_SPACE}+$`, "g");
-const BREAK_SPACE_ONLY = new RegExp(`^${BREAK_SPACE}+$`);
+/**
+ * Whitespace a line may break at: what `\s` matches, but the no-break spaces
+ * (U+00A0, U+2007, U+202F, U+FEFF). Every one is a single UTF-16 unit.
+ */
+const BREAK_SPACES = new Set(
+    Array.from("\t\n\v\f\r \u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2008\u2009\u200a\u2028\u2029\u205f\u3000", (space) => space.charCodeAt(0))
+);
+
+function isBreakSpace(text: string, at: number): boolean {
+    return BREAK_SPACES.has(text.charCodeAt(at));
+}
+
+/**
+ * A line's words, each with the break space before it, then its trailing
+ * break space if any. Scanned rather than matched: a regular expression that
+ * excludes the no-break spaces from a word needs a lookahead per character,
+ * which ran out of stack on a value of millions of characters.
+ */
+function* breakableWords(line: string): Generator<string> {
+    let at = 0;
+    while (at < line.length) {
+        const start = at;
+        while (at < line.length && isBreakSpace(line, at)) at++;
+        while (at < line.length && !isBreakSpace(line, at)) at++;
+        yield line.slice(start, at);
+    }
+}
 
 /** `splitMultiLineText` results by font, direction, width and text, least recently used first. */
 const wrapCache = new Map<string, readonly string[]>();
@@ -561,7 +583,7 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, width: number
     let current = "";
     // Each word keeps the whitespace before it; trailing whitespace is a word
     // too. No-break spaces belong to the word they are in.
-    for (const word of line.match(BREAKABLE_WORDS) ?? [line]) {
+    for (const word of breakableWords(line)) {
         let fitting: boolean;
         if (current === "") {
             current = word;
@@ -569,7 +591,8 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, width: number
         } else if (fits(current + word)) {
             current += word;
             fitting = true;
-        } else if (BREAK_SPACE_ONLY.test(word)) {
+        } else if (isBreakSpace(word, word.length - 1)) {
+            // (A word ends in a break space only when it is all trailing space.)
             // Trailing whitespace past the edge: dropped, as the line's trim would.
             continue;
         } else {
