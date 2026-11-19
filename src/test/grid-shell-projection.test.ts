@@ -8158,8 +8158,15 @@ describe('GridShell row auto-fit', () => {
         await render_fit({ 0: 'a', 1: 'b', 2: 'c', 3: 'd' });
         grid_mock.row_resize_set_target.mockClear();
         // Glide scrolls an element inside the root; scroll does not bubble.
+        const root_element = container!.querySelector('.grid-shell-root')!;
+        // An editor's text scrolling inside the grid moves no row.
+        const textarea = document.createElement('textarea');
+        root_element.appendChild(textarea);
+        act(() => textarea.dispatchEvent(new Event('scroll')));
+        expect(grid_mock.row_resize_set_target).not.toHaveBeenCalled();
         const scroller = document.createElement('div');
-        container!.querySelector('.grid-shell-root')!.appendChild(scroller);
+        scroller.className = 'dvn-scroller';
+        root_element.appendChild(scroller);
         act(() => scroller.dispatchEvent(new Event('scroll')));
         expect(grid_mock.row_resize_set_target).toHaveBeenCalledWith(null);
     });

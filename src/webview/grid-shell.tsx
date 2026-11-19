@@ -11006,7 +11006,12 @@ export function GridShell({
     useEffect(() => {
         const grid_root = grid_root_ref.current;
         if (!grid_root) return;
-        const clear = () => row_resize_ref.current?.set_target(null);
+        const clear = (event: Event) => {
+            // The grid's own scroller, not an editor's text scrolling inside it.
+            if ((event.target as Element | null)?.classList?.contains('dvn-scroller')) {
+                row_resize_ref.current?.set_target(null);
+            }
+        };
         grid_root.addEventListener('scroll', clear, true);
         return () => grid_root.removeEventListener('scroll', clear, true);
         // The root is another element once every column is hidden or shown.

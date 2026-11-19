@@ -617,9 +617,9 @@ export interface RowHeightsReplayTarget {
  *
  * Undo sets each run back to the height it held (`null` removes the custom
  * height); redo sets every row to the step's height, or for an auto-fit to
- * each row's own. Rows the worksheet no longer has are left out. Rows above or at a promoted Header Row are written
- * like any other: a height is keyed by source row, and a promotion renumbers
- * none.
+ * each row's own. Rows the worksheet no longer has are left out. Rows above
+ * or at a promoted Header Row are written like any other: a height is keyed
+ * by source row, and a promotion renumbers none.
  */
 export function row_heights_replay_target(
     delta: RowHeightsViewDelta,
