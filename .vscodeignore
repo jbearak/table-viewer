@@ -25,4 +25,3 @@ test-results/**
 # the one the marketplace listing uses and must stay in the .vsix.
 build/**
 design_handoff_app_icon/**
-vendor/**
