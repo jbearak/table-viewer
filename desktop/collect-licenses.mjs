@@ -19,7 +19,8 @@ const out_file = process.env.TABLE_VIEWER_NOTICES_OUT
 
 const LICENSE_FILE_RE = /^(licen[cs]e|copying|notice)(\.|$)/i;
 // Notices for code a package bundles from elsewhere, such as the crates in
-// @jbearak/dta-parser's wasm module, published beside its own licence.
+// the wasm modules of @jbearak/dta-parser and pqparser, published beside
+// its own licence.
 const THIRD_PARTY_NOTICES_RE = /^third[-_]party[-_]notices(\.|$)/i;
 
 async function license_text(pkg_dir) {

@@ -2,12 +2,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import {
-    ParquetReader,
-    openParquet,
-    writeParquet,
-    type ReadRange,
-} from '@jbearak/dta-parser';
+import { writeParquet } from '@jbearak/dta-parser';
+import { ParquetReader, openParquet, type ReadRange } from 'pqparser';
 import { FileParquetDataSource } from '../data-source/file-parquet-source';
 import { DEFERRED_COMPARISON_IDENTITY, type RawCell, type RenderedCell } from '../data-source/interface';
 import { ParquetDataSource } from '../data-source/parquet-source';
@@ -186,7 +182,7 @@ describe('Parquet block cache and bounded reads', () => {
         }
     });
 
-    it('reads every 3rd row in readRowsAt calls bounded by span and columns', async () => {
+    it('reads every 3rd row in readRowsAt calls bounded by rows and columns', async () => {
         const source = await ParquetDataSource.create(skewed_bytes());
         try {
             const rows = Array.from({ length: Math.ceil(ROWS / 3) }, (_, i) => i * 3);
@@ -197,7 +193,7 @@ describe('Parquet block cache and bounded reads', () => {
             expect(calls.length).toBeGreaterThan(1);
             for (const call of calls) {
                 const span = call.rows[call.rows.length - 1] - call.rows[0] + 1;
-                expect(span).toBeLessThanOrEqual(source.block_rows);
+                expect(call.rows.length).toBeLessThanOrEqual(source.block_rows);
                 const touches_run = call.rows.some((row) => row >= RUN_START && row < RUN_END);
                 if (call.columns.includes(1) && touches_run) {
                     expect(call.columns).toEqual([1]);
@@ -205,6 +201,23 @@ describe('Parquet block cache and bounded reads', () => {
                 }
             }
             expect(calls.some((call) => call.columns.length === 2)).toBe(true);
+        } finally {
+            source.close();
+        }
+    });
+
+    it('joins scattered rows of the same columns into one readRowsAt call', async () => {
+        const source = await ParquetDataSource.create(skewed_bytes());
+        try {
+            // Rows more than a block apart, outside the run of large text.
+            const rows = [0, 1500, 3000, 4090];
+            expect(rows.every((row) => row < RUN_START || row >= RUN_END)).toBe(true);
+            expect(1500 - 0).toBeGreaterThan(source.block_rows);
+            const calls = spy_read_rows_at();
+            const sparse = await source.read_raw_columns_indexed_async(0, rows, [0, 1], () => false);
+            expect(sparse.rows.map((row) => row.map((cell) => cell!.raw)))
+                .toEqual(rows.map((row) => [String(row * 0.5), note(row)]));
+            expect(calls).toEqual([{ rows: [...rows].sort((a, b) => a - b), columns: [0, 1] }]);
         } finally {
             source.close();
         }

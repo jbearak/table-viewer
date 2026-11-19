@@ -1,9 +1,10 @@
 // The heap that every column chunk's footer statistics hold once `chunks` is
-// first read (dta-parser parses them all at once). Writes a file of
+// first read (pqparser parses them all at once). Writes a file of
 // <columns> x <groups> chunks (one row per row group), then reports the
 // footer size and the heap held. Run inside the repository:
 //   node --expose-gc benchmarks/parquet/chunk-heap.mjs out.parquet 1000 1000
-import { openParquetFile, writeParquetFile } from '@jbearak/dta-parser/node';
+import { writeParquetFile } from '@jbearak/dta-parser/node';
+import { openParquetFile } from 'pqparser/node';
 const [out, columns_arg, groups_arg] = process.argv.slice(2);
 const columns = Number(columns_arg);
 const groups = Number(groups_arg);

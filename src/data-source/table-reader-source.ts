@@ -94,15 +94,27 @@ export function is_missing_code(raw: string): boolean {
     return raw.charCodeAt(0) === 0x2e && MISSING_CODE.test(raw);
 }
 
-export function label_for(labels: ValueLabels | undefined, raw: string): string | undefined {
+/**
+ * The missing values a reader's value label sets are keyed by. Each reader
+ * package makes its own objects (`@jbearak/dta-parser` for `.dta`,
+ * `pqparser` for Parquet), and a set is looked up by identity.
+ */
+export type MissingValues = typeof MISSING;
+
+export function label_for(
+    labels: ValueLabels | undefined,
+    raw: string,
+    missing: MissingValues = MISSING,
+): string | undefined {
     if (labels === undefined) return undefined;
-    if (is_missing_code(raw)) return labels.get(MISSING[raw]);
+    if (is_missing_code(raw)) return labels.get(missing[raw]);
     const numeric = Number(raw);
     return Number.isFinite(numeric) ? labels.get(numeric) : undefined;
 }
 
 export function filter_metadata_from_labels(
     labels: ValueLabels | undefined,
+    missing: MissingValues = MISSING,
 ): ColumnFilterMetadata | undefined {
     if (!labels || labels.size === 0) return undefined;
     let categorical_codes = false;
@@ -115,7 +127,7 @@ export function filter_metadata_from_labels(
     }
     return {
         categoricalCodes: categorical_codes,
-        valueLabel: (raw) => label_for(labels, raw),
+        valueLabel: (raw) => label_for(labels, raw, missing),
     };
 }
 
@@ -208,6 +220,8 @@ export class TableReaderSource<R extends TableReader = TableReader> implements D
     private lifecycle_epoch = 0;
     private readonly binaries = new Map<string, TableBinaryIdentity>();
     private binary_bytes = 0;
+    /** The missing values the reader's value label sets are keyed by. */
+    protected readonly missing_values: MissingValues = MISSING;
 
     protected constructor(reader: R, shape: TableShape) {
         this.reader_handle = reader;
@@ -391,7 +405,7 @@ export class TableReaderSource<R extends TableReader = TableReader> implements D
         this.open_reader();
         this.assert_sheet(sheet_index);
         this.assert_column(column_index);
-        return filter_metadata_from_labels(this.labels_of(column_index));
+        return filter_metadata_from_labels(this.labels_of(column_index), this.missing_values);
     }
 
     async column_filter_metadata_async(

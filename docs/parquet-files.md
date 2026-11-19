@@ -28,6 +28,8 @@ Each column of the file is a column of the table, in the file's order.
 | text, or a categorical | the text | the text |
 | binary | its size and first 32 bytes, in hex | the same |
 | decimal | the number; past 15 digits, every digit as text | the same |
+| 16-bit float | the number | the same |
+| geometry or geography | its size and first 32 bytes, in hex | the same |
 
 A timestamp shows as many fraction digits as its unit has: 3 for
 milliseconds, 6 for microseconds, and 9 for nanoseconds. A value too
@@ -51,9 +53,17 @@ timestamps, and text, formatted as the cells are (text in quotes), but
 not for binary values, or for text longer than 64 characters. In a very
 wide file, columns past the first 1 MiB of these details show none.
 
-**Columns that are not shown.** Lists, maps, and structs, and FLOAT16
-and INTERVAL columns, are left out of the table, and a warning names
-them when the file opens.
+**Columns that are not shown.** Lists, maps, and structs, and INTERVAL
+columns, are left out of the table, and a warning names them when the
+file opens.
+
+**Unusual files.** Text that is not valid UTF-8 shows with each bad byte
+replaced by `�`. A column whose type annotation does not fit how it is
+stored (such as a UUID stored as a 32-bit integer) shows as it is
+stored, and a warning names it. An INT96 timestamp (written by Spark,
+Impala, and older pyarrow) before 1677 or after 2262 cannot be shown in
+nanoseconds: the rows around it do not show, and an error names the
+row, rather than a wrong date.
 
 ## Large files
 
@@ -77,8 +87,8 @@ as `.dta`: Parquet stores each column in compressed pages, so every
 visible row needs a page from each column.
 
 Sorted and filtered views of long files are slower still. Their rows
-are scattered through the file, and each needs its own page from every
-column. On a file of a million rows, or of a few hundred thousand rows
-with many columns, a screenful can take several seconds to appear (about
-2 s for 1,000,000 rows by 26 columns, and 5 s for 200,000 rows by 100
-columns, on an Apple silicon Mac).
+are scattered through the file, and each needs a page from every column.
+On a file of a million rows, or of a few hundred thousand rows with many
+columns, a screenful can take a few tenths of a second to appear (about
+0.4 s for 1,000,000 rows by 26 columns, and 0.3 s for 200,000 rows by
+100 columns, on an Apple silicon Mac).
