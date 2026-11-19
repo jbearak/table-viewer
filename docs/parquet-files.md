@@ -87,8 +87,8 @@ as `.dta`: Parquet stores each column in compressed pages, so every
 visible row needs a page from each column.
 
 Sorted and filtered views of long files are slower still. Their rows
-are scattered through the file, and each needs its own page from every
-column. On a file of a million rows, or of a few hundred thousand rows
-with many columns, a screenful can take several seconds to appear (about
-2 s for 1,000,000 rows by 26 columns, and 5 s for 200,000 rows by 100
-columns, on an Apple silicon Mac).
+are scattered through the file, and each needs a page from every column.
+On a file of a million rows, or of a few hundred thousand rows with many
+columns, a screenful can take a few tenths of a second to appear (about
+0.4 s for 1,000,000 rows by 26 columns, and 0.3 s for 200,000 rows by
+100 columns, on an Apple silicon Mac).

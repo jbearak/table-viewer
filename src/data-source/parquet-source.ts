@@ -952,18 +952,56 @@ export class ParquetReaderSource extends TableReaderSource<ParquetReader> {
         rows: readonly number[],
         columns: readonly number[],
     ): Generator<{ rows: number[]; positions: number[] }> {
+        // The reader reads a call's rows in one pass, decompressing each page
+        // once, and keeps no page between calls: batched calls of the same
+        // columns are joined while their bounds together stay within
+        // `PARQUET_BLOCK_BUDGET`, up to `block_rows` rows a call.
+        const pending = new Map<string, { rows: number[]; positions: number[]; bytes: number }>();
+        for (const call of this.sparse_spans(rows, columns)) {
+            if (!Number.isFinite(call.bytes)) {
+                yield call;
+                continue;
+            }
+            const key = call.positions.join(',');
+            const joined = pending.get(key);
+            if (
+                joined !== undefined
+                && joined.rows.length + call.rows.length <= this.block_rows
+                && joined.bytes + call.bytes <= PARQUET_BLOCK_BUDGET
+            ) {
+                joined.rows.push(...call.rows);
+                joined.bytes += call.bytes;
+                continue;
+            }
+            if (joined !== undefined) yield joined;
+            pending.set(key, { rows: [...call.rows], positions: call.positions, bytes: call.bytes });
+        }
+        yield* pending.values();
+    }
+
+    /**
+     * `sparse_calls` before calls are joined, each with its batch's bounds
+     * over its span (infinite for a column read alone).
+     */
+    private *sparse_spans(
+        rows: readonly number[],
+        columns: readonly number[],
+    ): Generator<{ rows: number[]; positions: number[]; bytes: number }> {
         const position = new Map(columns.map((column, k) => [column, k]));
         for (const group of span_groups(rows, this.block_rows)) {
-            const plan = this.plan_reads(
-                columns, group[0], group[group.length - 1] + 1, PARQUET_BLOCK_BUDGET, false,
-            );
+            const [start, end] = [group[0], group[group.length - 1] + 1];
+            const plan = this.plan_reads(columns, start, end, PARQUET_BLOCK_BUDGET, false);
             for (const batch of plan.batches) {
-                yield { rows: group, positions: batch.map((column) => position.get(column)!) };
+                yield {
+                    rows: group,
+                    positions: batch.map((column) => position.get(column)!),
+                    bytes: batch.reduce((sum, column) => sum + this.bound(column, start, end), 0),
+                };
             }
             if (plan.alone.length === 0) continue;
             for (const small of span_groups(group, DECODE_WINDOW_ROWS)) {
                 for (const column of plan.alone) {
-                    yield { rows: small, positions: [position.get(column)!] };
+                    yield { rows: small, positions: [position.get(column)!], bytes: Number.POSITIVE_INFINITY };
                 }
             }
         }
