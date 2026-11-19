@@ -152,16 +152,12 @@ export function rich_cell_wrapped_lines(
     );
 }
 
-/** Whether a segment draws a line under or through all of its text (a link's too). */
-function segment_decorated(data: RichCellData): (segment: RichTextLine[number]) => boolean {
-    const linked = data.hyperlink !== undefined;
-    return (segment) => linked || segment.style?.underline === true || segment.style?.strikethrough === true;
-}
-
-/** Whether a segment paints something: visible text, or spaces under a decoration. */
+/** Whether a segment paints something: visible text, or spaces under an underline or strikethrough (a link's too). */
 function segment_paints(data: RichCellData): (segment: RichTextLine[number]) => boolean {
-    const decorated = segment_decorated(data);
-    return (segment) => /\S/.test(segment.text) || (segment.text !== '' && decorated(segment));
+    const linked = data.hyperlink !== undefined;
+    return (segment) => /\S/.test(segment.text)
+        || (segment.text !== ''
+            && (linked || segment.style?.underline === true || segment.style?.strikethrough === true));
 }
 
 /**
@@ -169,6 +165,10 @@ function segment_paints(data: RichCellData): (segment: RichTextLine[number]) => 
  * `width` wide (what it does at the default row height), would leave visible
  * text undrawn: text past the cell's right padding, or past a segment cut at
  * `ceil(width / 4)` characters, after which the line stops. Mirrors `draw`.
+ *
+ * Visible text only: spaces past the edge, even under an underline, are not
+ * shown by a taller row either, whose wrapped lines keep spaces only where
+ * they fit (`wrap_rich_text_lines`), so they are no reason to grow it.
  */
 export function rich_cell_unwrapped_hides_text(
     ctx: CanvasRenderingContext2D,
@@ -177,8 +177,7 @@ export function rich_cell_unwrapped_hides_text(
     horizontal_padding: number,
     font_family: string,
 ): boolean {
-    const paints = segment_paints(data);
-    const decorated = segment_decorated(data);
+    const visible = (segment: RichTextLine[number]) => /\S/.test(segment.text);
     const line = data.lines[0] ?? [];
     const variants = font_variants(data.font_size_px, font_family);
     const max_chars = Math.ceil(width / 4);
@@ -191,17 +190,14 @@ export function rich_cell_unwrapped_hides_text(
     try {
         let pen = 0;
         for (let index = 0; index < line.length; index += 1) {
-            const later_paints = () => line.slice(index + 1).some(paints);
+            const later_visible = () => line.slice(index + 1).some(visible);
             const segment = line[index];
-            if (pen >= room) return paints(segment) || later_paints();
+            if (pen >= room) return visible(segment) || later_visible();
             const truncated = segment.text.length > max_chars;
             const text = truncated ? segment.text.slice(0, max_chars) : segment.text;
             ctx.font = variant_of(variants, segment.style);
-            // Up to its last glyph, or all of it under a decoration, which `draw`
-            // lays across the segment's whole width.
-            const drawn = decorated(segment) ? text : text.trimEnd();
-            if (paints({ ...segment, text }) && pen + ctx.measureText(drawn).width > clip + 0.5) return true;
-            if (truncated) return paints({ ...segment, text: segment.text.slice(max_chars) }) || later_paints();
+            if (pen + ctx.measureText(text.trimEnd()).width > clip + 0.5) return true;
+            if (truncated) return visible({ ...segment, text: segment.text.slice(max_chars) }) || later_visible();
             pen += ctx.measureText(text).width;
         }
         return false;

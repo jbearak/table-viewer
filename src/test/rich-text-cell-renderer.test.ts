@@ -400,16 +400,19 @@ describe('rich_cell_fit', () => {
         expect(fit([[{ text: 'a' }], [], [{ text: '   ' }]], 200)).toEqual({ lines: 1, fits_default: true });
     });
 
-    it('counts an underline over spaces cut at a quarter of the width in characters', () => {
-        // The second segment is cut at ceil(100 / 4) = 25 of its 27 spaces,
-        // and its underline runs past the cell's edge.
+    it('does not grow for underlined spaces past the edge, which wrapping drops too', () => {
+        const underlined = make_cell([[{ text: 'b' + ' '.repeat(10), style: { underline: true } }]]);
+        expect(fit(underlined.data.lines as RichTextLine[], 100).fits_default).toBe(true);
+        // A taller row shows no more of them: its wrapped line keeps "b" and
+        // the spaces that fit, and drops the rest.
+        const tall = draw(
+            make_cell(underlined.data.lines as RichTextLine[], { allow_wrapping: true }),
+            { x: 0, y: 0, width: 100, height: 44 },
+            stub_ctx((text) => [...text].length * 10),
+        );
+        expect(tall.calls.map((call) => call.text).join('').trimEnd()).toBe('b');
         expect(fit([[{ text: 'a' }, { text: ' '.repeat(27), style: { underline: true } }]], 100).fits_default)
-            .toBe(false);
-        expect(fit([[{ text: 'a' }, { text: ' '.repeat(27) }]], 100).fits_default).toBe(true);
-        // Text and its trailing spaces in one underlined segment: the
-        // underline runs across the spaces, past the edge of a 100px cell.
-        expect(fit([[{ text: 'b' + ' '.repeat(10), style: { underline: true } }]], 100).fits_default).toBe(false);
-        expect(fit([[{ text: 'b' + ' '.repeat(10) }]], 100).fits_default).toBe(true);
+            .toBe(true);
     });
 
     it('takes a line break as wrapping at the default height, with no character cap', () => {
