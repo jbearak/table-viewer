@@ -8,7 +8,7 @@
 // `MAX_ROW_HEIGHT_PX`. Sums of such numbers are exact in any order while the
 // total stays under 2^37 px, so `top` agrees bit for bit with a running sum
 // of `height` from row 0, which is how Glide's own loops add them up.
-import { MAX_ROW_HEIGHT_PX } from './row-heights';
+import { DEFAULT_ROW_HEIGHT_PX, MAX_ROW_HEIGHT_PX } from './row-heights';
 
 /** Every geometry height is a multiple of this. */
 export const ROW_HEIGHT_QUANTUM = 2 ** -16;
@@ -19,7 +19,7 @@ export const ROW_HEIGHT_QUANTUM = 2 ** -16;
  * [2^-16, MAX_ROW_HEIGHT_PX] and rounded to the nearest multiple of 2^-16.
  */
 export function geometry_row_height(height: number, fallback: number): number {
-    const finite = Number.isFinite(height) ? height : fallback;
+    const finite = Number.isFinite(height) ? height : Number.isFinite(fallback) ? fallback : DEFAULT_ROW_HEIGHT_PX;
     const bounded = Math.min(MAX_ROW_HEIGHT_PX, Math.max(ROW_HEIGHT_QUANTUM, finite));
     return Math.max(ROW_HEIGHT_QUANTUM, Math.round(bounded / ROW_HEIGHT_QUANTUM) * ROW_HEIGHT_QUANTUM);
 }
@@ -39,12 +39,16 @@ export interface RowHeightIndex {
     readonly runs: readonly RowHeightRun[];
     /** The height of `row`; the default for a row outside `[0, rowCount)` or not an integer. */
     height(row: number): number;
-    /** The sum of the heights of rows `[0, row)`; for a negative row, minus the rows `[row, 0)`. */
+    /**
+     * The sum of the heights of rows `[0, row)`; for a negative row, minus the
+     * rows `[row, 0)`. A fractional row counts as the row below it.
+     */
     top(row: number): number;
     /**
      * The first row `r >= 0` with `top(r + 1) > y`: the row whose span holds
      * `y`. NaN and negative `y` give 0; `+Infinity` gives `+Infinity` (no row
-     * holds it), which a caller clamps to its row count.
+     * holds it), which a caller clamps to its row count; a `y` past the last
+     * safe-integer row gives `Number.MAX_SAFE_INTEGER`.
      */
     rowAtY(y: number): number;
 }
@@ -52,16 +56,23 @@ export interface RowHeightIndex {
 /**
  * An index over `rowCount` rows of `defaultHeight`, except `runs` (sorted by
  * start, disjoint). Runs are clipped to `[0, rowCount)`; default-height runs
- * are dropped and adjacent runs of one height joined.
+ * are dropped and adjacent runs of one height joined. A row count that is not
+ * a non-negative safe integer counts as 0, the default and run heights pass
+ * through `geometry_row_height`, and a run whose start or count is not a safe
+ * integer is skipped.
  */
 export function create_row_height_index(
-    rowCount: number,
-    defaultHeight: number,
+    rowCountIn: number,
+    defaultHeightIn: number,
     runs: readonly RowHeightRun[],
 ): RowHeightIndex {
+    const rowCount = Number.isSafeInteger(rowCountIn) && rowCountIn > 0 ? rowCountIn : 0;
+    const defaultHeight = geometry_row_height(defaultHeightIn, DEFAULT_ROW_HEIGHT_PX);
     const kept: RowHeightRun[] = [];
     let previous_end = 0;
-    for (const run of runs) {
+    for (const input of runs) {
+        if (!Number.isSafeInteger(input.start) || !Number.isSafeInteger(input.count)) continue;
+        const run = { ...input, height: geometry_row_height(input.height, defaultHeight) };
         const start = Math.max(run.start, previous_end, 0);
         const end = Math.min(run.start + run.count, rowCount);
         if (end <= start) continue;
@@ -102,7 +113,8 @@ export function create_row_height_index(
         const run = kept[runs_through(row) - 1];
         return run !== undefined && row < run.start + run.count ? run.height : defaultHeight;
     };
-    const top = (row: number): number => {
+    const top = (rowIn: number): number => {
+        const row = Math.floor(rowIn);
         // The last run starting before `row`, then its rows or the gap after it.
         const at = runs_through(row - 1) - 1;
         const run = kept[at];
@@ -135,9 +147,12 @@ export function create_row_height_index(
                 ? run.start + Math.floor((y - start_top) / run.height)
                 : run.start + run.count + Math.floor((y - end_top) / defaultHeight);
         }
-        // Division can round across a boundary; settle by the index's own sums.
-        while (row > 0 && top(row) > y) row -= 1;
-        while (top(row + 1) <= y) row += 1;
+        if (!(row < Number.MAX_SAFE_INTEGER)) return Number.MAX_SAFE_INTEGER;
+        // Inside the exact range (§0 of the plan) the division lands on the
+        // row; past it, rounding can leave it one off. Settle by the index's
+        // own sums, a few steps at most.
+        for (let step = 0; step < 4 && row > 0 && top(row) > y; step++) row -= 1;
+        for (let step = 0; step < 4 && top(row + 1) <= y; step++) row += 1;
         return row;
     };
     return Object.freeze({

@@ -59,6 +59,10 @@ describe('geometry_row_height', () => {
         // Within half a quantum of the default it is the default; past that it is not.
         expect(geometry_row_height(24 + ROW_HEIGHT_QUANTUM / 4, 24)).toBe(24);
         expect(geometry_row_height(24.001, 24)).toBeGreaterThan(24);
+        // To the nearest quantum, not down.
+        expect(geometry_row_height(24 + 0.75 * ROW_HEIGHT_QUANTUM, 24)).toBe(24 + ROW_HEIGHT_QUANTUM);
+        // A fallback that is not finite gives way to the stock default.
+        expect(geometry_row_height(Number.NaN, Number.NaN)).toBe(24);
     });
 });
 
@@ -134,6 +138,55 @@ describe('create_row_height_index', () => {
             expect(quanta(index.top(row)), `top ${row}`).toBe(exact(row));
             expect(index.rowAtY(index.top(row)), `row at top ${row}`).toBe(row);
         }
+    });
+
+    it('stays exact across a second run after an odd-length tall-default run', () => {
+        // Under rev 3's row × default + extra the top inside the second run
+        // was a quantum off.
+        const short = 20 + ROW_HEIGHT_QUANTUM;
+        const count = 34_000_001;
+        const index = create_row_height_index(count + 10, 4096, [
+            { start: 1, count, height: short },
+            { start: count + 3, count: 4, height: 30 },
+        ]);
+        const quanta = (value: number) => BigInt(value / ROW_HEIGHT_QUANTUM);
+        const before_second = quanta(4096) + BigInt(count) * quanta(short) + 2n * quanta(4096);
+        for (const offset of [0, 1, 2, 3, 4]) {
+            const row = count + 3 + offset;
+            expect(quanta(index.top(row)), `top ${row}`).toBe(before_second + BigInt(offset) * quanta(30));
+            expect(index.rowAtY(index.top(row))).toBe(row);
+        }
+    });
+
+    it('answers a y far past any row without hanging', () => {
+        for (const runs of [[], [{ start: 1, count: 2, height: 40 }]]) {
+            const index = create_row_height_index(100, 24, runs);
+            for (const y of [1e17, 1e18, 2 ** 60, 1e300]) {
+                const row = index.rowAtY(y);
+                expect(row).toBeGreaterThan(100);
+                expect(row).toBeLessThanOrEqual(Number.MAX_SAFE_INTEGER);
+            }
+        }
+    });
+
+    it('treats fractional rows and bad inputs predictably', () => {
+        const index = create_row_height_index(5, 24, [{ start: 1, count: 1, height: 8 }]);
+        expect(index.height(1)).toBe(8);
+        expect(index.height(1.5)).toBe(24);
+        expect(index.height(Number.NaN)).toBe(24);
+        expect(index.top(1.99)).toBe(index.top(1));
+        expect(index.top(2.5)).toBe(32);
+        // Not a row count, not a height, not a run: an empty index of the stock default.
+        const bad = create_row_height_index(Number.NaN, Number.NaN, [
+            { start: Number.NaN, count: 2, height: 40 },
+            { start: 0, count: 1.5, height: 40 },
+        ]);
+        expect(bad.rowCount).toBe(0);
+        expect(bad.defaultHeight).toBe(24);
+        expect(bad.runs).toEqual([]);
+        // Heights are drawn heights: a run that rounds to the default is the default.
+        const near = create_row_height_index(5, 24, [{ start: 1, count: 1, height: 24 + ROW_HEIGHT_QUANTUM / 4 }]);
+        expect(near.runs).toEqual([]);
     });
 
     it('takes NaN and negative y as row 0 and +Infinity as no row', () => {
