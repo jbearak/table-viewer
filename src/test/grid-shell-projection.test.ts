@@ -1835,6 +1835,9 @@ describe('GridShell cell wrapping', () => {
             localEventY: 10,
         }));
         expect(menu_button_labels()).toContain('Copy 2 rows');
+        Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Copy 2 rows')!.focus();
+        grid_mock.focus.mockClear();
 
         // A page arrives holding source row 4 at the top of the sorted view:
         // every grid index below it now names another row.
@@ -1844,6 +1847,26 @@ describe('GridShell cell wrapping', () => {
             root!.render(React.createElement(GridShell, shell_props));
         });
         expect(menu_button_labels()).not.toContain('Copy 2 rows');
+        // The menu held the focus; the grid has it back.
+        expect(grid_mock.focus).toHaveBeenCalled();
+
+        // A column header's menu names no row, and stays open when the rows move.
+        await act(async () => (grid_mock.props!.onHeaderContextMenu as (
+            column: number, event: Record<string, unknown>,
+        ) => void)(0, {
+            preventDefault: vi.fn(),
+            bounds: { x: 40, y: 0, width: 100, height: 36 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        const header_menu = document.querySelector('[role="menu"]');
+        expect(header_menu?.getAttribute('aria-label')).toMatch(/^Column actions/);
+        grid_mock.source_row_for_display = (display_row) => [3, 2, 1, 0][display_row];
+        grid_mock.loader_version = 2;
+        await act(async () => {
+            root!.render(React.createElement(GridShell, shell_props));
+        });
+        expect(document.querySelector('[role="menu"]')?.getAttribute('aria-label')).toMatch(/^Column actions/);
     });
 
     it('invalidates cuts after either source or pending cell payload changes', async () => {

@@ -4697,8 +4697,14 @@ export function GridShell({
         if (committed_display_rows_key_ref.current === display_rows_key) return;
         committed_display_rows_key_ref.current = display_rows_key;
         // A column header's menu names no row; it stays.
-        set_context_menu((menu) => (menu?.kind === 'header' ? menu : null));
-    }, [display_rows_key]);
+        if (context_menu === null || context_menu.kind === 'header') return;
+        // Closed from here, not by the menu: give the grid the focus the
+        // menu held, as the menu does when it is dismissed.
+        const active = document.activeElement;
+        const menu_held_focus = active instanceof Element && active.closest('[role="menu"]') !== null;
+        set_context_menu(null);
+        if (menu_held_focus) grid_ref.current?.focus();
+    }, [context_menu, display_rows_key]);
     const select_active_display_cell = useCallback((target: Item) => {
         // Merge snapping is required here: the vendored grid's canonicalization
         // chokepoint (setGridSelection) covers selections *it* originates —

@@ -11,7 +11,7 @@
  */
 
 import type { DisplayRowInterval } from '../types';
-import { NEAREST_LIVE_ROW_SCAN_LIMIT, type PendingRowProjection } from './pending-row-projection';
+import type { PendingRowProjection } from './pending-row-projection';
 
 export interface RowFitTargetSources {
     readonly projection: Pick<
@@ -164,9 +164,10 @@ export function row_fit_targets(
  * selection of a million removed rows costs no more than one. In band mode
  * the band of rows removed at the end holds none and the appended rows all
  * are; the saved rows before them can include rows removed in place (a
- * sorted or filtered view over a layout), so those are read row by row for
- * at most `NEAREST_LIVE_ROW_SCAN_LIMIT` rows, past which an interval is
- * taken to hold one.
+ * sorted or filtered view over a layout), so those are read row by row as
+ * before. That walk stops at the first row that is not removed, and a row
+ * whose page is not loaded is not known to be removed: it reads at most the
+ * rows the loader holds.
  */
 export function rows_hold_fit_target(
     projection: Pick<
@@ -186,12 +187,10 @@ export function rows_hold_fit_target(
         }
         if (end >= projection.pendingBandStart) return true;
         const source_end = Math.min(end, projection.deletedBandStart - 1);
-        const last = Math.min(source_end, start + NEAREST_LIVE_ROW_SCAN_LIMIT - 1);
-        for (let row = start; row <= last; row += 1) {
+        for (let row = start; row <= source_end; row += 1) {
             const state = projection.row_state(row);
             if (state !== 'removed' && state !== 'tail-removal') return true;
         }
-        if (last < source_end) return true;
     }
     return false;
 }

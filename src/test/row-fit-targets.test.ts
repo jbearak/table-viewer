@@ -275,4 +275,30 @@ describe('rows_hold_fit_target', () => {
             }
         }
     });
+
+    it('reads past ten thousand rows removed in place in a sorted view, to the first not known removed', () => {
+        const rows = 20_000;
+        const sorted_removed = (unloaded: number | undefined) => create_pending_row_projection({
+            sourceDisplayRowCount: rows,
+            // Sorted in reverse; one row may have no loaded page.
+            sourceRowAt: (row) => (row === unloaded ? undefined : rows - 1 - row),
+            displayRowForSource: (source) => rows - 1 - source,
+            sourceRowCount: rows,
+            bodyViewTransformed: true,
+            changes: {
+                formatTemplates: [],
+                appendedRows: [],
+                tailRemovals: [],
+                conflicts: [],
+                rowLayout: {
+                    runs: [{ kind: 'source', start: 0, count: rows }],
+                    removedSourceRows: [{ start: 0, count: rows }],
+                    discardedPendingRows: [],
+                },
+            },
+        });
+        const every_row = [{ start: 0, end: rows - 1 }];
+        expect(rows_hold_fit_target(sorted_removed(undefined), every_row)).toBe(false);
+        expect(rows_hold_fit_target(sorted_removed(15_000), every_row)).toBe(true);
+    });
 });
