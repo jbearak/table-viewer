@@ -425,6 +425,10 @@ describe('compact_intervals', () => {
         const rows = { length: 9, toRanges: () => [[8, 12], [-3, 2], [2, 4], [1, 3]] } as unknown as GridSelection['rows'];
         expect(compact_intervals(rows, 10)).toEqual([{ start: 0, end: 3 }, { start: 8, end: 9 }]);
         expect(compact_intervals(rows, 0)).toEqual([]);
+        // As listing them: a slice from 2.5 holds 2.5, 3.5, 4.5, no whole index;
+        // one from 6 to 7.5 holds 6 and 7.
+        const fractional = { length: 3, toRanges: () => [[2.5, 5], [6, 7.5]] } as unknown as GridSelection['rows'];
+        expect(compact_intervals(fractional, 10)).toEqual([{ start: 6, end: 7 }]);
         expect(compact_intervals(CompactSelection.empty(), 10)).toEqual([]);
     });
 

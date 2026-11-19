@@ -179,8 +179,10 @@ export function compact_intervals(
     }
     const clamped: DisplayRowInterval[] = [];
     for (const [start, end] of selection.toRanges()) {
-        // Indices are integers: a slice holds every integer in [start, end).
-        const first = Math.max(0, Math.ceil(start));
+        // A slice lists start, start + 1, ... below end; only whole indices
+        // count, so a slice that starts between two holds none.
+        if (!Number.isInteger(start)) continue;
+        const first = Math.max(0, start);
         const last = Math.min(limit - 1, Math.ceil(end) - 1);
         if (Number.isSafeInteger(first) && Number.isSafeInteger(last) && first <= last) {
             clamped.push({ start: first, end: last });
