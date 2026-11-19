@@ -241,6 +241,17 @@ describe('header_drag_state_for_selection by ranges', () => {
         expect(header_drag_state_for_selection(CompactSelection.empty(), previous)).toBeNull();
     });
 
+    it('anchors on the sole selected index past an empty slice', () => {
+        const ranges = (slices: [number, number][]) => ({
+            length: slices.reduce((total, [start, end]) => total + end - start, 0),
+            toRanges: () => slices,
+            first: () => slices[0]?.[0],
+            hasIndex: (index: number) => slices.some(([start, end]) => index >= start && index < end),
+        }) as unknown as CompactSelection;
+        // Row 5 was already selected: nothing is added, and 5 is the only row.
+        expect(header_drag_state_for_selection(ranges([[5, 6]]), ranges([[0, 0], [5, 6]]))?.anchor).toBe(5);
+    });
+
     it('lists slices that do not start and end on whole indices, as before', () => {
         const fractional = (ranges: [number, number][], values: number[]) => ({
             length: values.length,

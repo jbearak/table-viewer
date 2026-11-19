@@ -114,8 +114,10 @@ export interface PendingRowProjection {
      * The first display row in `[start, end]` that is not a Pending Row
      * Removal or tail removal, or undefined; reads no further than `end`. In
      * layout mode removed runs are skipped whole; band mode reads row by row,
-     * stopping at the first row not known removed (one whose page is not
-     * loaded has no state), so at most the rows the loader holds.
+     * stopping at the first row not known removed. Over the source band (as
+     * Auto-fit's offer reads it) a row whose page is not loaded has no state,
+     * so that is at most the rows the loader holds; over the deleted band it
+     * is every row read.
      */
     first_live_display_row_in(start: number, end: number): number | undefined;
     /** Expand compressed source-band intervals back into host display space. */

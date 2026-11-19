@@ -90,9 +90,11 @@ export function header_drag_state_for_selection(
         // selection of a million rows. (Grid gestures give whole indices;
         // anything else is listed, as before.)
         const added = single_added_index(previous_ranges, next_ranges);
-        const anchor = added === 'none' || added === 'many'
-            ? next_columns.length === 1 ? next_columns.first() : undefined
-            : added;
+        // The sole selected index, read from the first slice that holds one.
+        const sole = next_columns.length === 1
+            ? next_ranges.find(([start, end]) => end > start)?.[0]
+            : undefined;
+        const anchor = added === 'none' || added === 'many' ? sole : added;
         return anchor === undefined ? null : { anchor, base: next_columns };
     }
     const next = compact_to_array(next_columns);
