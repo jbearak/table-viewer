@@ -11051,12 +11051,13 @@ export function GridShell({
     }, [has_visible_columns]);
     /**
      * A double-click on a row border: fits the row (see `fit_row_heights`).
-     * `boundary_y` is where the strip took that border to be. Heights can
-     * change under a still pointer (an undo, a delivery), leaving the strip
-     * where another row's border is now: the fit is taken only while the
-     * row's bottom edge is still there.
+     * `client_y` is where it landed. Heights can change under a still pointer
+     * (an undo, a delivery), leaving the strip where another row's border is
+     * now: the fit is taken only while the row's bottom edge is as near the
+     * double-click as a hover would need to arm the strip. Otherwise the
+     * strip is out of date, and is taken down for the next hover to re-arm.
      */
-    const handle_row_border_double_click = useCallback((row: number, boundary_y: number): void => {
+    const handle_row_border_double_click = useCallback((row: number, client_y: number): void => {
         const double_clicked = row_border_was_double_clicked(
             row_border_presses_ref.current,
             row,
@@ -11066,7 +11067,13 @@ export function GridShell({
         if (!double_clicked) return;
         // The row marker's cell: never merged, so its bottom is the row's.
         const bounds = grid_ref.current?.getBounds(-1, row);
-        if (bounds === undefined || Math.abs(bounds.y + bounds.height - boundary_y) > 1) return;
+        if (
+            bounds === undefined
+            || Math.abs(bounds.y + bounds.height - client_y) > ROW_RESIZE_TOLERANCE_PX
+        ) {
+            row_resize_ref.current?.set_target(null);
+            return;
+        }
         // The strip's row height and border position are about to change.
         row_resize_ref.current?.set_target(null);
         fit_row_heights(row);

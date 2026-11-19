@@ -8088,9 +8088,9 @@ describe('GridShell row auto-fit', () => {
         (grid_mock.row_resize_props!.on_resize_start as (row: number, height: number) => void)(row, height);
         (grid_mock.row_resize_props!.on_resize_end as (row: number, height: number) => void)(row, height);
     });
-    /** The double-click itself, on a strip at `boundary_y` (where the mocked grid puts every row's bottom). */
-    const fit = (row: number, boundary_y = 46) => act(() =>
-        (grid_mock.row_resize_props!.on_fit as (row: number, boundary_y: number) => void)(row, boundary_y));
+    /** The double-click itself, landing at `client_y` (the mocked grid puts every row's bottom at 46). */
+    const fit = (row: number, client_y = 46) => act(() =>
+        (grid_mock.row_resize_props!.on_fit as (row: number, client_y: number) => void)(row, client_y));
     const double_click_border = (row: number, height = 24) => {
         click_border(row, height);
         click_border(row, height);
@@ -8234,14 +8234,22 @@ describe('GridShell row auto-fit', () => {
         expect(grid_mock.row_resize_set_target).toHaveBeenCalledWith(null);
     });
 
-    it('fits nothing when the row\'s border has moved from under the strip', async () => {
+    it('fits only while the row\'s border is under the double-click, and drops a strip that is out of date', async () => {
         const on_row_fit = await render_fit({ 0: 'x'.repeat(30), 1: 'b', 2: 'c', 3: 'd' });
-        // The strip took row 0's border to be at 70; its bottom is at 46 now
-        // (an undo of its height, say, with the pointer still).
+        grid_mock.row_resize_set_target.mockClear();
+        // Row 0 ends at 46 now, after an undo under a still pointer at 70.
         click_border(0);
         click_border(0);
         fit(0, 70);
         expect(on_row_fit).not.toHaveBeenCalled();
+        expect(grid_mock.row_resize_set_target).toHaveBeenCalledWith(null);
+        // Its border moved 3px (inside the strip): the double-click is on it.
+        click_border(0);
+        click_border(0);
+        fit(0, 49);
+        expect(on_row_fit).toHaveBeenCalledOnce();
+        // A grid that cannot say where the row is fits nothing.
+        grid_mock.get_bounds.mockImplementation(() => undefined);
         double_click_border(0);
         expect(on_row_fit).toHaveBeenCalledOnce();
     });
