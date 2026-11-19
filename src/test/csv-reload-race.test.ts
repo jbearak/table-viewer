@@ -2401,12 +2401,12 @@ describe('CSV reload races', () => {
             bytes = new Uint8Array(content);
             if (after_write.replace_with) bytes = new Uint8Array(after_write.replace_with);
         });
+        const base = csv_table_profile(fake_viewer_host.config);
         const profile: ViewerProfile = {
-            editing: true,
-            plan_save: plan_csv_save,
-            async build_source(raw: Uint8Array, path: string) {
+            ...base,
+            async build_source(...args: Parameters<ViewerProfile['build_source']>) {
                 builds += 1;
-                const source = await build_csv_source(raw, path);
+                const source = await base.build_source(...args);
                 if (builds === 2) stall_next_read = true;
                 return source;
             },
@@ -2418,6 +2418,7 @@ describe('CSV reload races', () => {
             post_save_stalled: post_save_stalled.promise,
             release_post_save: () => release_post_save.resolve(),
             builds: () => builds,
+            set_bytes: (next: Uint8Array) => { bytes = new Uint8Array(next); },
             gate_check(answer?: Uint8Array) {
                 const started = deferred<void>();
                 const release = deferred<void>();
@@ -2496,6 +2497,54 @@ describe('CSV reload races', () => {
 
         expect(harness.builds()).toBe(2);
         expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
+    });
+
+    it('does not let a late own-watcher check cancel Load all rows', async () => {
+        // The postSave installs bytes past the row limit; the user asks for
+        // every row while the watcher's check is still reading. The watcher's
+        // report is older than that request and must not cancel it.
+        vscode_mock.__setConfigurationValue('tableViewer.csvMaxRows', 2);
+        const harness = post_save_stalled_after_build('/tmp/post-save-own-watcher-load-all.csv');
+        const { panel } = harness;
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        harness.after_write.replace_with = enc.encode('h\nsaved\nb\nc\n');
+
+        const save = panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await harness.post_save_stalled;
+        const check = harness.gate_check();
+        const watcher = vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await check.started;
+        harness.release_post_save();
+        await save;
+        await vi.waitFor(() => {
+            expect(refresh_snapshots(panel).at(-1)).toMatchObject({ truncationMessage: 'Showing 2 of 3 rows' });
+        });
+        // Hold Load all rows at its read, so it is still running when the
+        // check answers.
+        const load_all_read = harness.gate_check();
+        const load_all = panel.__receive({ type: 'loadAllCsvRows' });
+        await load_all_read.started;
+        check.release();
+        await flush_promises();
+        load_all_read.release();
+        await Promise.all([load_all, watcher]);
+        await flush_promises();
+
+        expect(refresh_snapshots(panel).at(-1)).toMatchObject({
+            truncationMessage: null,
+            meta: { sheets: [{ rowCount: 3 }] },
+        });
+        // The request still stands for the next reload: a cancelled one would
+        // have been withdrawn, and the next change would truncate again.
+        harness.set_bytes(enc.encode('h\nsaved\nb\nc\nd\n'));
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await vi.waitFor(() => {
+            expect(refresh_snapshots(panel).at(-1)).toMatchObject({
+                truncationMessage: null,
+                meta: { sheets: [{ rowCount: 4 }] },
+            });
+        });
     });
 
     it('refreshes after an own watcher joined a postSave that installed other bytes', async () => {

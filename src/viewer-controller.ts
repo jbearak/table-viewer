@@ -10626,6 +10626,8 @@ export function attach_viewer(
             ) return false;
             // Past the size limit the build refuses before reading, so this
             // must not read it either; the refresh it falls back to refuses.
+            // As in the build, the limit is checked on the stat: a file
+            // replaced between the stat and the read is read as it is then.
             assert_safe_file_size(stat.size, host.config.max_file_size_mib());
             return content_digest(await host.fs.read_file(uri)) === digest;
         } catch {
@@ -10668,7 +10670,14 @@ export function attach_viewer(
             // A parked header settlement is the exception: only an adoption
             // settles it, which a kept source does not give, so the event
             // still refreshes.
+            //
+            // A postSave that stalls after its build, in its own reads of the
+            // file or its commit, holds a joined event with it. The refresh
+            // the event would start instead does the same reads of the same
+            // file, so it is not a way out of that stall; a parse that hangs
+            // is (see above), and so is a new attempt.
             session.wake_delivery();
+            const seq_at_arrival = load_seq;
             return (async () => {
                 if (
                     await file_holds_bytes(post_save.saved_digest)
@@ -10691,13 +10700,16 @@ export function attach_viewer(
                     if (covered) return result;
                 }
                 if (disposed) return { type: 'disposed' } as const;
-                // A newer event may have started its own load while this one
-                // was checking. Starting this one now would supersede it with
-                // an older event: a recovery or a later save would lose to a
-                // watcher report that came before it.
+                // A load that started while this event was checking (a newer
+                // event, a recovery, a later save, or a local refresh such as
+                // Load all rows) is newer than this report and reads the file
+                // itself. Starting this one now would supersede it with an
+                // older event. A retry of the postSave this event checked is
+                // the same load and does not count.
                 if (
-                    latest_refresh_event !== undefined
-                    && latest_refresh_event.episode > event.episode
+                    load_seq !== seq_at_arrival
+                    || (latest_refresh_event !== undefined
+                        && latest_refresh_event.episode > event.episode)
                 ) {
                     return inactive_refresh_result();
                 }
