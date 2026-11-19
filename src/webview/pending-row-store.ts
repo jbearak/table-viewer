@@ -1980,6 +1980,26 @@ function rows_in_range(
     return count;
 }
 
+/**
+ * The nearest row to `row`, going `up` (to higher rows) or `down`, that no
+ * interval of canonical `intervals` (sorted, merged, adjacent ones joined)
+ * holds: `row` itself, or the row just past the interval holding it. One
+ * binary search.
+ */
+function row_outside(intervals: readonly SourceInterval[], row: number, direction: 'up' | 'down'): number {
+    // The last interval starting at or before `row`.
+    let low = 0;
+    let high = intervals.length;
+    while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (intervals[middle]!.start <= row) low = middle + 1;
+        else high = middle;
+    }
+    const holder = intervals[low - 1];
+    if (holder === undefined || holder.start + holder.count <= row) return row;
+    return direction === 'up' ? holder.start + holder.count : holder.start - 1;
+}
+
 function row_prefix(intervals: readonly SourceInterval[]): number[] {
     const prefix = [0];
     for (const entry of intervals) prefix.push(prefix[prefix.length - 1]! + entry.count);
@@ -2057,11 +2077,10 @@ function merge_move_refusal_by_intervals(
         const start = Math.max(merge.startRow, body_start);
         const end = Math.min(merge.endRow, body_end - 1);
         if (end < start) continue;
-        const staying = subtract_intervals([{ start, count: end - start + 1 }], staying_out);
-        if (staying.length === 0) continue;
-        const low = after.body_index_of({ kind: 'source', sourceRow: staying[0]!.start });
-        const tail = staying[staying.length - 1]!;
-        const high = after.body_index_of({ kind: 'source', sourceRow: tail.start + tail.count - 1 });
+        const first_staying = row_outside(staying_out, start, 'up');
+        if (first_staying > end) continue;
+        const low = after.body_index_of({ kind: 'source', sourceRow: first_staying });
+        const high = after.body_index_of({ kind: 'source', sourceRow: row_outside(staying_out, end, 'down') });
         if (low !== undefined && high !== undefined && low < first && last < high) {
             return refuse_structure('merge-destination', merge_destination_message('rows'));
         }

@@ -327,6 +327,39 @@ vi.mock('../webview/grid-copy-model', async (import_original) => {
     };
 });
 
+// The structure planners as they are, counting what the Move items and row
+// drops do: reads of a row selection's listed rows, run-based Move dry runs,
+// and column Move plans.
+const move_work = vi.hoisted(() => ({ identity_reads: 0, row_probes: 0, column_moves: 0 }));
+vi.mock('../webview/row-structure-model', async (import_original) => {
+    const original = await import_original<typeof import('../webview/row-structure-model')>();
+    return {
+        ...original,
+        resolve_row_structure_selection(...args: Parameters<typeof original.resolve_row_structure_selection>) {
+            return new Proxy(original.resolve_row_structure_selection(...args), {
+                get(target, key, receiver) {
+                    if (key === 'identities') move_work.identity_reads += 1;
+                    return Reflect.get(target, key, receiver);
+                },
+            });
+        },
+    };
+});
+vi.mock('../webview/pending-row-store', async (import_original) => {
+    const original = await import_original<typeof import('../webview/pending-row-store')>();
+    return {
+        ...original,
+        probe_row_move_runs(...args: Parameters<typeof original.probe_row_move_runs>) {
+            move_work.row_probes += 1;
+            return original.probe_row_move_runs(...args);
+        },
+        move_columns(...args: Parameters<typeof original.move_columns>) {
+            move_work.column_moves += 1;
+            return original.move_columns(...args);
+        },
+    };
+});
+
 vi.mock('../webview/vscode-theme', () => ({
     use_vscode_theme: () => ({
         theme: {},
@@ -11920,6 +11953,62 @@ describe('row Move by menu, shortcut, and drag', () => {
         ]);
         expect(announcement()).toBe('Moved 2 rows up');
         await vi.waitFor(() => expect(selected_rows()).toEqual([0, 1]));
+    });
+
+    it('proposes drops by the block’s runs, and lists its rows only to move them', async () => {
+        const { pending } = await render_moves();
+        type Block = { start: number; end: number };
+        const propose = grid_mock.props!.onRowProposeMove as (rows: Block, before: number) => boolean;
+        const on_row_moved = grid_mock.props!.onRowMoved as (rows: Block, before: number) => void;
+        move_work.identity_reads = 0;
+        move_work.row_probes = 0;
+        expect(propose({ start: 1, end: 2 }, 0)).toBe(true);
+        expect(propose({ start: 1, end: 2 }, 4)).toBe(true);
+        // A drop where the block already is changes nothing, and may still land.
+        expect(propose({ start: 1, end: 2 }, 1)).toBe(true);
+        expect(propose({ start: 1, end: 2 }, 3)).toBe(true);
+        expect(move_work.row_probes).toBe(4);
+        expect(move_work.identity_reads).toBe(0);
+        await act(async () => on_row_moved({ start: 1, end: 2 }, 0));
+        expect(move_work.identity_reads).toBe(1);
+        expect(pending.snapshot().rowLayout?.runs).toEqual([
+            { kind: 'source', start: 1, count: 2 },
+            { kind: 'source', start: 0, count: 1 },
+            { kind: 'source', start: 3, count: 1 },
+        ]);
+    });
+
+    it('decides the row menu’s Move items without listing the rows, and lists them for the move', async () => {
+        const { pending } = await render_moves();
+        await select_rows([1, 2]);
+        move_work.identity_reads = 0;
+        move_work.row_probes = 0;
+        await open_row_menu(2);
+        expect(menu_item('Move rows up')?.getAttribute('aria-disabled')).toBeNull();
+        expect(move_work.row_probes).toBeGreaterThan(0);
+        expect(move_work.identity_reads).toBe(0);
+        await act(async () => menu_item('Move rows up')!.click());
+        expect(move_work.identity_reads).toBe(1);
+        expect(pending.snapshot().rowLayout?.runs?.[0]).toEqual({ kind: 'source', start: 1, count: 2 });
+    });
+
+    it('opens the cell menu without planning a Move on either axis', async () => {
+        await render_moves();
+        await select_rows([]);
+        move_work.row_probes = 0;
+        move_work.column_moves = 0;
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([1, 1], {
+            preventDefault: vi.fn(),
+            bounds: { x: 140, y: 48, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        expect(menu_item('Insert row above')).toBeDefined();
+        expect(menu_item('Move rows up')).toBeUndefined();
+        expect(move_work.row_probes).toBe(0);
+        expect(move_work.column_moves).toBe(0);
     });
 
     describe('loading rows a move brought on screen', () => {

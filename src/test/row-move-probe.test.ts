@@ -311,13 +311,27 @@ describe('probe_row_move_runs', () => {
             [mixed, source(10)],
             [mixed, pending('i0')],
             [mixed, pending('bogus')],
+            // A discarded row as the target, for live rows.
+            [[{ kind: 'source', start: 6, count: 2 }], pending('i0')],
+            // A pending row the layout does not have, beside live rows.
+            [[{ kind: 'pending', identity: { kind: 'pending', pendingRowId: 'ghost' } },
+                { kind: 'source', start: 6, count: 2 }], source(10)],
         ] as [RowSelectionRun[], RowIdentity | 'end'][]) {
             const expected = outcome(move_rows(changes, ctx, identities_of_runs(runs), before));
             expect(outcome(probe_row_move_runs(changes, ctx, runs, before)), JSON.stringify([runs, before])).toBe(expected);
             seen.add(expected.split(':')[0]!);
         }
         expect(seen).toContain('no-live-entry');
+        expect(seen).toContain('unknown-identity');
         expect(seen).toContain('ok');
+    });
+
+    it('refuses for a pending cut-move before a transformed view, as move_rows does', () => {
+        const ctx = context({ bodyViewTransformed: true, hasPendingCellMove: () => true });
+        const runs: RowSelectionRun[] = [{ kind: 'source', start: 4, count: 2 }];
+        const expected = outcome(move_rows(EMPTY, ctx, identities_of_runs(runs), source(9)));
+        expect(expected.split(':')[0]).toBe('cell-move');
+        expect(outcome(probe_row_move_runs(EMPTY, ctx, runs, source(9)))).toBe(expected);
     });
 
     it('answers the run limit as move_rows does, at the limit', () => {
