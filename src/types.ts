@@ -341,9 +341,10 @@ export type SheetViewRecord =
          *
          * Computed on the host because that is the only place both halves of the
          * question exist at once — the permutation and the durable dirty map.
-         * Membership moves only at an install: an installed filter reads saved values
-         * and deliberately never recomputes mid-session, and the user can only type
-         * into rows the view is showing.
+         * Membership moves only at an install: an installed filter never recomputes
+         * as the user types (an install reads saved values, or for a Reapply the
+         * unsaved ones its `cellValues` carry), and the user can only type into rows
+         * the view is showing.
          *
          * Keys rather than a bare count, and this is the refinement worth keeping
          * straight. Membership moves only at an install, but the *count* is a function
@@ -4041,7 +4042,14 @@ export type WebviewMessage =
      * `target` instead of those two, and `enabled` equal to its mode being `'on'`.
      */
     | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; unhideAll?: boolean; headerRow?: number; target?: ExcelHeaderTarget; requestId: string; generation: number; sourceGeneration: number }
-    | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent }
+    /**
+     * `cellValues`, sent only by the stale-view banner's Reapply, is the window's
+     * unsaved text for cells in columns these rules read, keyed
+     * `"sourceRow:sourceColumn"`. The install reads them in place of the saved values,
+     * so the order follows what is on screen. They only shape this install: nothing
+     * stores them, and a later install sent without them reads saved values again.
+     */
+    | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent; cellValues?: Record<string, string> }
     /**
      * Which source rows these display rows of the sheet are. It computes and
      * saves nothing: Hide rows composes the answer onto the rules it asks for

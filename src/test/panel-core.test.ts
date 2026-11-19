@@ -1101,6 +1101,133 @@ describe('ViewerPanelCore', () => {
             .toEqual(['4', '3', '2']);
     });
 
+    it('sorts and filters by the unsaved values a request carries, without caching them', async () => {
+        const { panel, posted } = make_panel();
+        const source = new TrackingColumnSource();
+        const core = new ViewerPanelCore(panel, source);
+        const install = async (
+            requestId: string,
+            state: SheetTransformState,
+            cellValues?: Record<string, string>,
+        ) => {
+            await core.handle_message({
+                type: 'setTransform',
+                sheetIndex: 0,
+                requestId,
+                generation: core.generation,
+                sourceGeneration: core.source_generation,
+                intent: 'user',
+                state,
+                ...(cellValues ? { cellValues } : {}),
+            });
+            const page_id = `${requestId}-page`;
+            await core.handle_message({
+                type: 'requestRows',
+                sheetIndex: 0,
+                startRow: 0,
+                count: 10,
+                requestId: page_id,
+                generation: core.generation,
+            });
+            const page = posted.find((message) => (
+                message.type === 'rowData' && message.requestId === page_id
+            ));
+            return page.rows.map((row: RenderedCell[]) => row[0].raw);
+        };
+        const sort = {
+            sort: [{ colIndex: 0, direction: 'desc' as const }],
+            filters: [],
+            schema: '["Sheet1",3,null]',
+        };
+        const saved_order = await install('saved', sort);
+        expect(saved_order.length).toBeGreaterThan(1);
+        const last = saved_order.at(-1);
+        // The last row's unsaved value now sorts it first. The page still shows the
+        // saved text: only the order reads the unsaved values.
+        // Column 0 of row r reads `1000 + r`.
+        const last_source_row = Number(last) - 1_000;
+        const reapplied = await install('reapply', sort, {
+            [`${last_source_row}:0`]: '999999',
+            'not-a-key': '5',
+        });
+        expect(reapplied).toEqual([last, ...saved_order.slice(0, -1)]);
+        // A request without them reads saved values again, and the column analysis
+        // it reads was never replaced by the unsaved one.
+        expect(await install('saved-again', sort)).toEqual(saved_order);
+        // (Pages read every column at once; the transform reads one column at a time.)
+        expect(source.column_reads
+            .map((read) => read.columns)
+            .filter((columns) => columns.length === 1)).toEqual([[0], [0]]);
+
+        // A filter keeps or drops a row by its unsaved value too.
+        const filtered = await install('filter', {
+            sort: [],
+            filters: [{
+                id: 'f', colIndex: 0, operator: 'greaterThan', value: '100000',
+                caseSensitive: false, enabled: true,
+            }],
+            schema: '["Sheet1",3,null]',
+        }, { [`${last_source_row}:0`]: '999999' });
+        expect(filtered).toEqual([last]);
+    });
+
+    it('keeps an installed text filter when unsaved values make its column numeric', async () => {
+        const { panel, posted } = make_panel();
+        const values = ['open', '2', 'x'];
+        const source = new TrackingColumnSource(3, 1, 1, (_sheet, _column, row) => values[row]);
+        const core = new ViewerPanelCore(panel, source);
+        const state: SheetTransformState = {
+            sort: [],
+            filters: [{
+                id: 'f', colIndex: 0, operator: 'equals', value: 'open',
+                caseSensitive: false, enabled: true,
+            }],
+            schema: '["Sheet1",1,null]',
+        };
+        const send = (requestId: string, cellValues?: Record<string, string>) => core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId,
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state, ...(cellValues ? { cellValues } : {}),
+        });
+        await send('install');
+        expect(posted.find((message) => message.requestId === 'install'))
+            .toMatchObject({ type: 'transformInstalled', view: { rowCount: 1 } });
+
+        // Every value now reads as a number, so a strict compile would refuse `open`.
+        await send('reapply', { '0:0': '1', '2:0': '3' });
+        expect(posted.find((message) => message.requestId === 'reapply'))
+            .toMatchObject({ type: 'transformInstalled', view: { rowCount: 0 } });
+    });
+
+    it('reapplies a range whose bounds read differently once edits make the column numeric', async () => {
+        const { panel, posted } = make_panel();
+        const values = ['2024-06-01', '2024-03-01'];
+        const source = new TrackingColumnSource(2, 1, 1, (_sheet, _column, row) => values[row]);
+        const core = new ViewerPanelCore(panel, source);
+        const state: SheetTransformState = {
+            sort: [],
+            filters: [{
+                id: 'f', colIndex: 0, operator: 'between', value: '2024', secondValue: '2024-12-31',
+                caseSensitive: false, enabled: true,
+            }],
+            schema: '["Sheet1",1,null]',
+        };
+        const send = (requestId: string, cellValues?: Record<string, string>) => core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId,
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state, ...(cellValues ? { cellValues } : {}),
+        });
+        await send('install');
+        expect(posted.find((message) => message.requestId === 'install'))
+            .toMatchObject({ type: 'transformInstalled', view: { rowCount: 2 } });
+
+        // Both cells now read as numbers, so `2024` is a numeric bound and
+        // `2024-12-31` is not: the range compares as text, `2025` outside it.
+        await send('reapply', { '0:0': '2025', '1:0': '2024' });
+        expect(posted.find((message) => message.requestId === 'reapply'))
+            .toMatchObject({ type: 'transformInstalled', view: { rowCount: 1 } });
+    });
+
     it('reports a permutation for every shape of active rule and none for an inactive one', async () => {
         // `permuted` is the webview's only answer to "are the rows on screen the source
         // rows", and it decides whether the display-keyed row-height affordances are

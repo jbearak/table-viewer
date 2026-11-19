@@ -1256,6 +1256,8 @@ describe('table transforms', () => {
             secondValue: '.z',
         })).resolves.toMatchObject({ indices: Uint32Array.from([2, 3]) });
         expect(matches_filter(cell('.a', 'number'), filter('greaterThan', '.'))).toBe(true);
+        // A blank operand is text, not zero, even where operands are read leniently.
+        expect(matches_filter(cell('0', 'number'), filter('notEquals', ' '))).toBe(true);
         // Stata missing values sort after every number.
         await expect(compute_transform(new Source([
             [cell('.a', 'number')],

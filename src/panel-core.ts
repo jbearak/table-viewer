@@ -1,6 +1,6 @@
 import { createHash } from 'crypto';
 import { transform_states_equal } from './transform-state-equality';
-import type { DataSource, SheetMeta } from './data-source/interface';
+import type { DataSource, RawCell, SheetMeta } from './data-source/interface';
 import {
     projected_row_for_source,
     read_source_row_indices,
@@ -19,6 +19,7 @@ import {
     compute_transform,
     InvalidNumericFilterOperandError,
     transformed_window,
+    type TransformCellOverrides,
     type TransformedRowWindow,
 } from './table-transform';
 import type {
@@ -1829,6 +1830,41 @@ export class ViewerPanelCore {
         };
     }
 
+    /**
+     * The window's unsaved cell text, re-keyed from source cells to the projected rows
+     * the transform reads, per column. Read as plain text, which is what a CSV cell
+     * reloads as; transforms already read canonical number text as a number. A key
+     * that names no row of this view (malformed, or a row the source no longer
+     * projects) is skipped rather than refused: these values only order rows.
+     */
+    private transform_cell_overrides(
+        sheet_index: number,
+        values: Readonly<Record<string, unknown>> | undefined,
+    ): TransformCellOverrides | undefined {
+        if (values === undefined || values === null || typeof values !== 'object') {
+            return undefined;
+        }
+        const by_column = new Map<number, Map<number, RawCell>>();
+        for (const [key, value] of Object.entries(values)) {
+            if (typeof value !== 'string') continue;
+            const parsed = parse_cell_highlight_key(key);
+            if (!parsed) continue;
+            const row = projected_row_for_source(
+                this.source,
+                sheet_index,
+                parsed.sourceRow,
+            );
+            if (row === undefined) continue;
+            let column = by_column.get(parsed.sourceColumn);
+            if (!column) {
+                column = new Map();
+                by_column.set(parsed.sourceColumn, column);
+            }
+            column.set(row, { raw: value, rawType: 'string' });
+        }
+        return by_column.size > 0 ? by_column : undefined;
+    }
+
     private async handle_set_transform(
         msg: SetTransformMessage,
     ): Promise<void> {
@@ -1952,6 +1988,7 @@ export class ViewerPanelCore {
                 undefined,
                 this.column_analysis_cache,
                 this.changed_grid_rows(msg.sheetIndex, msg.state),
+                this.transform_cell_overrides(msg.sheetIndex, msg.cellValues),
             );
             if (compute_is_cancelled()) return;
 

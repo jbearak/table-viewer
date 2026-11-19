@@ -1,4 +1,5 @@
 import type {
+    CsvDirtyEntry,
     FilterColumnKind,
     FilterEntry,
     FilterOperator,
@@ -9,6 +10,7 @@ import type {
     TransformIntent,
 } from '../types';
 import {
+    dirty_entry_value_changed,
     is_range_filter_operator,
     is_stata_binary_filter_identity,
     raw_value_from_escaped_filter_identity,
@@ -363,15 +365,73 @@ export function order_relevant_dirty_keys(
 }
 
 /**
+ * The unsaved values an install of `state` reads: the text of every edit Save would
+ * write (link-only entries excluded, as `csv-save-model` excludes them), in a column
+ * the rules read. Recorded per install so the notice can tell which edits the rows on
+ * screen already reflect.
+ */
+export function transform_read_values(
+    state: SheetTransformState | undefined,
+    entries: Iterable<readonly [string, CsvDirtyEntry]>,
+    // The first source row of the body. A promoted header row, and anything above
+    // it, is not a row the order reads; an edit there renames a column instead.
+    first_body_row = 0,
+): Record<string, string> {
+    const values: Record<string, string> = {};
+    if (!state) return values;
+    const columns = transform_read_columns(state);
+    if (columns.size === 0) return values;
+    for (const [key, entry] of entries) {
+        if (!(
+            dirty_entry_value_changed(entry)
+            || entry.movedFrom !== undefined
+            || entry.valueEditOrder !== undefined
+        )) continue;
+        const separator = key.indexOf(':');
+        const text = separator < 0 ? '' : key.slice(separator + 1);
+        const column = Number(text);
+        if (text.length === 0 || !Number.isInteger(column) || !columns.has(column)) {
+            continue;
+        }
+        if (Number(key.slice(0, separator)) < first_body_row) continue;
+        values[key] = entry.value;
+    }
+    return values;
+}
+
+/**
+ * The keys where the installed order and the values on screen disagree: an edit the
+ * order has not read (made since the install, or changed again since), and an edit the
+ * order read that is gone again (undone or discarded, so the cell shows its saved
+ * value). `read_values` is what a Reapply read (`transform_read_values`); a view
+ * installed any other way read none, which leaves every edit stale, as before Reapply.
+ */
+export function stale_dirty_keys(
+    state: SheetTransformState | undefined,
+    live_edits: Readonly<Record<string, CsvDirtyEntry>> | undefined,
+    read_values: Readonly<Record<string, string>> | undefined,
+    first_body_row = 0,
+): string[] {
+    const current = transform_read_values(
+        state,
+        Object.entries(live_edits ?? {}),
+        first_body_row,
+    );
+    const keys = new Set([...Object.keys(current), ...Object.keys(read_values ?? {})]);
+    return [...keys].filter((key) => read_values?.[key] !== current[key]).sort();
+}
+
+/**
  * Signature of everything the stale-view notice is currently saying, or undefined
  * when it has nothing to say.
  *
  * There are two independent reasons to say something, and either alone is enough:
  *
- *  - A dirty cell sits in a column the installed order reads. An installed sort or
- *    filter deliberately does not recompute during a live edit session — rows stay
- *    where the user left them, which is the feature — so the displayed order can
- *    disagree with the current values, and that is worth saying.
+ *  - A dirty cell the installed order has not read sits in a column it reads. An
+ *    installed sort or filter deliberately does not recompute as the user types —
+ *    rows stay where the user left them, which is the feature — so the displayed
+ *    order can disagree with the current values until a Reapply, and that is worth
+ *    saying. The caller passes only those keys (`stale_dirty_keys`).
  *  - The installed view does not show rows holding unsaved edits
  *    (`hidden_edited_cell_keys`). This one cannot be reduced to the first:
  *    hidden-ness is a property of the *row*, so an edit in a column no rule reads is

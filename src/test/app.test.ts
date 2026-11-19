@@ -17398,9 +17398,10 @@ describe('acquiring a session and an installed transform', () => {
 });
 
 describe('stale-view banner', () => {
-    const BANNER_TEXT = 'Sorting and filters don\'t update while you\'re editing.';
-    // A future contributor must not be able to reintroduce a "Resort"/"Refresh"
-    // action here. Rows staying put is the feature, so there is nothing to apply.
+    const BANNER_TEXT =
+        'Rows stay in place as you edit, so sorting and filters may be out of date.';
+    // Rows staying put is the feature, so the only action that moves them is the
+    // banner's own Reapply, and only beside the sentence about a stale order.
     const CTA = /re-?sort|re-?filter|refresh|apply|update/i;
 
     function banner(): HTMLElement | null {
@@ -17412,13 +17413,40 @@ describe('stale-view banner', () => {
         if (present) {
             const labels = Array.from(present.querySelectorAll('button'))
                 .map((button) => button.textContent ?? '');
-            expect(labels).toEqual(['Dismiss']);
+            expect(labels).toEqual(
+                present.textContent?.includes(BANNER_TEXT)
+                    ? ['Reapply', 'Dismiss']
+                    : ['Dismiss'],
+            );
         }
-        // Nowhere on the page, so a CTA cannot sneak in beside the banner either.
+        // Nowhere else on the page, so a CTA cannot sneak in beside the banner.
         const offenders = Array.from(document.querySelectorAll('button'))
+            .filter((button) => !present?.contains(button))
             .map((button) => button.textContent ?? '')
             .filter((label) => CTA.test(label));
         expect(offenders).toEqual([]);
+    }
+
+    /** Commit edits to the store the grid paints from, then report them, as the
+     *  real grid does after a commit. */
+    async function commit_edits(edits: Record<string, CsvDirtyEntry>) {
+        const store = grid_shell_mock.latest_props?.edit_session as
+            | {
+                commit(session: string, key: string, entry: CsvDirtyEntry): unknown;
+                snapshot(): ReadonlyMap<string, CsvDirtyEntry>;
+            }
+            | undefined;
+        expect(store).toBeDefined();
+        await act(async () => {
+            for (const [key, entry] of Object.entries(edits)) {
+                store!.commit('test-edit-session', key, entry);
+            }
+        });
+        // The whole map, as the grid reports it; a remount (any install that moves
+        // the generation) reports it again.
+        const all = Object.fromEntries(store!.snapshot());
+        grid_shell_mock.mount_edits = all;
+        await report_grid_editing(true, true, [], all);
     }
 
     async function session_sorted_on_column_0() {
@@ -17964,6 +17992,169 @@ describe('stale-view banner', () => {
         expect_no_call_to_action();
     });
 
+    it('reapplies the installed rules by the unsaved values on screen', async () => {
+        const post_message = await session_sorted_on_column_0();
+        await commit_edits(dirty('0:0'));
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect_no_call_to_action();
+
+        post_message.mockClear();
+        await click_button('Reapply');
+        const request = latest_transform_request(post_message);
+        expect(request).toMatchObject({
+            intent: 'user',
+            state: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
+            cellValues: { '0:0': 'dirty-0:0' },
+        });
+
+        // The install read that value, so the order on screen reflects it.
+        await acknowledge_transform(request, 3);
+        expect(grid_stub().getAttribute('data-generation')).toBe('3');
+        expect(banner()).toBeNull();
+
+        // Changed again, the same cell is stale again.
+        await commit_edits({ '0:0': { value: 'changed again', base: 'base' } });
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect_no_call_to_action();
+    });
+
+    it('reads saved values for a sort chosen mid-edit', async () => {
+        const post_message = await session_sorted_on_column_0();
+        await commit_edits(dirty('0:0'));
+        await act(async () => (
+            container!.querySelector('.stub-header-transform') as HTMLButtonElement
+        ).click());
+        const request = latest_transform_request(post_message);
+        // Only Reapply applies unsaved values; a choice moves no row by an edit.
+        expect(request.cellValues).toBeUndefined();
+        await acknowledge_transform(request, 3);
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect_no_call_to_action();
+    });
+
+    it('announces a dismissed edit again once a Reapply read it and it changed', async () => {
+        const post_message = await session_sorted_on_column_0();
+        await commit_edits(dirty('0:0'));
+        await click_button('Dismiss');
+        expect(banner()).toBeNull();
+        // Typed again: same key, so the dismissal still holds it.
+        await commit_edits({ '0:0': { value: 'second', base: 'base' } });
+        expect(banner()).toBeNull();
+        // A new edit elsewhere brings the banner, and its Reapply reads both.
+        await commit_edits({ '1:0': { value: 'other', base: 'base' } });
+        await click_button('Reapply');
+        await acknowledge_transform(latest_transform_request(post_message), 3);
+        expect(banner()).toBeNull();
+
+        await commit_edits({ '0:0': { value: 'third', base: 'base' } });
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+    });
+
+    it('applies the value still in an open editor', async () => {
+        const post_message = await session_sorted_on_column_0();
+        await commit_edits(dirty('0:0'));
+        // Reapply folds the open editor before it reads the store, so the value
+        // typed but not yet committed is the one applied.
+        const store = grid_shell_mock.latest_props?.edit_session as
+            { commit(session: string, key: string, entry: CsvDirtyEntry): unknown };
+        grid_shell_mock.commit_live_edit.mockImplementationOnce(() => {
+            store.commit('test-edit-session', '0:0', { value: 'still typing', base: 'base' });
+            return true;
+        });
+        await click_button('Reapply');
+        expect(latest_transform_request(post_message).cellValues)
+            .toEqual({ '0:0': 'still typing' });
+    });
+
+    it('holds editors while it computes and can be cancelled', async () => {
+        const post_message = await session_sorted_on_column_0();
+        await commit_edits(dirty('0:0'));
+        await click_button('Reapply');
+        const reapply = latest_transform_request(post_message);
+        // A view request like any sort: cells offer no editor until it lands, and
+        // its install records no step.
+        expect(grid_shell_mock.latest_props?.view_request_in_flight).toBe(true);
+
+        // Its rules are the installed ones, and Cancel still stops it.
+        await click_button('Cancel');
+        const cancel = latest_transform_request(post_message);
+        expect(cancel).toMatchObject({ intent: 'cancel' });
+        expect(cancel.requestId).not.toBe(reapply.requestId);
+        expect(cancel.cellValues).toBeUndefined();
+        // The host keeps the order on screen and answers on the same generation.
+        await acknowledge_transform(cancel, 2);
+        expect(grid_shell_mock.latest_props?.view_request_in_flight).toBe(false);
+        // The cancelled Reapply read nothing that is on screen: still stale.
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+    });
+
+    it('leaves an edit to the header row out of the order', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        // An auto-detected header names no source row: it is row 0.
+        await dispatch_host_message(initial_snapshot_message(
+            {
+                ...meta,
+                sheets: meta.sheets.map((sheet) => ({
+                    ...sheet,
+                    excelFirstRowHeader: {
+                        mode: 'auto' as const, detected: true, active: true, available: true,
+                    },
+                })),
+            },
+            { capabilities: { csvEditable: true, csvEditingSupported: true } },
+        ));
+        await acquire_editing_session(post_message);
+        await act(async () => (
+            container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
+        ).click());
+        await acknowledge_transform(latest_transform_request(post_message), 2);
+
+        await commit_edits({ '0:0': { value: 'Renamed', base: 'Name' } });
+        expect(banner()).toBeNull();
+        // A body row in the same column is one the order reads.
+        await commit_edits({ '1:0': { value: 'moved', base: 'base' } });
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+    });
+
+    it('waits for a sort still in flight rather than replacing it', async () => {
+        const post_message = await session_sorted_on_column_0();
+        await commit_edits(dirty('0:0'));
+        await act(async () => (
+            container!.querySelector('.stub-header-transform') as HTMLButtonElement
+        ).click());
+        const in_flight = latest_transform_request(post_message);
+        expect(get_button('Reapply').disabled).toBe(true);
+        expect(latest_transform_request(post_message).requestId).toBe(in_flight.requestId);
+    });
+
+    it('offers Reapply once an applied edit is undone, even with the session gone', async () => {
+        const post_message = await session_sorted_on_column_0();
+        await commit_edits(dirty('0:0'));
+        await click_button('Reapply');
+        await acknowledge_transform(latest_transform_request(post_message), 3);
+        expect(banner()).toBeNull();
+
+        // The last edit undone: the map empties and the session lets go, but the row
+        // still sits where its unsaved value put it.
+        const store = grid_shell_mock.latest_props?.edit_session as
+            { clear(session: string): unknown };
+        await act(async () => { store.clear('test-edit-session'); });
+        grid_shell_mock.mount_edits = {};
+        await report_grid_editing(false, false, [], {});
+        await release_idle_edit_session();
+        expect(grid_stub().getAttribute('data-editing-session-held')).toBe('false');
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
+        expect_no_call_to_action();
+
+        post_message.mockClear();
+        await click_button('Reapply');
+        const request = latest_transform_request(post_message);
+        expect(request.cellValues).toBeUndefined();
+        await acknowledge_transform(request, 4);
+        expect(banner()).toBeNull();
+    });
+
     it('stays away for an edit in a column the order does not read', async () => {
         await session_sorted_on_column_0();
         await report_grid_editing(true, true, [], dirty('0:1'));
@@ -18154,7 +18345,7 @@ describe('stale-view banner', () => {
         await reinstall_with_hidden_cells(['1:1']);
 
         expect(banner()?.textContent).toContain(
-            'Sorting and filters don\'t update while you\'re editing.'
+            'Rows stay in place as you edit, so sorting and filters may be out of date.'
             + ' 1 edited cell is in a row this view doesn\'t show.',
         );
         expect_no_call_to_action();
