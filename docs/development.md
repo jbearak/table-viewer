@@ -212,7 +212,7 @@ git tag -d v<version> && git reset --hard HEAD~1
 
 ## pqparser
 
-Table Viewer reads Parquet files with [pqparser](https://github.com/jbearak/pqparser), which is not on npm. `package.json` installs it from the tarball attached to its GitHub release, and `package-lock.json` records that tarball's sha512, so `npm ci` fails if the file at the URL ever changes. The tarball embeds pqparser's wasm module, so installing it needs no Rust. The extension and desktop bundles inline the package.
+Table Viewer reads Parquet files with [pqparser](https://github.com/jbearak/pqparser), which is not on npm. `package.json` installs it from the tarball attached to its GitHub release, and `package-lock.json` records that tarball's sha512, so npm refuses a tarball whose bytes differ from it. The tarball embeds pqparser's wasm module, so installing it needs no Rust. The extension and desktop bundles inline the package.
 
 To move to a new version, release it from pqparser (its README's Release section: pushing a tag `vX.Y.Z` makes the release), then:
 

@@ -8,6 +8,13 @@ const repo_dir = resolve(__dirname, '../..');
 const manifest = JSON.parse(readFileSync(join(repo_dir, 'package.json'), 'utf8')) as {
     scripts: Record<string, string>;
 };
+const lock = JSON.parse(readFileSync(join(repo_dir, 'package-lock.json'), 'utf8')) as {
+    packages: Record<string, { version: string }>;
+};
+// The installed version, so that moving to a new one needs no change here.
+function locked(name: string): string {
+    return `${name}@${lock.packages[`node_modules/${name}`].version}`;
+}
 const vscodeignore = readFileSync(join(repo_dir, '.vscodeignore'), 'utf8')
     .split(/\r?\n/u)
     .filter((line) => line.length > 0 && !line.startsWith('#'));
@@ -39,8 +46,8 @@ describe('wasm packages\' third-party notices', () => {
     });
 
     it.each([
-        ['@jbearak/dta-parser@1.1.0', 'Third-party notices for @jbearak/dta-parser'],
-        ['pqparser@0.0.3', 'Third-party notices for pqparser'],
+        [locked('@jbearak/dta-parser'), 'Third-party notices for @jbearak/dta-parser'],
+        [locked('pqparser'), 'Third-party notices for pqparser'],
     ])('adds %s\'s third-party notices to the desktop notices', (header, notices) => {
         const out = join(temp_dir(), 'THIRD_PARTY_NOTICES.txt');
         execFileSync(process.execPath, [join(repo_dir, 'desktop', 'collect-licenses.mjs')], {
