@@ -209,3 +209,15 @@ To undo a bump before pushing, drop the tag and the commit:
 ```sh
 git tag -d v<version> && git reset --hard HEAD~1
 ```
+
+## pqparser
+
+Table Viewer reads Parquet files with [pqparser](https://github.com/jbearak/pqparser), which is not on npm. `package.json` installs it from the tarball attached to its GitHub release, and `package-lock.json` records that tarball's sha512, so npm refuses a tarball whose bytes differ from it. The tarball embeds pqparser's wasm module, so installing it needs no Rust. The extension and desktop bundles inline the package.
+
+To move to a new version, release it from pqparser (its README's Release section: pushing a tag `vX.Y.Z` makes the release), then:
+
+```sh
+npm install --save https://github.com/jbearak/pqparser/releases/download/vX.Y.Z/pqparser-X.Y.Z.tgz
+```
+
+The release notes give the commit it was built from, the toolchain, and the tarball's SHA-256.
