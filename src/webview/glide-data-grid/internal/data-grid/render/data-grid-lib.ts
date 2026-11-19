@@ -314,6 +314,7 @@ export function clearTextMetricsCache(): void {
     metricsCache = {};
     biasCache.length = 0;
     wrapCache.clear();
+    wrapCacheChars = 0;
     clearCache();
     textMetricsGeneration++;
 }
@@ -501,17 +502,34 @@ function truncateString(data: string, w: number): string {
     return data;
 }
 
-/** `splitMultiLineText` results by font, width and text, least recently used first. */
+/** `splitMultiLineText` results by font, direction, width and text, least recently used first. */
 const wrapCache = new Map<string, readonly string[]>();
+/** The characters of `wrapCache`'s keys, which hold whole cell values. */
+let wrapCacheChars = 0;
+const WRAP_CACHE_MAX_ENTRIES = 500;
+const WRAP_CACHE_MAX_CHARS = 4_000_000;
 
 const graphemeSegmenter = typeof Intl.Segmenter === "function"
     ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
     : undefined;
 
-/** The glyphs a word may break between: grapheme clusters, or code points without `Intl.Segmenter`. */
-function graphemes(text: string): Iterable<string> {
-    if (graphemeSegmenter === undefined) return text;
-    return Array.from(graphemeSegmenter.segment(text), (part) => part.segment);
+/**
+ * Where a word may break: the offset of each grapheme cluster (each code point
+ * without `Intl.Segmenter`), then the word's length.
+ */
+function graphemeBoundaries(text: string): number[] {
+    const boundaries: number[] = [];
+    if (graphemeSegmenter === undefined) {
+        let offset = 0;
+        for (const point of text) {
+            boundaries.push(offset);
+            offset += point.length;
+        }
+    } else {
+        for (const { index } of graphemeSegmenter.segment(text)) boundaries.push(index);
+    }
+    boundaries.push(text.length);
+    return boundaries;
 }
 
 /**
@@ -532,7 +550,7 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, width: number
     // names neither the direction nor, for a long line, a short string.
     const fits = (text: string) => ctx.measureText(text).width <= width;
     // Spaces alone draw nothing, however many lines they would take.
-    if (line.trim() === "" || fits(line)) return [line];
+    if (/^ *$/.test(line) || fits(line)) return [line];
     const lines: string[] = [];
     let current = "";
     // Each word keeps the spaces before it; trailing spaces are a word too.
@@ -544,7 +562,7 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, width: number
         } else if (fits(current + word)) {
             current += word;
             fitting = true;
-        } else if (word.trim() === "") {
+        } else if (/^ +$/.test(word)) {
             // Trailing spaces past the edge: dropped, as the line's trim would.
             continue;
         } else {
@@ -553,17 +571,37 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, width: number
             fitting = fits(current);
         }
         if (fitting) continue;
-        // One word wider than the line: break it between graphemes.
-        let piece = "";
-        for (const glyph of graphemes(current)) {
-            if (piece !== "" && !fits(piece + glyph)) {
-                lines.push(piece);
-                piece = glyph;
-            } else {
-                piece += glyph;
+        // One word wider than the line: break it between graphemes, each line
+        // the longest run that fits (at least one grapheme), found by
+        // galloping and then halving, so a long unbroken value (a URL, base64)
+        // costs a few measurements a line rather than one a grapheme.
+        const boundaries = graphemeBoundaries(current);
+        const count = boundaries.length - 1;
+        const run = (from: number, length: number) =>
+            current.slice(boundaries[from], boundaries[from + length]);
+        let from = 0;
+        for (;;) {
+            const remaining = count - from;
+            let good = 1;
+            let bad = remaining + 1;
+            for (let step = 1; good < remaining; step *= 2) {
+                const next = Math.min(good + step, remaining);
+                if (!fits(run(from, next))) {
+                    bad = next;
+                    break;
+                }
+                good = next;
             }
+            while (bad - good > 1) {
+                const middle = (good + bad) >> 1;
+                if (fits(run(from, middle))) good = middle;
+                else bad = middle;
+            }
+            if (good === remaining) break;
+            lines.push(run(from, good));
+            from += good;
         }
-        current = piece;
+        current = run(from, count - from);
     }
     lines.push(current);
     return lines;
@@ -602,9 +640,12 @@ export function splitMultiLineText(
     // canvas-hypertxt's whitespace handling, which the painter has always had.
     const lines = split.map((line, index) => index === 0 ? line.trimEnd() : line.trim());
     wrapCache.set(key, lines);
-    if (wrapCache.size > 500) {
+    wrapCacheChars += key.length;
+    while (wrapCache.size > WRAP_CACHE_MAX_ENTRIES || wrapCacheChars > WRAP_CACHE_MAX_CHARS) {
         const oldest = wrapCache.keys().next().value;
-        if (oldest !== undefined) wrapCache.delete(oldest);
+        if (oldest === undefined) break;
+        wrapCache.delete(oldest);
+        wrapCacheChars -= oldest.length;
     }
     return lines;
 }

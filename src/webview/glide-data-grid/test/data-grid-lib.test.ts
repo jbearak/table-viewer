@@ -211,6 +211,24 @@ describe("splitMultiLineText", () => {
         expect(splitMultiLineText(directed, "abc def", "13px test", 70)).toEqual(["abc", "def"]);
     });
 
+    it("breaks a long unbroken value with a few measurements a line, not one a glyph", () => {
+        let calls = 0;
+        const counted = {
+            font: "",
+            measureText: (text: string) => {
+                calls += 1;
+                return { width: text.length * 10 };
+            },
+        } as unknown as CanvasRenderingContext2D;
+        const word = "abcdefghij".repeat(1_000);
+        const lines = splitMultiLineText(counted, word, "13px test", 1_000);
+        expect(lines).toHaveLength(100);
+        expect(lines.join("")).toBe(word);
+        for (const line of lines) expect(line).toHaveLength(100);
+        // 10,000 glyphs; about 15 measurements for each of the 100 lines.
+        expect(calls).toBeLessThan(2_000);
+    });
+
     it("wraps a value into more lines than a spread can pass", () => {
         const lines = splitMultiLineText(ctx, "ab ".repeat(150_000), "13px test", 25);
         expect(lines).toHaveLength(150_000);
