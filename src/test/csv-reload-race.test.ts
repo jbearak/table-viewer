@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 import {
     attach_viewer,
@@ -124,6 +124,12 @@ beforeEach(() => {
     for (const panel of vscode_mock.__getPanels()) panel.dispose();
     vi.restoreAllMocks();
     vscode_mock.__reset();
+});
+
+// A test that fails between useFakeTimers and its own useRealTimers must not
+// hand fake timers to the next one.
+afterEach(() => {
+    vi.useRealTimers();
 });
 
 describe('CSV reload races', () => {
