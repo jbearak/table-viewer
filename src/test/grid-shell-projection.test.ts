@@ -11054,6 +11054,16 @@ describe('row Insert in the row-gutter menu', () => {
         expect(on_row_fit).not.toHaveBeenCalled();
     });
 
+    it('fits nothing from the row menu when the gesture may not start', async () => {
+        long_rows();
+        const on_row_fit = vi.fn();
+        const { pending } = await insert_after_first({ on_row_fit, size_gesture_may_start: () => false });
+        await open_row_menu(1);
+        await act(async () => menu_item('Auto-fit row height')!.click());
+        expect(on_row_fit).not.toHaveBeenCalled();
+        expect(pending.snapshot().appendedRows[0]?.viewerRowHeight).toBeUndefined();
+    });
+
     it('offers Reset row height for saved rows that show a custom height, and posts a reset', async () => {
         const on_row_resize = vi.fn();
         const size_gesture_may_start = vi.fn(() => true);

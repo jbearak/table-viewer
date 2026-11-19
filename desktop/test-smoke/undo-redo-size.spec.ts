@@ -606,6 +606,23 @@ test('a double-clicked border of a selected row fits every selected row to its o
     await expect_sizes(page, file, { ...fit, undo: 'Undo Auto-fit 3 row heights', redo: 'Redo' });
 });
 
+test('Auto-fit row height in the row-number menu is the same one step', async () => {
+    watch([], [1]);
+    const { file, page } = await open_file('fit-menu.csv', NOTES_CSV);
+    await expect_sizes(page, file, { stored: NOTHING, shown: layout(), undo: 'Undo', redo: 'Redo' });
+
+    await choose(await open_row_menu(page, 1), 'Auto-fit row height');
+    const [fitted] = await stored_heights(file, 1);
+    expect(fitted).toBeGreaterThan(80);
+    const fit = { stored: { widths: {}, heights: [fitted] }, shown: layout([], [24, fitted]) };
+    await expect_sizes(page, file, { ...fit, undo: 'Undo Auto-fit row height', redo: 'Redo' });
+
+    await history(page, 'undo');
+    await expect_sizes(page, file, { stored: NOTHING, shown: layout(), undo: 'Undo', redo: 'Redo Auto-fit row height' });
+    await history(page, 'redo');
+    await expect_sizes(page, file, { ...fit, undo: 'Undo Auto-fit row height', redo: 'Redo' });
+});
+
 test('a row border reached from inside its own cell offers the drag', async () => {
     watch([], [1]);
     const { file, page } = await open_file('inside.csv', CSV);
