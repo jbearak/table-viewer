@@ -8071,14 +8071,17 @@ describe('GridShell row auto-fit', () => {
             return text === undefined ? undefined : cells(text);
         }) as any);
         const on_row_fit = vi.fn();
-        await render_grid(props({
+        fit_props = props({
             sheet_meta: { ...props().sheet_meta, rowCount: 4, sourceRowCount: 4 },
             row_count: 4,
             on_row_fit,
             ...overrides,
-        }));
+        });
+        fit_shell = await render_grid(fit_props);
         return on_row_fit;
     };
+    let fit_props: GridShellProps;
+    let fit_shell: Awaited<ReturnType<typeof render_grid>>;
     /** One press on a row border, released without moving it. */
     const click_border = (row: number, height = 24) => act(() => {
         window.dispatchEvent(new Event('pointerdown'));
@@ -8227,6 +8230,15 @@ describe('GridShell row auto-fit', () => {
         scroller.className = 'dvn-scroller';
         root_element.appendChild(scroller);
         act(() => scroller.dispatchEvent(new Event('scroll')));
+        expect(grid_mock.row_resize_set_target).toHaveBeenCalledWith(null);
+    });
+
+    it('takes the border strip down when row heights change under it', async () => {
+        await render_fit({ 0: 'a', 1: 'b', 2: 'c', 3: 'd' }, { row_heights: { 0: 72 } });
+        grid_mock.row_resize_set_target.mockClear();
+        await act(async () => {
+            root!.render(React.createElement(fit_shell, { ...fit_props, row_heights: {} }));
+        });
         expect(grid_mock.row_resize_set_target).toHaveBeenCalledWith(null);
     });
 

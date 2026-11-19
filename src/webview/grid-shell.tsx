@@ -11049,6 +11049,11 @@ export function GridShell({
         return () => grid_root.removeEventListener('scroll', clear, true);
         // The root is another element once every column is hidden or shown.
     }, [has_visible_columns]);
+    // Likewise when row heights change under it (an undo, another window's
+    // write, an insert): the border it sits on may now end another row.
+    useEffect(() => {
+        row_resize_ref.current?.set_target(null);
+    }, [effective_row_height]);
     /** A double-click on a row border: fits the row (see `fit_row_heights`). */
     const handle_row_border_double_click = useCallback((row: number): void => {
         const double_clicked = row_border_was_double_clicked(
