@@ -631,6 +631,9 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, width: number
             const piece = run(from, good);
             if (!/^\s*$/.test(piece)) lines.push(piece);
             from += good;
+            // The next line is drawn trimmed: whitespace it starts with (a
+            // no-break space, which is not a break) takes no width.
+            while (from < count - 1 && /^\s+$/.test(run(from, 1))) from += 1;
         }
         current = run(from, count - from);
     }

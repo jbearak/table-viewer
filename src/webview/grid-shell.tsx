@@ -175,6 +175,7 @@ import {
     rich_cell_wrapped_lines,
     rich_text_cell_renderer,
 } from './rich-text-cell-renderer';
+import type { RichTextLine } from './rich-text-layout';
 import {
     fit_row_height,
     source_height_runs,
@@ -10901,6 +10902,17 @@ export function GridShell({
             default_row_height,
         };
         const padding = glide_theme.cellHorizontalPadding;
+        /**
+         * The lines a cell needs: through its last one with visible text (at
+         * least one). Blank lines after it show nothing, and a block taller
+         * than its row starts at the top, so they need no room.
+         */
+        const lines_to_last_visible = <Line,>(lines: readonly Line[], text_of: (line: Line) => string): number => {
+            for (let index = lines.length - 1; index >= 0; index -= 1) {
+                if (/\S/.test(text_of(lines[index]))) return index + 1;
+            }
+            return 1;
+        };
         const measure_cell = (display_row: number, display_column: number): MeasuredCell => {
             const cell = get_cell_content([display_column, display_row]);
             const width = get_cell_width(display_row, display_column);
@@ -10923,7 +10935,7 @@ export function GridShell({
                 let fits_default: boolean;
                 try {
                     ctx.direction = direction(text) === 'rtl' ? 'rtl' : 'inherit';
-                    lines = splitMultiLineText(ctx, text, font, available).length;
+                    lines = lines_to_last_visible(splitMultiLineText(ctx, text, font, available), (line) => line);
                     if (auto_fit_active || has_line_break(text)) {
                         fits_default = lines <= 1;
                     } else {
@@ -10944,10 +10956,14 @@ export function GridShell({
             }
             if (cell.kind === GridCellKind.Custom && is_rich_text_cell(cell)) {
                 // The rich renderer takes its line metric from the base font.
-                const lines = rich_cell_wrapped_lines(ctx, cell.data, available, glide_theme.fontFamily).length;
+                const segments_text = (line: RichTextLine) => line.map((segment) => segment.text).join('');
+                const lines = lines_to_last_visible(
+                    rich_cell_wrapped_lines(ctx, cell.data, available, glide_theme.fontFamily),
+                    segments_text,
+                );
                 const fits_default = auto_fit_active
                     ? lines <= 1
-                    : cell.data.lines.length <= 1
+                    : lines_to_last_visible(cell.data.lines, segments_text) <= 1
                         && !rich_cell_unwrapped_hides_text(ctx, cell.data, width, padding, glide_theme.fontFamily);
                 return { lines, fits_default };
             }

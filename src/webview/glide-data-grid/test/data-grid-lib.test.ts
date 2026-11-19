@@ -245,11 +245,13 @@ describe("splitMultiLineText", () => {
 
     it("adds no line for whitespace: tabs past the edge, or indentation wider than the line", () => {
         expect(splitMultiLineText(ctx, "hi" + "\t".repeat(40), "13px test", 52)).toEqual(["hi"]);
-        // Runs of indentation alone add nothing; what is left of it stays on the first line.
-        expect(splitMultiLineText(ctx, " ".repeat(12) + "abcdefgh", "13px test", 50)).toEqual(["  abc", "defgh"]);
+        // Indentation wider than the line adds nothing, and takes no width from the text.
+        expect(splitMultiLineText(ctx, " ".repeat(12) + "abcdefgh", "13px test", 50)).toEqual(["abcde", "fgh"]);
         expect(splitMultiLineText(ctx, "ab\tcd ef", "13px test", 50)).toEqual(["ab\tcd", "ef"]);
         // A later hard line is drawn trimmed: its indentation takes no width.
         expect(splitMultiLineText(ctx, "head\n  abcde", "13px test", 50)).toEqual(["head", "abcde"]);
+        // A word broken at a no-break space: the next line starts after it.
+        expect(splitMultiLineText(ctx, "abcde\u00a0fghij", "13px test", 50)).toEqual(["abcde", "fghij"]);
         // A BOM after trailing spaces is trailing whitespace too.
         expect(splitMultiLineText(ctx, "ab   \uFEFF", "13px test", 24)).toEqual(["ab"]);
         // A no-break space keeps its words together: "10\u00a0km" moves whole.

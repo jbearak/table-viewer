@@ -8136,6 +8136,16 @@ describe('GridShell row auto-fit', () => {
         ], undefined);
     });
 
+    it('gives blank lines after the last visible one no room', async () => {
+        const on_row_fit = await render_fit({ 0: 'a\n', 1: 'a\n\n  ', 2: 'a\n\nb', 3: 'd' });
+        await select_rows([0, 1, 2]);
+        double_click_border(0);
+        expect(on_row_fit).toHaveBeenCalledExactlyOnceWith([
+            { start: 0, end: 1, height: null },
+            { start: 2, end: 2, height: 62 },
+        ], undefined);
+    });
+
     it('keeps the default for text that paints whole there, reaching into the right padding', async () => {
         // 13 × 7 = 91px: two lines at the 84px wrap width, but whole at the
         // default height, where it is clipped only at the cell's 92px edge.

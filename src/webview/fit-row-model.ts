@@ -64,8 +64,9 @@ export interface MeasuredCell {
 
 /**
  * A row's fitted height. The default when every cell paints all of its text
- * at the default height; otherwise the tallest any cell needs once the row is
- * tall enough to wrap (at least two lines for one that did not fit), each
+ * at the default height; otherwise (or when the row is kept taller anyway)
+ * the tallest any cell needs once the row is tall enough to wrap (at least
+ * two lines for one that did not fit), each
  * judged in its own font (a bold cell's em can differ from the base font's).
  *
  * `keep_at_least` is the row's current height when the row must not shrink:
@@ -79,7 +80,9 @@ export function fit_row_height(
 ): number {
     let fitted = metrics.default_row_height;
     const measured = [...cells];
-    if (measured.some((cell) => !cell.fits_default)) {
+    // A row kept above the default (by a vertical merge) wraps its cells too.
+    const wraps = keep_at_least !== undefined && keep_at_least > metrics.default_row_height;
+    if (wraps || measured.some((cell) => !cell.fits_default)) {
         for (const cell of measured) {
             const height = fit_height_for_lines(
                 cell.fits_default ? cell.lines : Math.max(2, cell.lines),

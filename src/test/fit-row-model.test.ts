@@ -101,6 +101,13 @@ describe('fit_row_height', () => {
         expect(fit_row_height([tall], metrics())).toBeGreaterThan(fit_height_for_lines(3, metrics()));
     });
 
+    it('wraps every cell of a row kept above the default', () => {
+        // Whole on one line at 24px, but a vertical merge keeps the row at 25,
+        // where the cell wraps to two lines.
+        expect(fit_row_height([{ lines: 2, fits_default: true }], metrics(), 25))
+            .toBe(fit_height_for_lines(2, metrics()));
+    });
+
     it('shrinks a tall row to its content unless told to keep its height', () => {
         expect(fit_row_height(lines(1), metrics())).toBe(24);
         expect(fit_row_height(lines(1), metrics(), 80)).toBe(80);
