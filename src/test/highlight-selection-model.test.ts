@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { plan_cell_highlight_mutation } from '../cell-highlight-command';
 import { create_column_projection } from '../webview/column-projection';
 import {
+    compact_intervals,
     grid_selection_contains_cell,
     grid_selection_contains_row,
     highlight_selection_may_have_renderable_highlight,
@@ -352,5 +353,141 @@ describe('highlight_selection_from_grid', () => {
         expect(highlight_selection_from_grid(current(0, 0), 0, projection, [])).toBeNull();
         expect(highlight_selection_from_grid(current(0, 0), 10, create_column_projection(0), []))
             .toBeNull();
+    });
+});
+
+/** A real CompactSelection that refuses to be expanded index by index. */
+function unexpandable(selection: CompactSelection): CompactSelection {
+    const guarded = Object.create(selection) as CompactSelection;
+    const refuse = () => {
+        throw new Error('expanded a CompactSelection index by index');
+    };
+    Object.defineProperty(guarded, 'toArray', { value: refuse });
+    Object.defineProperty(guarded, Symbol.iterator, { value: refuse });
+    return guarded;
+}
+
+/** A small seeded generator, so a failure names its case. */
+function random_source(seed: number): () => number {
+    let state = seed >>> 0;
+    return () => {
+        state = (state * 1664525 + 1013904223) >>> 0;
+        return state / 2 ** 32;
+    };
+}
+
+function random_compact(next: () => number, limit: number): CompactSelection {
+    let selection = CompactSelection.empty();
+    const pieces = Math.floor(next() * 5);
+    for (let piece = 0; piece < pieces; piece++) {
+        const start = Math.floor(next() * (limit + 4)) - 2;
+        const length = 1 + Math.floor(next() * 4);
+        selection = next() < 0.75
+            ? selection.add([start, start + length])
+            : selection.remove([start, start + length]);
+    }
+    return selection;
+}
+
+describe('compact_intervals', () => {
+    it('reads a million-row selection by its slices, without expanding it', () => {
+        const rows = unexpandable(CompactSelection.fromSingleSelection([0, 1_000_000]).add([2_000_000, 2_000_003]));
+        expect(compact_intervals(rows, 2_000_002)).toEqual([
+            { start: 0, end: 999_999 },
+            { start: 2_000_000, end: 2_000_001 },
+        ]);
+        expect(selected_display_row_intervals({ ...empty(), rows }, 1_000_000))
+            .toEqual([{ start: 0, end: 999_999 }]);
+        expect(highlight_selection_from_grid({ ...empty(), rows }, 1_000_000, projection, []))
+            .toMatchObject({
+                selection: { displayRows: [{ start: 0, end: 999_999 }], sourceColumns: [0, 2, 3] },
+                estimatedCellCount: 3_000_000,
+            });
+    });
+
+    it('clamps to the limit and merges adjacent and overlapping slices', () => {
+        const rows = { length: 9, toRanges: () => [[8, 12], [-3, 2], [2, 4], [1, 3]] } as unknown as GridSelection['rows'];
+        expect(compact_intervals(rows, 10)).toEqual([{ start: 0, end: 3 }, { start: 8, end: 9 }]);
+        expect(compact_intervals(rows, 0)).toEqual([]);
+        expect(compact_intervals(CompactSelection.empty(), 10)).toEqual([]);
+    });
+
+    it('agrees with listing the indices, over random selections', () => {
+        const next = random_source(307);
+        for (let trial = 0; trial < 500; trial++) {
+            const limit = 1 + Math.floor(next() * 20);
+            const selection = random_compact(next, limit);
+            const listed = [...new Set(selection.toArray())]
+                .filter((index) => index >= 0 && index < limit)
+                .sort((a, b) => a - b);
+            const expected: { start: number; end: number }[] = [];
+            for (const index of listed) {
+                const last = expected.at(-1);
+                if (last !== undefined && last.end + 1 === index) last.end = index;
+                else expected.push({ start: index, end: index });
+            }
+            expect(compact_intervals(unexpandable(selection), limit), `trial ${trial}`).toEqual(expected);
+        }
+    });
+});
+
+describe('highlight_selection_from_grid over random selections', () => {
+    it('accepts exactly the selections whose cells form rows × columns, and counts them', () => {
+        const next = random_source(401);
+        const all_columns = create_column_projection(5);
+        for (let trial = 0; trial < 400; trial++) {
+            const row_count = 1 + Math.floor(next() * 12);
+            const rows = random_compact(next, row_count);
+            const columns = next() < 0.3 ? random_compact(next, 5) : CompactSelection.empty();
+            const rect = () => {
+                const x = Math.floor(next() * 5);
+                const y = Math.floor(next() * row_count);
+                return {
+                    x,
+                    y,
+                    width: 1 + Math.floor(next() * (5 - x)),
+                    height: 1 + Math.floor(next() * (row_count - y)),
+                };
+            };
+            const range = next() < 0.5 ? rect() : undefined;
+            const selection: GridSelection = {
+                rows: unexpandable(rows),
+                columns,
+                ...(range === undefined
+                    ? {}
+                    : { current: { cell: [range.x, range.y], range, rangeStack: next() < 0.3 ? [rect()] : [] } }),
+            };
+            // The cells the selection covers, listed one by one.
+            const cells = new Set<string>();
+            for (const row of rows.toArray()) {
+                if (row < 0 || row >= row_count) continue;
+                for (let column = 0; column < 5; column++) cells.add(`${row}:${column}`);
+            }
+            for (const column of columns.toArray()) {
+                if (column < 0 || column >= 5) continue;
+                for (let row = 0; row < row_count; row++) cells.add(`${row}:${column}`);
+            }
+            for (const area of range === undefined ? [] : [range, ...selection.current!.rangeStack]) {
+                for (let row = area.y; row < Math.min(row_count, area.y + area.height); row++) {
+                    for (let column = area.x; column < Math.min(5, area.x + area.width); column++) {
+                        cells.add(`${row}:${column}`);
+                    }
+                }
+            }
+            const covered_rows = new Set([...cells].map((cell) => Number(cell.split(':')[0])));
+            const covered_columns = new Set([...cells].map((cell) => Number(cell.split(':')[1])));
+            const rectangular = cells.size > 0 && cells.size === covered_rows.size * covered_columns.size;
+            const result = highlight_selection_from_grid(selection, row_count, all_columns, []);
+            if (!rectangular) {
+                expect(result, `trial ${trial}`).toBeNull();
+                continue;
+            }
+            expect(result?.estimatedCellCount, `trial ${trial}`).toBe(cells.size);
+            const listed_rows: number[] = [];
+            for (const interval of result!.selection.displayRows) {
+                for (let row = interval.start; row <= interval.end; row++) listed_rows.push(row);
+            }
+            expect(listed_rows, `trial ${trial}`).toEqual([...covered_rows].sort((a, b) => a - b));
+        }
     });
 });

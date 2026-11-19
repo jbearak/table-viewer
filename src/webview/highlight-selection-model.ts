@@ -124,7 +124,7 @@ function compact_indices(selection: GridSelection['rows'], limit: number): numbe
         values = Array.from(selection as Iterable<number>);
     } else {
         // Compatibility for reduced test doubles. Real CompactSelection exposes
-        // toArray and an iterator, so production work scales with selection size.
+        // toRanges, which `compact_intervals` reads instead.
         const first = typeof selection.first === 'function' ? selection.first() : undefined;
         const last = typeof selection.last === 'function' ? selection.last() : undefined;
         if (first === undefined || last === undefined || typeof selection.hasIndex !== 'function') {
@@ -150,11 +150,38 @@ function coalesce_indices(indices: readonly number[]): DisplayRowInterval[] {
     return intervals;
 }
 
+/**
+ * A CompactSelection's indices in `[0, limit)` as ascending, disjoint,
+ * non-adjacent inclusive intervals. Reads the selection's own `[start, end)`
+ * slices, so a selection of a million rows costs as much as one of a few: it
+ * is never expanded into an index per row. Doubles without `toRanges` fall
+ * back to listing their indices.
+ */
+export function compact_intervals(
+    selection: GridSelection['rows'],
+    limit: number,
+): DisplayRowInterval[] {
+    if (limit <= 0 || selection.length === 0) return [];
+    if (typeof selection.toRanges !== 'function') {
+        return coalesce_indices(compact_indices(selection, limit));
+    }
+    const clamped: DisplayRowInterval[] = [];
+    for (const [start, end] of selection.toRanges()) {
+        // Indices are integers: a slice holds every integer in [start, end).
+        const first = Math.max(0, Math.ceil(start));
+        const last = Math.min(limit - 1, Math.ceil(end) - 1);
+        if (Number.isSafeInteger(first) && Number.isSafeInteger(last) && first <= last) {
+            clamped.push({ start: first, end: last });
+        }
+    }
+    return merge_display_row_intervals(clamped);
+}
+
 export function selected_display_row_intervals(
     selection: GridSelection,
     row_count: number,
 ): DisplayRowInterval[] | null {
-    const explicit = coalesce_indices(compact_indices(selection.rows, row_count));
+    const explicit = compact_intervals(selection.rows, row_count);
     if (explicit.length > 0) return explicit;
     const current = selection.current;
     if (!current) return null;
@@ -214,33 +241,48 @@ function add_rect(
     }
 }
 
+/**
+ * The number of cells the regions cover together. Regions are grouped by
+ * their column span (a row selection's regions all span every column), and
+ * one sweep over the groups' merged row intervals adds each slab's covered
+ * width, so a selection of many row intervals costs about one step per
+ * interval rather than one per pair.
+ */
 function region_union_area(regions: readonly DisplayRegion[]): bigint {
-    const row_boundaries = [...new Set(regions.flatMap((region) => [
-        region.rows.start,
-        region.rows.end + 1,
-    ]))].sort((a, b) => a - b);
-    const column_boundaries = [...new Set(regions.flatMap((region) => [
-        region.firstColumn,
-        region.lastColumn + 1,
-    ]))].sort((a, b) => a - b);
-    let area = 0n;
-    for (let row_index = 0; row_index + 1 < row_boundaries.length; row_index++) {
-        const row = row_boundaries[row_index];
-        const row_height = row_boundaries[row_index + 1] - row;
-        for (
-            let column_index = 0;
-            column_index + 1 < column_boundaries.length;
-            column_index++
-        ) {
-            const column = column_boundaries[column_index];
-            if (!regions.some((region) =>
-                row >= region.rows.start
-                && row <= region.rows.end
-                && column >= region.firstColumn
-                && column <= region.lastColumn)) continue;
-            area += BigInt(row_height)
-                * BigInt(column_boundaries[column_index + 1] - column);
+    const groups = new Map<string, { firstColumn: number; lastColumn: number; rows: DisplayRowInterval[] }>();
+    for (const region of regions) {
+        const key = `${region.firstColumn}:${region.lastColumn}`;
+        let group = groups.get(key);
+        if (group === undefined) {
+            group = { firstColumn: region.firstColumn, lastColumn: region.lastColumn, rows: [] };
+            groups.set(key, group);
         }
+        group.rows.push(region.rows);
+    }
+    const spans = [...groups.values()].map((group) => ({
+        firstColumn: group.firstColumn,
+        lastColumn: group.lastColumn,
+        rows: merge_display_row_intervals(group.rows),
+    }));
+    const boundaries = [...new Set(spans.flatMap((span) => span.rows.flatMap((rows) => [
+        rows.start,
+        rows.end + 1,
+    ])))].sort((a, b) => a - b);
+    const cursors = spans.map(() => 0);
+    let area = 0n;
+    for (let index = 0; index + 1 < boundaries.length; index++) {
+        const row = boundaries[index];
+        const columns: DisplayRowInterval[] = [];
+        spans.forEach((span, at) => {
+            while (cursors[at] < span.rows.length && span.rows[cursors[at]].end < row) cursors[at] += 1;
+            const rows = span.rows[cursors[at]];
+            if (rows !== undefined && rows.start <= row) {
+                columns.push({ start: span.firstColumn, end: span.lastColumn });
+            }
+        });
+        let width = 0;
+        for (const covered of merge_display_row_intervals(columns)) width += covered.end - covered.start + 1;
+        area += BigInt(boundaries[index + 1] - row) * BigInt(width);
     }
     return area;
 }
@@ -257,7 +299,7 @@ export function highlight_selection_from_grid(
 
     const display_merges = project_merges_to_display(merges, column_projection);
     const regions: DisplayRegion[] = [];
-    for (const rows of coalesce_indices(compact_indices(grid_selection.rows, row_count))) {
+    for (const rows of compact_intervals(grid_selection.rows, row_count)) {
         add_rect(
             {
                 x: 0,
@@ -272,9 +314,7 @@ export function highlight_selection_from_grid(
             regions,
         );
     }
-    for (const columns of coalesce_indices(
-        compact_indices(grid_selection.columns, display_column_count),
-    )) {
+    for (const columns of compact_intervals(grid_selection.columns, display_column_count)) {
         add_rect(
             {
                 x: columns.start,
