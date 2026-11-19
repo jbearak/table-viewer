@@ -10905,17 +10905,14 @@ export function GridShell({
             const cell = get_cell_content([display_column, display_row]);
             const width = get_cell_width(display_row, display_column);
             const available = Math.max(0, width - 2 * padding);
-            // A layout of one line is fitted to the default height, where a
-            // cell does not wrap (unless Auto-fit Columns is on, or it has a
-            // line break): it paints its whole value on one line, cut at a
+            // Whether a cell paints all of its text at the default height. It
+            // wraps there only with Auto-fit Columns on (a Text cell also on a
+            // line break); otherwise it paints its value on one line, cut at a
             // quarter of its width in characters (both painters do, to bound
-            // the work of a huge value) and clipped at the column. When that
-            // would hide anything visible, the row must be tall enough to wrap.
-            const unwrapped_at_default = (lines: number, hard_lines: number): boolean =>
-                lines <= 1 && hard_lines <= 1 && !auto_fit_active;
+            // the work of a huge value) and clipped at the cell's edge.
             if (cell.kind === GridCellKind.Text) {
                 const text = cell.displayData;
-                if (text === '') return { lines: 1 };
+                if (text === '') return { lines: 1, fits_default: true };
                 // The Text cell paints in its own font (bold or italic), and
                 // takes its line metric from that font too.
                 const font = `${cell.themeOverride?.baseFontStyle ?? glide_theme.baseFontStyle} ${glide_theme.fontFamily}`;
@@ -10923,38 +10920,38 @@ export function GridShell({
                 // cell paints: right to left for right-to-left text.
                 ctx.font = font;
                 let lines: number;
+                let fits_default: boolean;
                 try {
                     ctx.direction = direction(text) === 'rtl' ? 'rtl' : 'inherit';
                     lines = splitMultiLineText(ctx, text, font, available).length;
-                    if (unwrapped_at_default(lines, has_line_break(text) ? 2 : 1)) {
+                    if (auto_fit_active || has_line_break(text)) {
+                        fits_default = lines <= 1;
+                    } else {
                         // Glide's truncateString keeps `slice(0, width / 4)`,
                         // and drawTextCell takes the direction from that.
                         const drawn = text.slice(0, width / 4);
                         const visible_past_cut = /\S/g;
                         visible_past_cut.lastIndex = drawn.length;
                         ctx.direction = direction(drawn) === 'rtl' ? 'rtl' : 'inherit';
-                        if (
-                            visible_past_cut.test(text)
-                            // Drawn from the left padding (and half a pixel),
-                            // clipped at the cell's edge; half a pixel of slack.
-                            || ctx.measureText(drawn.trimEnd()).width > width - padding
-                        ) lines = 2;
+                        // Drawn from the left padding, clipped at the cell's edge.
+                        fits_default = !visible_past_cut.test(text)
+                            && ctx.measureText(drawn.trimEnd()).width <= width - padding;
                     }
                 } finally {
                     ctx.direction = 'inherit';
                 }
-                return { lines, em_height: em_of(font) };
+                return { lines, fits_default, em_height: em_of(font) };
             }
             if (cell.kind === GridCellKind.Custom && is_rich_text_cell(cell)) {
                 // The rich renderer takes its line metric from the base font.
-                let lines = rich_cell_wrapped_lines(ctx, cell.data, available, glide_theme.fontFamily).length;
-                if (
-                    unwrapped_at_default(lines, cell.data.lines.length)
-                    && rich_cell_unwrapped_hides_text(ctx, cell.data, width, padding, glide_theme.fontFamily)
-                ) lines = 2;
-                return { lines };
+                const lines = rich_cell_wrapped_lines(ctx, cell.data, available, glide_theme.fontFamily).length;
+                const fits_default = auto_fit_active
+                    ? lines <= 1
+                    : cell.data.lines.length <= 1
+                        && !rich_cell_unwrapped_hides_text(ctx, cell.data, width, padding, glide_theme.fontFamily);
+                return { lines, fits_default };
             }
-            return { lines: 1 };
+            return { lines: 1, fits_default: true };
         };
         const fitted_height = (display_row: number): number => {
             const counts: MeasuredCell[] = [];

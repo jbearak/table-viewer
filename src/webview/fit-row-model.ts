@@ -54,13 +54,18 @@ export function fit_height_for_lines(lines: number, metrics: RowFitMetrics): num
 
 /** One measured cell: its visual lines and the em box of the font it paints in. */
 export interface MeasuredCell {
+    /** Its lines once the row is tall enough to wrap. */
     readonly lines: number;
+    /** Whether it paints all of its text at the default height. */
+    readonly fits_default: boolean;
     /** The painter's em for this cell's font; the metrics' own when absent. */
     readonly em_height?: number;
 }
 
 /**
- * A row's fitted height: the tallest any of its measured cells needs, each
+ * A row's fitted height. The default when every cell paints all of its text
+ * at the default height; otherwise the tallest any cell needs once the row is
+ * tall enough to wrap (at least two lines for one that did not fit), each
  * judged in its own font (a bold cell's em can differ from the base font's).
  *
  * `keep_at_least` is the row's current height when the row must not shrink:
@@ -73,12 +78,15 @@ export function fit_row_height(
     keep_at_least?: number,
 ): number {
     let fitted = metrics.default_row_height;
-    for (const cell of cells) {
-        const height = fit_height_for_lines(
-            cell.lines,
-            cell.em_height === undefined ? metrics : { ...metrics, em_height: cell.em_height },
-        );
-        if (height > fitted) fitted = height;
+    const measured = [...cells];
+    if (measured.some((cell) => !cell.fits_default)) {
+        for (const cell of measured) {
+            const height = fit_height_for_lines(
+                cell.fits_default ? cell.lines : Math.max(2, cell.lines),
+                cell.em_height === undefined ? metrics : { ...metrics, em_height: cell.em_height },
+            );
+            if (height > fitted) fitted = height;
+        }
     }
     return keep_at_least === undefined ? fitted : Math.max(fitted, keep_at_least);
 }

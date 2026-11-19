@@ -8136,6 +8136,18 @@ describe('GridShell row auto-fit', () => {
         ], undefined);
     });
 
+    it('keeps the default for text that paints whole there, reaching into the right padding', async () => {
+        // 13 × 7 = 91px: two lines at the 84px wrap width, but whole at the
+        // default height, where it is clipped only at the cell's 92px edge.
+        const on_row_fit = await render_fit({ 0: 'x'.repeat(13), 1: 'x'.repeat(14), 2: 'c', 3: 'd' });
+        await select_rows([0, 1]);
+        double_click_border(0);
+        expect(on_row_fit).toHaveBeenCalledExactlyOnceWith([
+            { start: 0, end: 0, height: null },
+            { start: 1, end: 1, height: 44 },
+        ], undefined);
+    });
+
     it('lets one line keep the default height when Auto-fit Columns has the default height wrap', async () => {
         const on_row_fit = await render_fit({ 0: 'i'.repeat(30), 1: 'b', 2: 'c', 3: 'd' }, { auto_fit_active: true });
         double_click_border(0);

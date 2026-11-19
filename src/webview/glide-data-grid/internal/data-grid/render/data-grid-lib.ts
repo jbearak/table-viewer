@@ -594,10 +594,6 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, width: number
         } else if (fits(current + word)) {
             current += word;
             fitting = true;
-        } else if (isBreakSpace(word, word.length - 1)) {
-            // (A word ends in a break space only when it is all trailing space.)
-            // Trailing whitespace past the edge: dropped, as the line's trim would.
-            continue;
         } else {
             lines.push(current);
             current = word.trimStart();
@@ -678,9 +674,13 @@ export function splitMultiLineText(
     }
     const split: string[] = [];
     // Appended one by one: a long value wraps to more lines than a spread can pass.
-    for (const hardLine of data.split("\n")) {
-        for (const line of wrapHardLine(ctx, hardLine, availableWidth)) split.push(line);
-    }
+    // Every visual line but the first is drawn trimmed, so a later hard
+    // line's indentation takes no width.
+    data.split("\n").forEach((hardLine, index) => {
+        for (const line of wrapHardLine(ctx, index === 0 ? hardLine : hardLine.trimStart(), availableWidth)) {
+            split.push(line);
+        }
+    });
     // canvas-hypertxt's whitespace handling, which the painter has always had.
     const lines = split.map((line, index) => index === 0 ? line.trimEnd() : line.trim());
     // A value too long for the whole cache is not kept: it would evict everything first.

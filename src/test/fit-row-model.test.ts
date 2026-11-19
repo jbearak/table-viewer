@@ -71,16 +71,31 @@ describe('fit_height_for_lines', () => {
 });
 
 describe('fit_row_height', () => {
-    const lines = (...counts: number[]) => counts.map((count) => ({ lines: count }));
+    /** Cells with these wrapped line counts, each painting all of its text at the default height iff it has one line. */
+    const lines = (...counts: number[]) => counts.map((count) => ({ lines: count, fits_default: count <= 1 }));
 
     it('fits the cell that needs the most height', () => {
         expect(fit_row_height(lines(1, 3, 2), metrics())).toBe(fit_height_for_lines(3, metrics()));
         expect(fit_row_height([], metrics())).toBe(24);
     });
 
+    it('keeps the default while every cell paints all of its text there', () => {
+        // Two wrapped lines, yet whole on one line at the default height (into the right padding).
+        expect(fit_row_height([{ lines: 2, fits_default: true }], metrics())).toBe(24);
+    });
+
+    it('grows for a cell cut at the default height, and then wraps every cell', () => {
+        // One line by measure, but cut at the default height: two lines.
+        expect(fit_row_height([{ lines: 1, fits_default: false }], metrics()))
+            .toBe(fit_height_for_lines(2, metrics()));
+        // The row grows, so a cell that fit unwrapped wraps too.
+        expect(fit_row_height([{ lines: 1, fits_default: false }, { lines: 3, fits_default: true }], metrics()))
+            .toBe(fit_height_for_lines(3, metrics()));
+    });
+
     it('judges each cell in its own font', () => {
         // Two lines in a font with a much larger em need more than three in the base font.
-        const tall = { lines: 2, em_height: 40 };
+        const tall = { lines: 2, fits_default: false, em_height: 40 };
         expect(fit_row_height([...lines(3), tall], metrics()))
             .toBe(fit_height_for_lines(2, metrics(13, 40)));
         expect(fit_row_height([tall], metrics())).toBeGreaterThan(fit_height_for_lines(3, metrics()));
