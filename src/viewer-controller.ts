@@ -10596,8 +10596,9 @@ export function attach_viewer(
 
     /**
      * Whether the file now holds exactly the bytes `digest` names. Only for a
-     * file the build reads whole anyway: a file-backed source is cheap to
-     * rebuild, and reading it whole here could be the expensive part.
+     * file the build reads whole anyway, and within the size limit: a
+     * file-backed source is cheap to rebuild, and reading it whole here could
+     * be the expensive part.
      */
     async function file_holds_bytes(digest: string): Promise<boolean> {
         try {
@@ -10607,6 +10608,9 @@ export function attach_viewer(
                 && profile.build_file_source !== undefined
                 && (profile.prefer_file_source || stat.size > MAX_WHOLE_FILE_READ_BYTES)
             ) return false;
+            // Past the size limit the build refuses before reading, so this
+            // must not read it either; the refresh it falls back to refuses.
+            assert_safe_file_size(stat.size, host.config.max_file_size_mib());
             return content_digest(await host.fs.read_file(uri)) === digest;
         } catch {
             return false;
