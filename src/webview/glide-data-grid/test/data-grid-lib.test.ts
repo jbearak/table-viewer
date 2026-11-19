@@ -182,12 +182,16 @@ describe("splitMultiLineText", () => {
             .toEqual(["alpha", "beta", "", "gamma"]);
         expect(splitMultiLineText(ctx, "ab abcdefgh", "13px test", 50)).toEqual(["ab", "abcde", "fgh"]);
         expect(splitMultiLineText(ctx, "  lead and trail  ", "13px test", 1000)).toEqual(["  lead and trail"]);
+        // Spaces past the edge add no line, and a line of spaces is one blank line.
+        expect(splitMultiLineText(ctx, "aaa bbb   ", "13px test", 70)).toEqual(["aaa bbb"]);
+        expect(splitMultiLineText(ctx, "aaa bbb   \nccc", "13px test", 70)).toEqual(["aaa bbb", "ccc"]);
+        expect(splitMultiLineText(ctx, "x\n" + " ".repeat(30), "13px test", 70)).toEqual(["x", ""]);
     });
 
-    it("wraps a line the same whatever was measured before it", () => {
+    it("keeps no state from earlier text that could change a later wrap", () => {
         // canvas-hypertxt judged a line from a prefix sized by the average
         // glyph width of earlier text: after wide text, a long line of narrow
-        // glyphs passed as one line.
+        // glyphs passed as one line. Guards against that coming back.
         const narrow = Array.from({ length: 40 }, () => "iiiiiiiiii").join(" ");
         const fresh = splitMultiLineText(ctx, narrow, "13px test", 104);
         clearTextMetricsCache();

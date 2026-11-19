@@ -501,8 +501,18 @@ function truncateString(data: string, w: number): string {
     return data;
 }
 
-/** `splitMultiLineText` results by font, width and text. Bounded like canvas-hypertxt's own cache. */
+/** `splitMultiLineText` results by font, width and text, least recently used first. */
 const wrapCache = new Map<string, readonly string[]>();
+
+const graphemeSegmenter = typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+    : undefined;
+
+/** The glyphs a word may break between: grapheme clusters, or code points without `Intl.Segmenter`. */
+function graphemes(text: string): Iterable<string> {
+    if (graphemeSegmenter === undefined) return text;
+    return Array.from(graphemeSegmenter.segment(text), (part) => part.segment);
+}
 
 /**
  * One hard line's visual lines at `width`: greedy, breaking after the last
@@ -518,7 +528,8 @@ const wrapCache = new Map<string, readonly string[]>();
  */
 function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, fontStyle: string, width: number): string[] {
     const measure = (text: string) => measureTextCached(text, ctx, fontStyle).width;
-    if (line.length === 0 || measure(line) <= width) return [line];
+    // Spaces alone draw nothing, however many lines they would take.
+    if (line.trim() === "" || measure(line) <= width) return [line];
     const lines: string[] = [];
     let current = "";
     let currentWidth = 0;
@@ -528,6 +539,9 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, fontStyle: st
         if (current === "" || currentWidth + wordWidth <= width) {
             current += word;
             currentWidth += wordWidth;
+        } else if (word.trim() === "") {
+            // Trailing spaces past the edge: dropped, as the line's trim would.
+            continue;
         } else {
             lines.push(current);
             current = word.trimStart();
@@ -537,7 +551,7 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, fontStyle: st
         // One word wider than the line: break it between glyphs.
         let piece = "";
         let pieceWidth = 0;
-        for (const glyph of current) {
+        for (const glyph of graphemes(current)) {
             const glyphWidth = measure(glyph);
             if (piece !== "" && pieceWidth + glyphWidth > width) {
                 lines.push(piece);
@@ -573,7 +587,12 @@ export function splitMultiLineText(
     if (availableWidth <= 0) return [];
     const key = `${fontStyle}\u0000${availableWidth}\u0000${data}`;
     const cached = wrapCache.get(key);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) {
+        // Most recently used last, so a viewport's cells outlive one scan.
+        wrapCache.delete(key);
+        wrapCache.set(key, cached);
+        return cached;
+    }
     const split: string[] = [];
     for (const hardLine of data.split("\n")) split.push(...wrapHardLine(ctx, hardLine, fontStyle, availableWidth));
     // canvas-hypertxt's whitespace handling, which the painter has always had.
