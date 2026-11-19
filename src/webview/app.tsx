@@ -948,6 +948,8 @@ interface GridFocusRestoreState {
  * every install ack, and it is pinned by its own unit test.
  */
 const NO_ROW_HEIGHT_OVERLAYS: readonly (RowHeightOverlay | undefined)[] = Object.freeze([]);
+/** A sheet with no stored row heights: one object, so GridShell's height memos hold across renders. */
+const NO_ROW_HEIGHTS: Readonly<Record<number, number>> = Object.freeze({});
 
 function column_visibility_equal(
     left: SheetColumnVisibilityState | undefined,
@@ -14832,7 +14834,7 @@ export function App(): React.JSX.Element {
             // display-keyed durable map from naming the wrong rows. The projection is
             // computed against the installed permutation, so it is correct in exactly the
             // case the suppression existed for.
-            row_heights={row_height_projection[active_sheet_index] ?? {}}
+            row_heights={row_height_projection[active_sheet_index] ?? NO_ROW_HEIGHTS}
             row_height_overlay={active_row_height_overlay}
             on_row_resize={handle_row_resize}
             on_row_fit={handle_row_fit}
