@@ -54,6 +54,7 @@ import {
     move_columns as move_layout_columns,
     move_rows as move_layout_rows,
     probe_row_move as probe_layout_row_move,
+    row_body_range,
     restore_columns as restore_layout_columns,
     restore_row_intervals as restore_layout_row_intervals,
     restore_rows as restore_layout_rows,
@@ -2047,14 +2048,10 @@ function merge_move_refusal_by_intervals(
     const first = after.body_index_of(moved.first);
     const last = after.body_index_of(moved.last);
     if (first === undefined || last === undefined) return undefined;
-    // The rows that stay where they are: in the body, not removed, not moved.
-    let body_start = Infinity;
-    let body_end = -Infinity;
-    for (const run of layout.runs) {
-        if (run.kind !== 'source') continue;
-        body_start = Math.min(body_start, run.start);
-        body_end = Math.max(body_end, run.start + run.count);
-    }
+    // The rows that stay where they are: in the body, not removed, not moved
+    // (a merge the block moves whole was refused as a split already unless
+    // every live row of it moves; leaving the moved rows out is defensive).
+    const { start: body_start, end: body_end } = row_body_range(layout);
     const staying_out = canonical_source_intervals([...removed, ...moved_sources]);
     for (const merge of merges) {
         const start = Math.max(merge.startRow, body_start);

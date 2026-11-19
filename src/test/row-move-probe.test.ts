@@ -76,7 +76,11 @@ function random_changes(next: () => number, ctx: WorksheetStructureContext): Pen
     const body_row = () => BODY_START + Math.floor(next() * (SOURCE_ROWS - BODY_START));
     for (let step = Math.floor(next() * 6); step > 0; step--) {
         const kind = next();
-        if (kind < 0.35) {
+        if (kind < 0.15 && inserted > 0) {
+            // Delete an inserted row: a discarded tombstone when an anchor names it.
+            const plan = plan_row_delete(changes, ctx, [pending(`i${Math.floor(next() * inserted)}`)], new Map());
+            if (plan.ok) changes = plan.outcome.next;
+        } else if (kind < 0.35) {
             const first = body_row();
             const rows = Array.from({ length: 1 + Math.floor(next() * 3) }, (_, offset) => first + offset)
                 .filter((row) => row < SOURCE_ROWS);
@@ -110,7 +114,8 @@ function random_merges(next: () => number): MergeRange[] {
     const merges: MergeRange[] = [];
     for (let count = Math.floor(next() * 3); count > 0; count--) {
         const start = Math.floor(next() * SOURCE_ROWS);
-        const end = Math.min(SOURCE_ROWS - 1, start + Math.floor(next() * 4));
+        // Unclipped: a merge may run past the body's last row.
+        const end = start + Math.floor(next() * 4);
         merges.push({ startRow: start, endRow: end, startCol: 0, endCol: next() < 0.5 ? 0 : 1 });
     }
     return merges;
@@ -138,7 +143,12 @@ describe('probe_row_move_runs', () => {
         const next = random_source(405);
         const seen = new Map<string, number>();
         for (let trial = 0; trial < 3000; trial++) {
-            const ctx = context({ merges: random_merges(next) });
+            // Half the time a Formula Anchor names every pending row, so
+            // deleted inserted rows stay as discarded tombstones.
+            const ctx = context({
+                merges: random_merges(next),
+                ...(next() < 0.5 ? { isRowReferenced: () => true } : {}),
+            });
             const changes = random_changes(next, ctx);
             const projection = projection_for(changes);
             const start = Math.floor(next() * projection.rowCount);
@@ -166,11 +176,14 @@ describe('probe_row_move_runs', () => {
                 .toBe(expected);
             const key = expected.split(':')[0]!;
             seen.set(key, (seen.get(key) ?? 0) + 1);
+            if ((changes.rowLayout?.discardedPendingRows.length ?? 0) > 0) {
+                seen.set('with-tombstone', (seen.get('with-tombstone') ?? 0) + 1);
+            }
         }
         // Every answer the planner can give came up.
         for (const reason of [
             'ok', 'unchanged', 'no-live-entry', 'unknown-identity', 'appended-band',
-            'merge-split', 'merge-destination', 'transformed', 'tail-removal',
+            'merge-split', 'merge-destination', 'transformed', 'tail-removal', 'with-tombstone',
         ]) {
             expect(seen.get(reason) ?? 0, `${reason} in ${JSON.stringify([...seen])}`).toBeGreaterThan(0);
         }
@@ -254,6 +267,57 @@ describe('probe_row_move_runs', () => {
             );
             expect(model.enabled, direction).toBe(true);
         }
+    });
+
+    it('answers as move_rows does for a merge that runs past the body', () => {
+        const ctx = context({ merges: [{ startRow: SOURCE_ROWS - 2, endRow: SOURCE_ROWS + 2, startCol: 0, endCol: 1 }] });
+        const seen = new Set<string>();
+        for (const [runs, before] of [
+            // The merge's rows inside the body, all of them: moves whole.
+            [[{ kind: 'source', start: SOURCE_ROWS - 2, count: 2 }], source(3)],
+            // Part of it: splits.
+            [[{ kind: 'source', start: SOURCE_ROWS - 1, count: 1 }], source(3)],
+            // Other rows dropped inside it.
+            [[{ kind: 'source', start: 3, count: 2 }], source(SOURCE_ROWS - 1)],
+            // Other rows dropped at its start.
+            [[{ kind: 'source', start: 3, count: 2 }], source(SOURCE_ROWS - 2)],
+            [[{ kind: 'source', start: 3, count: 2 }], 'end'],
+        ] as [RowSelectionRun[], RowIdentity | 'end'][]) {
+            const expected = outcome(move_rows(EMPTY, ctx, identities_of_runs(runs), before));
+            expect(outcome(probe_row_move_runs(EMPTY, ctx, runs, before)), JSON.stringify([runs, before])).toBe(expected);
+            seen.add(expected.split(':')[0]!);
+        }
+        expect([...seen].sort()).toEqual(['merge-destination', 'merge-split', 'ok']);
+    });
+
+    it('answers as move_rows does for discarded pending rows in the selection', () => {
+        // A Formula Anchor names the deleted row, so its tombstone stays.
+        const ctx = context({ isRowReferenced: () => true });
+        const inserted = plan_row_insert(EMPTY, ctx, source(5), 'before', ['i0'], template, 1, APPEND_BASIS);
+        if (!inserted.ok) throw new Error(inserted.message);
+        const discarded = plan_row_delete(inserted.outcome.next, ctx, [pending('i0')], new Map());
+        if (!discarded.ok) throw new Error(discarded.message);
+        const changes = discarded.outcome.next;
+        expect(changes.rowLayout?.discardedPendingRows.map((row) => row.id)).toEqual(['i0']);
+        const only: RowSelectionRun[] = [{ kind: 'pending', identity: { kind: 'pending', pendingRowId: 'i0' } }];
+        const mixed: RowSelectionRun[] = [...only, { kind: 'source', start: 6, count: 2 }];
+        const seen = new Set<string>();
+        for (const [runs, before] of [
+            // Nothing live to move, whatever the target: the target is not checked.
+            [only, pending('bogus')],
+            [only, source(9)],
+            [only, 'end'],
+            // The live rows move; the discarded row stays where it is.
+            [mixed, source(10)],
+            [mixed, pending('i0')],
+            [mixed, pending('bogus')],
+        ] as [RowSelectionRun[], RowIdentity | 'end'][]) {
+            const expected = outcome(move_rows(changes, ctx, identities_of_runs(runs), before));
+            expect(outcome(probe_row_move_runs(changes, ctx, runs, before)), JSON.stringify([runs, before])).toBe(expected);
+            seen.add(expected.split(':')[0]!);
+        }
+        expect(seen).toContain('no-live-entry');
+        expect(seen).toContain('ok');
     });
 
     it('answers the run limit as move_rows does, at the limit', () => {

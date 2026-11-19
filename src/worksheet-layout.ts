@@ -914,6 +914,7 @@ function move_selected(
     });
     if (target >= items.length) push_moving();
     const live_moving = moving.filter((item) => item.live);
+    // Defensive: both callers pass live entries only, so one always moves.
     if (live_moving.length === 0) return no_live_entry(axis);
     const entry_at = (item: MovingItem, end: 'first' | 'last'): AxisEntry => item.kind === 'source'
         ? { kind: 'source', source: end === 'first' ? item.start : item.start + item.count - 1 }
@@ -1332,13 +1333,7 @@ export function delete_row_intervals(
     pending: readonly PendingRowId[],
     created_order: (id: PendingRowId) => number,
 ): LayoutResult<RowLayout> {
-    let body_start = Infinity;
-    let body_end = -Infinity;
-    for (const run of layout.runs) {
-        if (run.kind !== 'source') continue;
-        body_start = Math.min(body_start, run.start);
-        body_end = Math.max(body_end, run.start + run.count);
-    }
+    const { start: body_start, end: body_end } = row_body_range(layout);
     for (const entry of source) {
         if (!(entry.count > 0) || entry.start < body_start || entry.start + entry.count > body_end) {
             return unknown_identity('row');
@@ -1414,7 +1409,7 @@ export function move_rows(
 }
 
 /** The source rows a row layout's body spans: `[start, end)`, empty when it has none. */
-function row_body_range(layout: RowLayout): { start: number; end: number } {
+export function row_body_range(layout: RowLayout): { start: number; end: number } {
     let start = Infinity;
     let end = -Infinity;
     for (const run of layout.runs) {
