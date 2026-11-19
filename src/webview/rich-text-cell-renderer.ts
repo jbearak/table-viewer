@@ -131,6 +131,26 @@ function visual_lines(
     return lines;
 }
 
+/**
+ * The visual lines this renderer draws `data` as once its row is tall enough
+ * to wrap, at `available_width` (the cell width less both horizontal
+ * paddings): what row auto-fit counts. Wraps whatever `allow_wrapping` says
+ * now, because a fit sizes the row for the wrapped layout it will get.
+ */
+export function rich_cell_wrapped_lines(
+    ctx: CanvasRenderingContext2D,
+    data: RichCellData,
+    available_width: number,
+    font_family: string,
+): readonly RichTextLine[] {
+    return visual_lines(
+        ctx,
+        data.allow_wrapping === true ? data : { ...data, allow_wrapping: true },
+        available_width,
+        font_variants(data.font_size_px, font_family),
+    );
+}
+
 export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
     kind: GridCellKind.Custom,
     isMatch: is_rich_text_cell,

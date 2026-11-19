@@ -500,20 +500,18 @@ function truncateString(data: string, w: number): string {
     return data;
 }
 
-function drawMultiLineText(
+/**
+ * Fork addition: the visual lines `drawMultiLineText` draws `data` as, at
+ * `availableWidth` (the cell width less both horizontal paddings). Exported so
+ * row auto-fit counts exactly the lines the painter will draw.
+ */
+export function splitMultiLineText(
     ctx: CanvasRenderingContext2D,
     data: string,
-    x: number,
-    y: number,
-    w: number,
-    h: number,
-    bias: number,
-    theme: FullTheme,
-    contentAlign?: BaseGridCell["contentAlign"],
-    hyperWrapping?: boolean
-) {
-    const fontStyle = theme.baseFontFull;
-    const availableWidth = w - theme.cellHorizontalPadding * 2;
+    fontStyle: string,
+    availableWidth: number,
+    hyperWrapping = false
+): readonly string[] {
     // canvas-hypertxt records average glyph width while splitting. Passing an
     // empty hard line makes it divide 0px by 0 characters, poisoning that font's
     // shared metric with NaN. The current width is already cached by then, so the
@@ -529,15 +527,33 @@ function drawMultiLineText(
             if (hardLine.length === 0) {
                 safeSplit.push("");
             } else {
-                safeSplit.push(...splitText(ctx, hardLine, fontStyle, availableWidth, hyperWrapping ?? false));
+                safeSplit.push(...splitText(ctx, hardLine, fontStyle, availableWidth, hyperWrapping));
             }
         }
         // Match canvas-hypertxt's whole-value whitespace handling now that each
         // hard line was sent through it independently.
         split = safeSplit.map((line, index) => index === 0 ? line.trimEnd() : line.trim());
     } else {
-        split = splitText(ctx, data, fontStyle, availableWidth, hyperWrapping ?? false);
+        split = splitText(ctx, data, fontStyle, availableWidth, hyperWrapping);
     }
+    return split;
+}
+
+function drawMultiLineText(
+    ctx: CanvasRenderingContext2D,
+    data: string,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    bias: number,
+    theme: FullTheme,
+    contentAlign?: BaseGridCell["contentAlign"],
+    hyperWrapping?: boolean
+) {
+    const fontStyle = theme.baseFontFull;
+    const availableWidth = w - theme.cellHorizontalPadding * 2;
+    const split = splitMultiLineText(ctx, data, fontStyle, availableWidth, hyperWrapping ?? false);
 
     const emHeight = getEmHeight(ctx, fontStyle);
     const lineHeight = theme.lineHeight * emHeight;

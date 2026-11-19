@@ -183,6 +183,41 @@ describe('the setRowHeights host handler', () => {
             })));
     });
 
+    it('answers a write by source row with the rows it changed and what each held', async () => {
+        const state = versioned_state_store();
+        const panel = open_csv_table(state.store);
+        const initial = await ready(panel);
+        await resize(panel, initial, [{ start: 0, end: 0 }], 44);
+        await vi.waitFor(() => expect(state.get_state(file_path).rowHeights?.[0]).toEqual({ 0: 44 }));
+
+        const fit = async (requestId: string) => panel.__receive({
+            type: 'setSourceRowHeights',
+            requestId,
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            sourceGeneration: initial.sourceGeneration,
+            rows: [{ start: 0, end: 0, height: null }, { start: 1, end: 2, height: 60 }],
+        } satisfies Extract<WebviewMessage, { type: 'setSourceRowHeights' }>);
+        await fit('fit');
+        await vi.waitFor(() => expect(messages_of(panel, 'rowHeightsChanged'))
+            .toContainEqual(expect.objectContaining({
+                requestId: 'fit',
+                applied: true,
+                changedRows: [
+                    { start: 0, end: 0, height: 44 },
+                    { start: 1, end: 2, height: null },
+                ],
+            })));
+        expect(state.get_state(file_path).rowHeights?.[0]).toEqual({ 1: 60, 2: 60 });
+
+        // The same write again changes nothing, and says so.
+        await fit('fit-again');
+        await vi.waitFor(() => expect(messages_of(panel, 'rowHeightsChanged'))
+            .toContainEqual(expect.objectContaining({
+                requestId: 'fit-again', applied: true, changedRows: [],
+            })));
+    });
+
     it('delivers a first resize after sparse persisted heights were decoded from JSON', async () => {
         // JSON spells sparse array slots as `null`. The durable decoder accepts that
         // representation, so runtime normalization must turn the slots back into

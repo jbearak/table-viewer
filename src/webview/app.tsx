@@ -32,6 +32,7 @@ import {
     EMPTY_TRANSFORM,
     MAX_PERSISTED_HIDDEN_ROWS,
     MAX_PERSISTED_ROW_HEIGHTS,
+    ROW_HEIGHT_LIMIT_WARNING,
     TOO_MANY_HIDDEN_ROWS_MESSAGE,
     is_range_filter_operator,
     is_wire_csv_save_rejection,
@@ -82,6 +83,7 @@ import {
     type ExcelHeaderTarget,
     type WorksheetPendingChanges,
     type ColumnWidthsSheetChange,
+    type SourceRowHeightRun,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import { header_body_start } from '../worksheet-layout';
@@ -303,6 +305,7 @@ import {
     ordered_skips,
     overtaken_transform_step,
     row_heights_replay_target,
+    row_fit_view_step,
     row_heights_view_step,
     transform_replay_target,
     transform_slices_equal,
@@ -646,6 +649,11 @@ interface PendingRowResize {
     readonly gesture: boolean;
     /** A row-height step's replay, which moves its entry when it lands. */
     readonly replay?: ViewReplay;
+    /**
+     * An auto-fit's runs, by source row: what it asked each row to hold. Its
+     * step pairs them with the rows the host says the write changed.
+     */
+    readonly fitRuns?: readonly SourceRowHeightRun[];
     /** The Pending Rows half of a mixed resize, committed or dropped with the answer. */
     readonly finish?: (applied: boolean) => void;
 }
@@ -5094,7 +5102,27 @@ export function App(): React.JSX.Element {
                     // overtook it), or its worksheet is gone. A write that
                     // changed nothing is no failure, and records nothing.
                     let unrecorded = !applied || pending.worksheet === undefined;
-                    if (applied && msg.change !== undefined && pending.worksheet !== undefined) {
+                    if (applied && pending.fitRuns !== undefined && pending.worksheet !== undefined) {
+                        // An auto-fit: the host names the rows it changed and
+                        // what each held; the fit knows what it asked of each.
+                        const sheets = meta_ref.current?.sheets ?? [];
+                        const index = worksheet_target_index(sheets, pending.worksheet);
+                        const sheet = index === undefined ? undefined : sheets[index];
+                        unrecorded = sheet === undefined || index === undefined;
+                        if (sheet !== undefined && index !== undefined) {
+                            record_view_step(row_fit_view_step(
+                                {
+                                    sheetIndex: index,
+                                    sheetName: sheet.name,
+                                    ...(sheet.worksheetId === undefined
+                                        ? {}
+                                        : { worksheetId: sheet.worksheetId }),
+                                },
+                                pending.fitRuns,
+                                msg.changedRows ?? [],
+                            ));
+                        }
+                    } else if (applied && msg.change !== undefined && pending.worksheet !== undefined) {
                         // The step is what the host says the write changed:
                         // which source rows, and what each held.
                         const sheets = meta_ref.current?.sheets ?? [];
@@ -5117,6 +5145,17 @@ export function App(): React.JSX.Element {
                         host_bridge.postMessage({
                             type: 'showWarning',
                             message: SIZE_WRITE_UNRESOLVED_MESSAGE,
+                        });
+                    } else if (
+                        !msg.applied
+                        && msg.refused === 'limit'
+                        && pending.fitRuns !== undefined
+                    ) {
+                        // The host warns about a refused resize, not about a
+                        // write by source row, which is also how undo writes.
+                        host_bridge.postMessage({
+                            type: 'showWarning',
+                            message: ROW_HEIGHT_LIMIT_WARNING,
                         });
                     }
                     if (unrecorded) {
@@ -8790,7 +8829,8 @@ export function App(): React.JSX.Element {
         }
         if (delta.slice === 'rowHeights') {
             // Undo sets each run back to what it held; redo sets every row
-            // to the step's height. Posted by source row: this window holds
+            // to the step's height (an auto-fit's, to each row's own). Posted
+            // by source row: this window holds
             // no durable heights, so "already in place" is the host's to
             // say, and its no-op success moves the entry.
             const target = row_heights_replay_target(delta, direction, sheet.sourceRowCount);
@@ -13390,6 +13430,52 @@ export function App(): React.JSX.Element {
         },
         [active_sheet_index, mark_row_height_request, sync_view_request_pending]
     );
+    /**
+     * A row auto-fit on the active sheet: each source row with its own height
+     * (`null`: none, the row fits the default). Written by source row, like an
+     * undo, because the grid measured resident rows whose source rows it
+     * knows; a permutation that moves afterwards cannot misplace them. It
+     * paints nothing ahead of the host, like a reset: the delivery does.
+     */
+    const handle_row_fit = useCallback(
+        (
+            runs: readonly SourceRowHeightRun[],
+            on_result?: (applied: boolean) => void,
+        ) => {
+            const sheet = meta_ref.current?.sheets[active_sheet_index];
+            if (runs.length === 0 || sheet === undefined) {
+                on_result?.(false);
+                return;
+            }
+            const request_id = [
+                'row-fit',
+                highlight_request_prefix_ref.current,
+                ++row_resize_request_seq_ref.current,
+            ].join(':');
+            pending_row_resize_requests_ref.current.set(request_id, {
+                sourceGeneration: source_generation_ref.current,
+                worksheet: {
+                    sheetIndex: active_sheet_index,
+                    sheetName: sheet.name,
+                    ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
+                },
+                gesture: true,
+                fitRuns: runs,
+                ...(on_result === undefined ? {} : { finish: on_result }),
+            });
+            mark_row_height_request(active_sheet_index, request_id);
+            sync_view_request_pending();
+            host_bridge.postMessage({
+                type: 'setSourceRowHeights',
+                requestId: request_id,
+                sheetIndex: active_sheet_index,
+                sheetName: sheet.name,
+                sourceGeneration: source_generation_ref.current,
+                rows: runs,
+            });
+        },
+        [active_sheet_index, mark_row_height_request, sync_view_request_pending]
+    );
 
     /**
      * Fit the active sheet now, recording the widths it replaces.
@@ -14749,6 +14835,7 @@ export function App(): React.JSX.Element {
             row_heights={row_height_projection[active_sheet_index] ?? {}}
             row_height_overlay={active_row_height_overlay}
             on_row_resize={handle_row_resize}
+            on_row_fit={handle_row_fit}
             merges={merges_flattened ? [] : current_sheet.merges}
             preview_mode={preview_mode}
             editing_session_held={editing_session_held}

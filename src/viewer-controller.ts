@@ -147,6 +147,7 @@ import {
     TOO_MANY_HIDDEN_ROWS_MESSAGE,
     excel_header_target_request_valid,
     MAX_PERSISTED_ROW_HEIGHTS,
+    ROW_HEIGHT_LIMIT_WARNING,
     type ColumnWidthChange,
     type ColumnWidthsSheetChange,
     type DisplayRowInterval,
@@ -758,26 +759,6 @@ const READY_STATE_RETRY_MS = 50;
 const READY_STATE_REBASE_COUNT = 16;
 const EDIT_CLEANUP_RECOVERY_MS = 250;
 const PENDING_EDIT_FLUSH_TIMEOUT_MS = 2_000;
-
-/**
- * The one sentence a refused `setRowHeights` says, whichever bound it hit.
- *
- * There are two enforcement points and they cannot be merged — one counts the rows a
- * single request names, before `map_display_rows_to_source` allocates against them; the
- * other counts the map the file would end up holding, which only the durable state can
- * answer. But they are the same bound and the same disappointment, so they say the same
- * thing: a user who reached the limit by one select-all and a user who reached it by a
- * hundred small drags have the identical problem and the identical remedy.
- *
- * Names the number, on `MAX_HIGHLIGHTED_CELLS_PER_FILE`'s wording ("A file may contain
- * at most …"), because "too many" alone is a dead end — it tells the user they are over
- * a line without telling them where the line is, and there is no UI that shows them how
- * many custom heights the sheet already holds. Locale is pinned so the message is
- * stable in tests and in every host's log.
- */
-const ROW_HEIGHT_LIMIT_WARNING =
-    'Too many resized rows to persist: a sheet may keep at most '
-    + `${MAX_PERSISTED_ROW_HEIGHTS.toLocaleString('en-US')} custom row heights.`;
 
 /**
  * Source rows and the height each held, as ascending runs of consecutive rows
@@ -15359,7 +15340,11 @@ export function attach_viewer(
             case 'setSourceRowHeights': {
                 const message = structuredClone(msg);
                 const authority = capture_size_write_authority();
-                let answer: { applied: boolean; refused?: 'limit' | 'unresolved' } = {
+                let answer: {
+                    applied: boolean;
+                    changedRows?: readonly SourceRowHeightRun[];
+                    refused?: 'limit' | 'unresolved';
+                } = {
                     applied: false,
                 };
                 const write_is_current = () => size_write_is_current(
@@ -15408,7 +15393,7 @@ export function attach_viewer(
                         return;
                     }
                     if (!written.applied) return;
-                    answer = { applied: true };
+                    answer = { applied: true, changedRows: written.before };
                     await deliver_after_size_write(authority);
                 } finally {
                     if (!disposed && session.current_receiver_epoch === authority.receiver_epoch) {
@@ -15419,6 +15404,9 @@ export function attach_viewer(
                             applied: answer.applied,
                             sourceGeneration: core?.source_generation
                                 ?? message.sourceGeneration,
+                            ...(answer.changedRows === undefined
+                                ? {}
+                                : { changedRows: answer.changedRows }),
                             ...(answer.refused === undefined ? {} : { refused: answer.refused }),
                         }, authority.receiver_epoch);
                     }

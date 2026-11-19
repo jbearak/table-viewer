@@ -98,8 +98,12 @@ export interface ColumnWidthsViewDelta {
 export interface RowHeightsViewDelta {
     readonly worksheet: WorksheetTarget;
     readonly slice: 'rowHeights';
-    /** What the gesture set on every row it changed. `null`: a reset. */
-    readonly after: number | null;
+    /**
+     * What the gesture set: one height on every row it changed (`null`: a
+     * reset), or, for an auto-fit, each changed row's own height as ascending,
+     * disjoint runs of consecutive source rows with one height.
+     */
+    readonly after: number | null | readonly SourceRowHeightRun[];
     /**
      * The rows the write changed and what each held before, as ascending,
      * disjoint runs of consecutive source rows with one prior height.
@@ -496,6 +500,59 @@ export function row_heights_view_step(
     };
 }
 
+/**
+ * The step of a row auto-fit, from the runs it asked for and what the host
+ * says its write changed; undefined when it changed nothing.
+ *
+ * `after` keeps only the rows the write changed, so redo writes nothing over
+ * a row the fit left as it was.
+ */
+export function row_fit_view_step(
+    worksheet: WorksheetTarget,
+    requested: readonly SourceRowHeightRun[],
+    before: readonly SourceRowHeightRun[],
+): ViewStep | undefined {
+    const rows = run_row_count(before);
+    if (rows === 0) return undefined;
+    return {
+        label: rows === 1 ? 'Auto-fit row height' : `Auto-fit ${rows} row heights`,
+        delta: {
+            worksheet,
+            slice: 'rowHeights',
+            after: runs_within(requested, before),
+            before: before.map(({ start, end, height }) => ({ start, end, height })),
+        },
+    };
+}
+
+/**
+ * The rows of `within` with the heights `runs` give them, as ascending runs
+ * of consecutive rows sharing one height. Both lists are ascending and
+ * disjoint; a row of `within` that `runs` does not name is left out.
+ */
+function runs_within(
+    runs: readonly SourceRowHeightRun[],
+    within: readonly SourceRowHeightRun[],
+): SourceRowHeightRun[] {
+    const out: { start: number; end: number; height: number | null }[] = [];
+    let index = 0;
+    for (const part of within) {
+        while (index < runs.length && runs[index].end < part.start) index += 1;
+        for (let at = index; at < runs.length && runs[at].start <= part.end; at += 1) {
+            const start = Math.max(part.start, runs[at].start);
+            const end = Math.min(part.end, runs[at].end);
+            const height = runs[at].height;
+            const last = out[out.length - 1];
+            if (last !== undefined && last.end === start - 1 && last.height === height) {
+                last.end = end;
+            } else {
+                out.push({ start, end, height });
+            }
+        }
+    }
+    return out;
+}
+
 export interface ColumnWidthsReplayTarget {
     /** The widths to ask for: the step's side for each of its columns still in the worksheet. */
     readonly widths: ColumnWidthsSheetRequest['widths'];
@@ -559,8 +616,8 @@ export interface RowHeightsReplayTarget {
  * The heights a row-height step's replay asks for.
  *
  * Undo sets each run back to the height it held (`null` removes the custom
- * height); redo sets every row to the step's height. Rows the worksheet no
- * longer has are left out. Rows above or at a promoted Header Row are written
+ * height); redo sets every row to the step's height, or for an auto-fit to
+ * each row's own. Rows the worksheet no longer has are left out. Rows above or at a promoted Header Row are written
  * like any other: a height is keyed by source row, and a promotion renumbers
  * none.
  */
@@ -571,7 +628,9 @@ export function row_heights_replay_target(
 ): RowHeightsReplayTarget {
     const rows: SourceRowHeightRun[] = [];
     let gone = false;
-    for (const run of delta.before) {
+    const after = delta.after;
+    const runs = direction === 'redo' && Array.isArray(after) ? after : delta.before;
+    for (const run of runs) {
         if (run.start >= source_row_count) {
             gone = true;
             continue;
@@ -581,7 +640,9 @@ export function row_heights_replay_target(
         rows.push({
             start: run.start,
             end,
-            height: direction === 'undo' ? run.height : delta.after,
+            height: direction === 'undo' || Array.isArray(after)
+                ? run.height
+                : after as number | null,
         });
     }
     return { rows, skipped: gone ? ['rows-gone'] : [] };

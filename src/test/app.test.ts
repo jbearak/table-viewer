@@ -951,6 +951,9 @@ async function answer_row_heights(
         ...(applied && request!.type === 'setRowHeights'
             ? { change: { height: request!.height, before: options.before ?? [] } }
             : {}),
+        ...(applied && request!.type === 'setSourceRowHeights' && options.before !== undefined
+            ? { changedRows: options.before }
+            : {}),
         ...(options.refused === undefined ? {} : { refused: options.refused }),
     });
 }
@@ -28496,6 +28499,72 @@ describe('view steps in history', () => {
                 await answer_row_heights(post_message, { applied: false });
 
                 expect(results).toEqual([true, false]);
+            });
+        });
+
+        describe('a row auto-fit', () => {
+            const fit_runs = [
+                { start: 1, end: 2, height: 60 },
+                { start: 3, end: 3, height: null },
+                { start: 8, end: 8, height: 42 },
+            ];
+
+            it('writes by source row, paints nothing ahead, and records one step', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+
+                await act(async () => props().on_row_fit!(fit_runs));
+
+                expect(row_height_writes(post_message)).toEqual([{
+                    type: 'setSourceRowHeights',
+                    requestId: expect.any(String),
+                    sheetIndex: 0,
+                    sheetName: 'Sheet1',
+                    sourceGeneration: 1,
+                    rows: fit_runs,
+                }]);
+                expect(row_overlay()).toBeNull();
+                expect(cells_editable()).toEqual(HELD);
+                // Row 8 already held 42: the host leaves it out.
+                await answer_row_heights(post_message, {
+                    before: [{ start: 1, end: 2, height: null }, { start: 3, end: 3, height: 50 }],
+                });
+
+                expect(undo_labels()).toEqual(['Auto-fit 3 row heights']);
+                expect(cells_editable()).toEqual(EDITABLE);
+
+                await undo();
+                expect(row_height_writes(post_message).at(-1)).toMatchObject({
+                    type: 'setSourceRowHeights',
+                    rows: [{ start: 1, end: 2, height: null }, { start: 3, end: 3, height: 50 }],
+                });
+                await answer_row_heights(post_message);
+                await redo();
+                expect(row_height_writes(post_message).at(-1)).toMatchObject({
+                    type: 'setSourceRowHeights',
+                    rows: [{ start: 1, end: 2, height: 60 }, { start: 3, end: 3, height: null }],
+                });
+                await answer_row_heights(post_message);
+                expect(undo_labels()).toEqual(['Auto-fit 3 row heights']);
+            });
+
+            it('records nothing when nothing changed, and warns when the limit refuses it', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                const results: boolean[] = [];
+
+                await act(async () => props().on_row_fit!(fit_runs, (applied) => results.push(applied)));
+                await answer_row_heights(post_message, { before: [] });
+                expect(undo_labels()).toEqual([]);
+
+                await act(async () => props().on_row_fit!(fit_runs, (applied) => results.push(applied)));
+                await answer_row_heights(post_message, { applied: false, refused: 'limit' });
+                expect(undo_labels()).toEqual([]);
+                expect(warnings(post_message)).toEqual([
+                    'Too many resized rows to persist: a sheet may keep at most 10,000 custom row heights.',
+                ]);
+                expect(results).toEqual([true, false]);
+                expect(cells_editable()).toEqual(EDITABLE);
             });
         });
 

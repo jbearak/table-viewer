@@ -32,6 +32,7 @@ import {
     type ExcelHeaderSide,
     type FilterEntry,
     type SortKey,
+    type SourceRowHeightRun,
     type WorksheetTarget,
 } from '../types';
 import {
@@ -3267,15 +3268,19 @@ function own_view_history_delta(
         });
     }
     if (delta.slice === 'rowHeights') {
-        return Object.freeze({
-            worksheet,
-            slice: 'rowHeights',
-            after: size(delta.after),
-            before: Object.freeze(delta.before.map((run) => Object.freeze({
+        const runs = (from: readonly SourceRowHeightRun[]): readonly SourceRowHeightRun[] =>
+            Object.freeze(from.map((run) => Object.freeze({
                 start: index(run.start),
                 end: index(run.end),
                 height: size(run.height),
-            }))),
+            })));
+        const after = delta.after;
+        return Object.freeze({
+            worksheet,
+            slice: 'rowHeights',
+            // An auto-fit's step carries each changed row's own height.
+            after: Array.isArray(after) ? runs(after) : size(after as number | null),
+            before: runs(delta.before),
         });
     }
     const schema = owner.own_string(String(delta.schema));

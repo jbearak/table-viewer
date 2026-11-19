@@ -22,6 +22,7 @@ export {
     measureTextCached,
     getEmHeight,
     getMiddleCenterBias,
+    splitMultiLineText,
 } from "./internal/data-grid/render/data-grid-lib.js";
 export { direction } from "./common/utils.js";
 
