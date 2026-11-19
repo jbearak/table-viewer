@@ -8356,7 +8356,11 @@ export function GridShell({
         const previous = base_row_height_index_ref.current;
         return previous !== null && same_row_heights(previous, next) ? previous : next;
     }, [default_row_height, row_height_inputs, source_display_runs]);
-    base_row_height_index_ref.current = base_row_height_index;
+    // Recorded once React commits it, so a render it discards cannot leave an
+    // index the grid never saw as the one to keep.
+    useLayoutEffect(() => {
+        base_row_height_index_ref.current = base_row_height_index;
+    }, [base_row_height_index]);
     /** The grid's row heights: the index's, with the drag preview painted over them. */
     const get_row_height = useMemo(
         () => indexed_row_height(preview_row_height_index(base_row_height_index, row_height_preview)),
@@ -8370,7 +8374,7 @@ export function GridShell({
         const entry = merge_index.is_anchor(row, display_column);
         const last_row = entry?.endRow ?? row;
         const index = get_row_height.rowHeightIndex;
-        return index.top(last_row + 1) - index.top(row);
+        return last_row === row ? index.height(row) : index.top(last_row + 1) - index.top(row);
     }, [get_row_height, merge_index]);
 
     const get_cell_width = useCallback((row: number, display_column: number): number => {
