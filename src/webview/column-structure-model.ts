@@ -164,6 +164,8 @@ export interface ColumnStructureMenuInput {
     readonly context: WorksheetStructureContext;
     /** The display columns the grid shows now, for Move's displayed neighbor. */
     readonly columns: readonly ProjectedColumn[];
+    /** For a menu that shows no Move items (the cell menu): skip their dry runs. */
+    readonly withoutMove?: boolean;
 }
 
 function item(count: number, reason: string | undefined): ColumnStructureItemModel {
@@ -192,8 +194,9 @@ export function column_structure_menu_model(input: ColumnStructureMenuInput): Co
         ?? refusal_message(plan_column_delete(changes, context, selection.identities, new Map()));
     const insertLeft = insert_item(input, shared, 'before');
     const insertRight = insert_item(input, shared, 'after');
-    const moveLeft = column_move_item_model(input, 'backward');
-    const moveRight = column_move_item_model(input, 'forward');
+    const unasked: ColumnMoveItemModel = Object.freeze({ count, enabled: false });
+    const moveLeft = input.withoutMove === true ? unasked : column_move_item_model(input, 'backward');
+    const moveRight = input.withoutMove === true ? unasked : column_move_item_model(input, 'forward');
     if (selection.removedSourceColumns.length === 0) {
         return Object.freeze({ insertLeft, insertRight, delete: item(count, delete_reason), moveLeft, moveRight });
     }

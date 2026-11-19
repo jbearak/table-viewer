@@ -53,6 +53,8 @@ import {
     insert_rows as insert_layout_rows,
     move_columns as move_layout_columns,
     move_rows as move_layout_rows,
+    probe_row_move as probe_layout_row_move,
+    row_body_range,
     restore_columns as restore_layout_columns,
     restore_row_intervals as restore_layout_row_intervals,
     restore_rows as restore_layout_rows,
@@ -1928,12 +1930,180 @@ export function move_rows(
         (sourceRow): RowIdentity => ({ kind: 'source', sourceRow }),
     );
     if (merge !== undefined) return merge;
-    return finish_structure(changes, context, 'rows', {
-        rowLayout: result.layout,
+    return finish_structure(changes, context, 'rows', row_move_draft(changes, context, result.layout));
+}
+
+/** What a row move hands `finish_structure`: the moved layout, nothing else changed. */
+function row_move_draft(
+    changes: PendingStructuralChanges,
+    context: WorksheetStructureContext,
+    row_layout: RowLayout,
+): StructureDraft {
+    return {
+        rowLayout: row_layout,
         columnLayout: column_layout_of(changes, context),
         rows: pending_rows(changes),
         columns: changes.pendingColumns ?? [],
-    });
+    };
+}
+
+/** How many of `[start, end]` sorted, disjoint `intervals` hold; `prefix[i]` counts the rows of intervals before `i`. */
+function rows_in_range(
+    intervals: readonly SourceInterval[],
+    prefix: readonly number[],
+    start: number,
+    end: number,
+): number {
+    if (end < start) return 0;
+    // The first interval ending after `start`, and the first starting after `end`.
+    let low = 0;
+    let high = intervals.length;
+    while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (intervals[middle]!.start + intervals[middle]!.count > start) high = middle;
+        else low = middle + 1;
+    }
+    const first = low;
+    high = intervals.length;
+    while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (intervals[middle]!.start > end) high = middle;
+        else low = middle + 1;
+    }
+    const after = low;
+    if (after <= first) return 0;
+    let count = prefix[after]! - prefix[first]!;
+    const head = intervals[first]!;
+    if (head.start < start) count -= start - head.start;
+    const tail = intervals[after - 1]!;
+    if (tail.start + tail.count - 1 > end) count -= tail.start + tail.count - 1 - end;
+    return count;
+}
+
+/**
+ * Whether moving the live source rows `moved` takes part of a merge: some of
+ * a merge's rows but not all its live rows, counted unclipped to the body as
+ * `live_in_range` counts them. `removed` and `moved` are canonical (sorted,
+ * merged) and `moved` holds no removed row. Two binary searches per merge.
+ */
+export function merge_split_by_intervals(
+    merges: readonly MergeRange[],
+    removed: readonly SourceInterval[],
+    moved: readonly SourceInterval[],
+): boolean {
+    const removed_prefix = row_prefix(removed);
+    const moved_prefix = row_prefix(moved);
+    for (const merge of merges) {
+        if (merge.endRow <= merge.startRow) continue;
+        const inside = rows_in_range(moved, moved_prefix, merge.startRow, merge.endRow);
+        if (inside === 0) continue;
+        const live = merge.endRow - merge.startRow + 1
+            - rows_in_range(removed, removed_prefix, merge.startRow, merge.endRow);
+        if (inside < live) return true;
+    }
+    return false;
+}
+
+/**
+ * The nearest row to `row`, going `up` (to higher rows) or `down`, that no
+ * interval of canonical `intervals` (sorted, merged, adjacent ones joined)
+ * holds: `row` itself, or the row just past the interval holding it. One
+ * binary search.
+ */
+export function row_outside(intervals: readonly SourceInterval[], row: number, direction: 'up' | 'down'): number {
+    // The last interval starting at or before `row`.
+    let low = 0;
+    let high = intervals.length;
+    while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (intervals[middle]!.start <= row) low = middle + 1;
+        else high = middle;
+    }
+    const holder = intervals[low - 1];
+    if (holder === undefined || holder.start + holder.count <= row) return row;
+    return direction === 'up' ? holder.start + holder.count : holder.start - 1;
+}
+
+function row_prefix(intervals: readonly SourceInterval[]): number[] {
+    const prefix = [0];
+    for (const entry of intervals) prefix.push(prefix[prefix.length - 1]! + entry.count);
+    return prefix;
+}
+
+/**
+ * Whether a row move would succeed, for a selection given as runs (source
+ * intervals and Pending Row IDs, as `resolve_row_structure_selection` gives
+ * them: disjoint, whole rows): the same answer and refusal `move_rows` gives
+ * for the runs' rows, in proportion to the runs. The menus' Move items, the
+ * shortcut's check and a drag's drop targets ask it; the gesture itself
+ * plans with `move_rows`.
+ */
+export function probe_row_move_runs(
+    changes: PendingStructuralChanges,
+    context: WorksheetStructureContext,
+    runs: readonly RowSelectionRun[],
+    before: RowIdentity | 'end',
+): StructureResult {
+    const exclusive = exclusivity_refusal(changes, context);
+    if (exclusive !== undefined) return exclusive;
+    if (context.bodyViewTransformed) return refuse_structure('transformed', STRUCTURE_TRANSFORMED_MESSAGE);
+    const appended = new Set(pending_rows(changes).flatMap((row) => is_inserted_row(row) ? [] : [row.id]));
+    if (runs.some((run) => run.kind === 'pending' && appended.has(run.identity.pendingRowId))
+        || (before !== 'end' && before.kind === 'pending' && appended.has(before.pendingRowId))) {
+        return refuse_structure('appended-band', APPENDED_BAND_MESSAGE);
+    }
+    const layout = row_layout_of(changes, context);
+    const sources: SourceInterval[] = [];
+    const pending_ids: string[] = [];
+    for (const run of runs) {
+        if (run.kind === 'source') sources.push({ start: run.start, count: run.count });
+        else pending_ids.push(run.identity.pendingRowId);
+    }
+    const result = probe_layout_row_move(layout, sources, pending_ids, before);
+    if (!result.ok) return layout_refusal(result.refusal);
+    const merge = merge_move_refusal_by_intervals(context, layout, result);
+    if (merge !== undefined) return merge;
+    return finish_structure(changes, context, 'rows', row_move_draft(changes, context, result.layout));
+}
+
+/**
+ * `merge_move_refusal` for rows, by intervals: every merge's split check
+ * first, then every merge's destination check, as it orders them.
+ */
+function merge_move_refusal_by_intervals(
+    context: WorksheetStructureContext,
+    layout: RowLayout,
+    moved: Extract<ReturnType<typeof probe_layout_row_move>, { ok: true }>,
+): StructureResult | undefined {
+    const merges = (context.merges ?? []).filter((merge) => merge.endRow > merge.startRow);
+    if (merges.length === 0) return undefined;
+    const removed = canonical_source_intervals(layout.removedSourceRows);
+    const moved_sources = moved.movedSources;
+    if (merge_split_by_intervals(merges, removed, moved_sources)) {
+        return refuse_structure('merge-split', MERGE_SPLIT_MESSAGE);
+    }
+    const after = index_row_layout(moved.layout);
+    const first = after.body_index_of(moved.first);
+    const last = after.body_index_of(moved.last);
+    if (first === undefined || last === undefined) return undefined;
+    // The rows that stay where they are: in the body, not removed, not moved
+    // (a merge the block moves whole was refused as a split already unless
+    // every live row of it moves; leaving the moved rows out is defensive).
+    const { start: body_start, end: body_end } = row_body_range(layout);
+    const staying_out = canonical_source_intervals([...removed, ...moved_sources]);
+    for (const merge of merges) {
+        const start = Math.max(merge.startRow, body_start);
+        const end = Math.min(merge.endRow, body_end - 1);
+        if (end < start) continue;
+        const first_staying = row_outside(staying_out, start, 'up');
+        if (first_staying > end) continue;
+        const low = after.body_index_of({ kind: 'source', sourceRow: first_staying });
+        const high = after.body_index_of({ kind: 'source', sourceRow: row_outside(staying_out, end, 'down') });
+        if (low !== undefined && high !== undefined && low < first && last < high) {
+            return refuse_structure('merge-destination', merge_destination_message('rows'));
+        }
+    }
+    return undefined;
 }
 
 /**

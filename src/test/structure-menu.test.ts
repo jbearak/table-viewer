@@ -395,6 +395,37 @@ describe('row Move', () => {
         expect(row_menu(EMPTY, { count: 2, identities: rows(2, 2) }, { ctx }).reason('Move rows up')).toBeUndefined();
     });
 
+    it('decides the Move items by runs, listing the rows only when one is clicked', () => {
+        const listed = selection({ count: 2, identities: rows(2, 4) });
+        let reads = 0;
+        const counted_selection: RowStructureSelection = {
+            ...listed,
+            get identities() {
+                reads += 1;
+                return listed.identities;
+            },
+        };
+        const menu = open({ axis: 'rows', selection: counted_selection }, EMPTY);
+        expect([menu.reason('Move rows up'), menu.reason('Move rows down')]).toEqual([undefined, undefined]);
+        expect(reads).toBe(0);
+        menu.click('Move rows up');
+        expect(reads).toBe(1);
+        expect(menu.calls.move_rows.mock.calls).toEqual([[rows(2, 4), source(3)]]);
+    });
+
+    it('offers no Move items to a target without them, on either axis', () => {
+        const rows_menu = open({ axis: 'rows', selection: selection({ count: 2, identities: rows(2, 4) }), without_move: true }, EMPTY);
+        expect(rows_menu.items.move).toEqual([]);
+        expect(rows_menu.labels).toEqual(['Insert 2 rows above', 'Insert 2 rows below', 'Delete 2 rows']);
+        const columns_menu = open({
+            axis: 'columns',
+            selection: resolve_column_structure_selection(columns_of(EMPTY), [1, 2]),
+            without_move: true,
+        }, EMPTY);
+        expect(columns_menu.items.move).toEqual([]);
+        expect(columns_menu.labels).toEqual(['Insert 2 columns left', 'Insert 2 columns right', 'Delete 2 columns']);
+    });
+
     it('refuses a move past the row-run limit', () => {
         // 9,998 single-row runs in swapped pairs and one tail run: 9,999 runs.
         const runs: RowLayout['runs'][number][] = [];

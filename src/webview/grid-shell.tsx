@@ -643,6 +643,7 @@ import {
 import { pending_signal, type PendingSignal } from './pending-signal';
 import {
     create_pending_row_store,
+    probe_row_move_runs,
     type PendingRowStoreChange,
     type PendingRowStore,
     STRUCTURE_TRANSFORMED_MESSAGE,
@@ -6361,27 +6362,32 @@ export function GridShell({
         structural_support,
         structure_gesture_admitted,
     ]);
-    /** Where a drag dropping before display row `before` lands, or undefined when it may not drop there. */
+    /**
+     * Where a drag dropping before display row `before` lands, or undefined
+     * when it may not drop there. Asked at every drop target the pointer
+     * crosses, so it plans by the block's runs; a drop that changes nothing
+     * may still land (and does nothing).
+     */
     const row_drop_target = useCallback((
         rows: { start: number; end: number },
         before: number,
-    ): { identities: readonly RowIdentity[]; before: RowIdentity | 'end' } | undefined => {
+    ): { selection: RowStructureSelection; before: RowIdentity | 'end' } | undefined => {
         const selection = row_drag_selection(rows);
-        if (selection.identities === undefined) return undefined;
+        if (selection.runs === undefined) return undefined;
         const target = resolve_row_move_drop(
             pending_projection_ref.current,
             before,
             row_structure_selection_options_ref.current,
         );
         if (!target.ok) return undefined;
-        const plan = plan_row_move(
+        const probe = probe_row_move_runs(
             pending_store.snapshot(),
             structure_context_ref.current,
-            selection.identities,
+            selection.runs,
             target.before,
         );
-        return plan.ok || plan.unchanged === true
-            ? { identities: selection.identities, before: target.before }
+        return probe.ok || probe.refusal.reason === 'unchanged'
+            ? { selection, before: target.before }
             : undefined;
     }, [pending_store, row_drag_selection]);
     const propose_row_move = useCallback((rows: { start: number; end: number }, before: number): boolean =>
@@ -6389,7 +6395,8 @@ export function GridShell({
     const on_row_moved = useCallback((rows: { start: number; end: number }, before: number): void => {
         const target = row_drop_target(rows, before);
         row_drag_selection_ref.current = null;
-        if (target !== undefined) move_rows_gesture(target.identities, target.before);
+        // The block's rows are listed only now, for the move itself.
+        if (target !== undefined) move_rows_gesture(target.selection.identities ?? [], target.before);
     }, [move_rows_gesture, row_drop_target]);
     /** `Alt+Shift+↑`/`↓`: move the selected whole rows one step, or announce why not. */
     const move_rows_by_keyboard_ref = useRef<(direction: 'backward' | 'forward') => boolean>(() => false);
@@ -12958,10 +12965,11 @@ export function GridShell({
         const has_explicit_column_selection = grid_selection.columns.length > 0;
         const has_explicit_row_selection = grid_selection.rows.length > 0;
         const selected_rows = selected_display_row_intervals(grid_selection, row_count);
+        // The cell menu shows Insert and Delete only: no Move dry runs.
         const row_structure = structure_items(cell_menu_structure
-            && { axis: 'rows', selection: cell_menu_structure.rows });
+            && { axis: 'rows', selection: cell_menu_structure.rows, without_move: true });
         const column_structure = structure_items(cell_menu_structure
-            && { axis: 'columns', selection: cell_menu_structure.columns });
+            && { axis: 'columns', selection: cell_menu_structure.columns, without_move: true });
         // Columns the selection spans; hide targets all of them (falls back to
         // the clicked column when the selection maps to nothing usable). A
         // Pending Column has no source column to hide until it is saved.

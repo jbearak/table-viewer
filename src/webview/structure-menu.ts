@@ -28,9 +28,13 @@ import {
 } from './row-structure-model';
 
 /** What a menu's structure items act on: rows or columns, resolved when the menu opened. */
-export type StructureMenuTarget =
+export type StructureMenuTarget = (
     | { readonly axis: 'rows'; readonly selection: RowStructureSelection }
-    | { readonly axis: 'columns'; readonly selection: ColumnStructureSelection };
+    | { readonly axis: 'columns'; readonly selection: ColumnStructureSelection }
+) & {
+    /** The menu shows no Move items (the cell menu): `move` comes back empty, unplanned. */
+    readonly without_move?: boolean;
+};
 
 /** The worksheet's state as the grid renders it, the same for every menu. */
 export interface StructureMenuState {
@@ -127,6 +131,7 @@ export function structure_menu_items(
             ...shared,
             support: state.support.rows,
             selection,
+            ...(target.without_move === true ? { withoutMove: true } : {}),
             ...(state.append_refusal === undefined ? {} : { appendRefusal: state.append_refusal }),
         });
         const insert = (item: typeof model.insertAbove, side: 'before' | 'after') => menu_item(
@@ -138,10 +143,12 @@ export function structure_menu_items(
                     ? undefined
                     : () => gestures.insert_rows(item.anchor!, side, Math.max(1, item.count)),
         );
+        // Its runs say whether it resolved; its rows are listed only when
+        // the move is made.
         const move = (item: typeof model.moveUp, direction: 'back' | 'forward') => menu_item(
             move_label(direction),
             item,
-            item.before === undefined || selection.identities === undefined
+            item.before === undefined || selection.runs === undefined
                 ? undefined
                 : () => gestures.move_rows(selection.identities!, item.before!),
         );
@@ -156,7 +163,9 @@ export function structure_menu_items(
                     () => gestures.restore_rows(selection.removedSourceRuns),
                 )]),
             ],
-            move: [move(model.moveUp, 'back'), move(model.moveDown, 'forward')],
+            move: target.without_move === true
+                ? []
+                : [move(model.moveUp, 'back'), move(model.moveDown, 'forward')],
         };
     }
     const { selection } = target;
@@ -165,6 +174,7 @@ export function structure_menu_items(
         support: state.support.columns,
         selection,
         columns: state.columns,
+        ...(target.without_move === true ? { withoutMove: true } : {}),
     });
     const insert = (item: typeof model.insertLeft, side: 'before' | 'after') => menu_item(
         `${counted('Insert', item.count)} ${words[side]}`,
@@ -189,6 +199,8 @@ export function structure_menu_items(
                 () => gestures.restore_columns(selection.removedSourceColumns),
             )]),
         ],
-        move: [move(model.moveLeft, 'back'), move(model.moveRight, 'forward')],
+        move: target.without_move === true
+            ? []
+            : [move(model.moveLeft, 'back'), move(model.moveRight, 'forward')],
     };
 }
