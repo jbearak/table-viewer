@@ -766,10 +766,9 @@ function is_watcher_refresh(event: FileRefreshEvent): boolean {
         || event.reason === 'watcherDelete';
 }
 
-/** A postSave refresh in flight: its load, its event, the bytes it reads. */
+/** A postSave refresh in flight: its load and the bytes it reads. */
 interface PostSaveRefresh {
     readonly seq: number;
-    readonly event: FileRefreshEvent;
     readonly saved_digest: string;
     readonly completion: Promise<FileRefreshSubscriberResult>;
 }
@@ -10629,10 +10628,17 @@ export function attach_viewer(
             // supersede as any change does.
             //
             // The check reads the file, so the postSave refresh may finish
-            // first. It then covers this event too when it completed and no
-            // load has started since: it adopted (or kept) the bytes this
-            // event reports, and rebuilding them would only block the host
-            // for another parse.
+            // first. It then covers this event too when no load has started
+            // since: it adopted (or kept) the bytes this event reports, so
+            // rebuilding them would only block the host for another parse.
+            // That holds for a failed postSave as well: rebuilding the same
+            // bytes would fail again and report the failure twice. A postSave
+            // that never settles holds a same-bytes event with it; different
+            // bytes never wait.
+            //
+            // A parked header settlement is the exception: only an adoption
+            // settles it, which a kept source does not give, so the event
+            // still refreshes.
             session.wake_delivery();
             return (async () => {
                 if (
@@ -10641,14 +10647,24 @@ export function attach_viewer(
                 ) {
                     const result = await post_save.completion;
                     if (
-                        result.type === 'completed'
-                        && load_seq === post_save.seq
+                        load_seq === post_save.seq
                         && !disposed
+                        && header_settlement_waiter === undefined
                     ) {
                         return result;
                     }
                 }
                 if (disposed) return { type: 'disposed' } as const;
+                // A newer event may have started its own load while this one
+                // was checking. Starting this one now would supersede it with
+                // an older event: a recovery or a later save would lose to a
+                // watcher report that came before it.
+                if (
+                    latest_refresh_event !== undefined
+                    && latest_refresh_event.episode > event.episode
+                ) {
+                    return inactive_refresh_result();
+                }
                 return start_refresh_from_event(event);
             })();
         }
@@ -10680,7 +10696,6 @@ export function attach_viewer(
         if (event.reason === 'postSave' && event.savedDigest !== undefined) {
             const tracked: PostSaveRefresh = {
                 seq: request.seq,
-                event,
                 saved_digest: event.savedDigest,
                 completion,
             };

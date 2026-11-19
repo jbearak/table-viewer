@@ -2485,6 +2485,133 @@ describe('CSV reload races', () => {
         expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
     });
 
+    it('does not let an own watcher whose check ends late supersede a newer event', async () => {
+        // W1 reports the save; while its check reads the file, another writer
+        // changes it and W2 starts the refresh that reads those bytes. W1 must
+        // not then start an older refresh over W2's.
+        const file_path = '/tmp/post-save-own-watcher-overtaken.csv';
+        let bytes = enc.encode('h\na\n');
+        let builds = 0;
+        let gate_next_read = false;
+        const check_read_started = deferred<void>();
+        const release_check_read = deferred<void>();
+        const post_save_started = deferred<void>();
+        const release_post_save = deferred<void>();
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            if (gate_next_read) {
+                gate_next_read = false;
+                const held = bytes;
+                check_read_started.resolve();
+                await release_check_read.promise;
+                return held;
+            }
+            return bytes;
+        });
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const profile: ViewerProfile = {
+            editing: true,
+            plan_save: plan_csv_save,
+            async build_source(raw: Uint8Array, path: string) {
+                builds += 1;
+                if (builds === 2) {
+                    post_save_started.resolve();
+                    await release_post_save.promise;
+                }
+                return build_csv_source(raw, path);
+            },
+        };
+        const panel = open_csv_table(uri(file_path), state_store(), profile);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+
+        const save = panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await post_save_started.promise;
+        const active = vscode_mock.__getActiveWatchers()[0];
+        gate_next_read = true;
+        const first = active.__fireChange();
+        await check_read_started.promise;
+        bytes = enc.encode('h\nother\n');
+        const second = active.__fireChange();
+        await flush_promises();
+        release_post_save.resolve();
+        await flush_promises();
+        release_check_read.resolve();
+        await Promise.all([save, first, second]);
+        await flush_promises();
+
+        // The ready build, the postSave build W2 superseded, and W2's.
+        expect(builds).toBe(3);
+        const latest = workbook_snapshots(panel).at(-1)!;
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            requestId: 'newer-wins',
+            generation: latest.generation,
+            sourceGeneration: latest.sourceGeneration,
+        });
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'rowData',
+            requestId: 'newer-wins',
+            rows: [[expect.objectContaining({ raw: 'other' })]],
+        }));
+    });
+
+    it('reports a failed postSave once when the own watcher arrives during it', async () => {
+        const file_path = '/tmp/post-save-own-watcher-failure.csv';
+        let bytes = enc.encode('h\na\n');
+        let builds = 0;
+        const post_save_started = deferred<void>();
+        const release_post_save = deferred<void>();
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+        });
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const error = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+        const profile: ViewerProfile = {
+            editing: true,
+            plan_save: plan_csv_save,
+            async build_source(raw: Uint8Array, path: string) {
+                builds += 1;
+                if (builds === 1) return build_csv_source(raw, path);
+                if (builds === 2) {
+                    post_save_started.resolve();
+                    await release_post_save.promise;
+                }
+                throw new Error('parser failed on the saved bytes');
+            },
+        };
+        const panel = open_csv_table(uri(file_path), state_store(), profile);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+
+        const save = panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await post_save_started.promise;
+        const watcher = vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await flush_promises();
+        release_post_save.resolve();
+        await save;
+        await vi.waitFor(() => {
+            expect(warning).toHaveBeenCalledWith(expect.stringContaining('file was saved'));
+        });
+        await watcher;
+        await flush_promises();
+
+        // The ready build and the postSave's own attempts (one and three
+        // retries); the watcher adds no attempt of its own on the same bytes.
+        expect(builds).toBe(5);
+        expect(warning.mock.calls.filter(([message]) => String(message).includes('file was saved')))
+            .toHaveLength(1);
+        expect(error.mock.calls.filter(([message]) => String(message).includes('Failed to reload')))
+            .toHaveLength(0);
+    });
+
     it('lets a same-stat external watcher supersede a stalled postSave candidate', async () => {
         const file_path = '/tmp/post-save-external-supersede.csv';
         // 'a' rather than 'aaaaa': host-side base validation compares the save's
