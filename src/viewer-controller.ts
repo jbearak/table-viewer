@@ -773,6 +773,9 @@ interface PostSaveRefresh {
     readonly completion: Promise<FileRefreshSubscriberResult>;
     /** Whether the current attempt's source build has returned. */
     built: boolean;
+    /** Settles when the next attempt starts. */
+    next_attempt: Promise<void>;
+    start_next_attempt: () => void;
 }
 
 /**
@@ -10672,7 +10675,13 @@ export function attach_viewer(
                     && load_seq === post_save.seq
                     && post_save.built
                 ) {
-                    const result = await post_save.completion.catch(() => undefined);
+                    // Joined to the attempt whose build returned: a retry
+                    // starting after it ends the join, since its build may
+                    // never return either.
+                    const result = await Promise.race([
+                        post_save.completion.catch(() => undefined),
+                        post_save.next_attempt.then(() => undefined),
+                    ]);
                     const covered = result !== undefined
                         && load_seq === post_save.seq
                         && !disposed
@@ -10721,15 +10730,27 @@ export function attach_viewer(
             projection_recovery ? 'recovery' : 'fileReload',
             initial,
             (built) => {
-                if (tracked !== undefined) tracked.built = built;
+                if (tracked === undefined) return;
+                tracked.built = built;
+                if (!built) tracked.start_next_attempt();
             },
         );
         if (event.reason === 'postSave' && event.savedDigest !== undefined) {
+            let start_next_attempt!: () => void;
+            const next_attempt = new Promise<void>((resolve) => { start_next_attempt = resolve; });
             tracked = {
                 seq: request.seq,
                 saved_digest: event.savedDigest,
                 completion,
                 built: false,
+                next_attempt,
+                start_next_attempt: () => {
+                    const settle_this = start_next_attempt;
+                    tracked!.next_attempt = new Promise<void>((resolve) => {
+                        start_next_attempt = resolve;
+                    });
+                    settle_this();
+                },
             };
             post_save_refresh = tracked;
             const settled_tracker = tracked;
