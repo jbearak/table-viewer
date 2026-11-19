@@ -2524,6 +2524,71 @@ describe('CSV reload races', () => {
         expect(harness.builds()).toBe(3);
     });
 
+    it('lets an own watcher supersede a postSave retry whose build has not returned', async () => {
+        // The postSave's first attempt builds, then finds the file changed
+        // under it and retries; the retry's build never returns. That the
+        // first attempt built says nothing about the retry.
+        const file_path = '/tmp/post-save-own-watcher-hung-retry.csv';
+        let bytes = enc.encode('h\na\n');
+        let saved: Uint8Array | undefined;
+        let builds = 0;
+        let answer_next_read: Uint8Array | undefined;
+        const retry_started = deferred<void>();
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            if (answer_next_read) {
+                const answer = answer_next_read;
+                answer_next_read = undefined;
+                return answer;
+            }
+            return bytes;
+        });
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            bytes = new Uint8Array(content);
+            saved = bytes;
+        });
+        const profile: ViewerProfile = {
+            editing: true,
+            plan_save: plan_csv_save,
+            async build_source(raw: Uint8Array, path: string) {
+                builds += 1;
+                if (builds === 2) {
+                    // The currency check's read sees other bytes of the same
+                    // size and stamp, so this attempt retries.
+                    const source = await build_csv_source(raw, path);
+                    answer_next_read = enc.encode('h\nsavex\n');
+                    return source;
+                }
+                if (builds === 3) {
+                    retry_started.resolve();
+                    return new Promise<DataSource>(() => {});
+                }
+                return build_csv_source(raw, path);
+            },
+        };
+        const panel = open_csv_table(uri(file_path), state_store(), profile);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        const before = workbook_snapshots(panel).at(-1)!.sourceGeneration;
+
+        const save = panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await retry_started.promise;
+        expect(bytes).toBe(saved);
+        void vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await save;
+        await vi.waitFor(() => {
+            expect(workbook_snapshots(panel).at(-1)!.sourceGeneration).toBeGreaterThan(before);
+        });
+
+        expect(builds).toBe(4);
+        await first_row(panel, 'recovered-retry');
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'rowData',
+            requestId: 'recovered-retry',
+            rows: [[expect.objectContaining({ raw: 'saved' })]],
+        }));
+    });
+
     it('lets an own watcher supersede a postSave whose build has not returned', async () => {
         // A build still running may never return. The watcher's refresh of the
         // same bytes is then the one that shows them.

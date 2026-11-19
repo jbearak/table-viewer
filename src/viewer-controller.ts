@@ -771,7 +771,7 @@ interface PostSaveRefresh {
     readonly seq: number;
     readonly saved_digest: string;
     readonly completion: Promise<FileRefreshSubscriberResult>;
-    /** Whether an attempt's source build has returned. */
+    /** Whether the current attempt's source build has returned. */
     built: boolean;
 }
 
@@ -10252,8 +10252,12 @@ export function attach_viewer(
         force: boolean,
         reason: 'ready' | 'fileReload' | 'recovery',
         initial = false,
-        /** Called each time an attempt's source build returns a candidate. */
-        on_built?: () => void,
+        /**
+         * Told, for the current attempt, whether its source build has
+         * returned a candidate: false as each attempt starts, true when its
+         * build returns one.
+         */
+        on_build_state?: (built: boolean) => void,
     ): Promise<FileRefreshSubscriberResult> {
         let attempts = 0;
         let include_compare_original = true;
@@ -10271,6 +10275,7 @@ export function attach_viewer(
             let file_failure = false;
             try {
                 const expected_authority = file_coordinator.authority().authorityRevision;
+                on_build_state?.(false);
                 const build = await build_source_with_file_size_decision(
                     request,
                     initial,
@@ -10279,7 +10284,7 @@ export function attach_viewer(
                 if (build.type === 'stale') return inactive_refresh_result();
                 if (build.type === 'stopped') return { type: 'completed' };
                 candidate = build.candidate;
-                on_built?.();
+                on_build_state?.(true);
                 if (!load_is_current(request.seq, request.refreshEvent)) {
                     return inactive_refresh_result();
                 }
@@ -10639,9 +10644,9 @@ export function attach_viewer(
             // second time. Bytes that differ are another writer's, and
             // supersede as any change does.
             //
-            // The event joins the postSave refresh only once that refresh's
-            // build has returned, which is when a synchronous parse lets the
-            // report through. A build still running may never return; the
+            // The event joins the postSave refresh only once the build of the
+            // attempt it is on has returned, which is when a synchronous parse
+            // lets the report through. A build still running may never return; the
             // event then supersedes it as before, so a hung parse can still
             // be recovered by a fresh one.
             //
@@ -10650,7 +10655,12 @@ export function attach_viewer(
             // since and it installed (or kept) exactly the bytes this event
             // reports. A completion that installed other bytes, or nothing (a
             // declined size prompt), and a failed postSave, leave the event to
-            // refresh as before.
+            // refresh as before. One consequence is accepted: a postSave whose
+            // build returns but whose commit or adoption fails the same way on
+            // every retry reports its failure, and the joined event's refresh
+            // fails and reports again. Treating that failure as covering the
+            // event instead would swallow the refresh that recovers from a
+            // transient one.
             //
             // A parked header settlement is the exception: only an adoption
             // settles it, which a kept source does not give, so the event
@@ -10710,8 +10720,8 @@ export function attach_viewer(
             projection_recovery,
             projection_recovery ? 'recovery' : 'fileReload',
             initial,
-            () => {
-                if (tracked !== undefined) tracked.built = true;
+            (built) => {
+                if (tracked !== undefined) tracked.built = built;
             },
         );
         if (event.reason === 'postSave' && event.savedDigest !== undefined) {
