@@ -71,15 +71,25 @@ describe('fit_height_for_lines', () => {
 });
 
 describe('fit_row_height', () => {
-    it('fits the cell with the most lines', () => {
-        expect(fit_row_height([1, 3, 2], metrics())).toBe(fit_height_for_lines(3, metrics()));
+    const lines = (...counts: number[]) => counts.map((count) => ({ lines: count }));
+
+    it('fits the cell that needs the most height', () => {
+        expect(fit_row_height(lines(1, 3, 2), metrics())).toBe(fit_height_for_lines(3, metrics()));
         expect(fit_row_height([], metrics())).toBe(24);
     });
 
+    it('judges each cell in its own font', () => {
+        // Two lines in a font with a much larger em need more than three in the base font.
+        const tall = { lines: 2, em_height: 40 };
+        expect(fit_row_height([...lines(3), tall], metrics()))
+            .toBe(fit_height_for_lines(2, metrics(13, 40)));
+        expect(fit_row_height([tall], metrics())).toBeGreaterThan(fit_height_for_lines(3, metrics()));
+    });
+
     it('shrinks a tall row to its content unless told to keep its height', () => {
-        expect(fit_row_height([1], metrics())).toBe(24);
-        expect(fit_row_height([1], metrics(), 80)).toBe(80);
-        expect(fit_row_height([10], metrics(), 30)).toBe(fit_height_for_lines(10, metrics()));
+        expect(fit_row_height(lines(1), metrics())).toBe(24);
+        expect(fit_row_height(lines(1), metrics(), 80)).toBe(80);
+        expect(fit_row_height(lines(10), metrics(), 30)).toBe(fit_height_for_lines(10, metrics()));
     });
 });
 

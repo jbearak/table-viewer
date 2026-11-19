@@ -173,7 +173,12 @@ import {
     rich_cell_wrapped_lines,
     rich_text_cell_renderer,
 } from './rich-text-cell-renderer';
-import { fit_row_height, source_height_runs, type FittedSourceRow } from './fit-row-model';
+import {
+    fit_row_height,
+    source_height_runs,
+    type FittedSourceRow,
+    type MeasuredCell,
+} from './fit-row-model';
 import { parse_http_external_url } from '../external-url';
 import type { CellHyperlink } from '../cell-content';
 import { HyperlinkDialog, type HyperlinkDialogHandle } from './hyperlink-dialog';
@@ -10850,8 +10855,16 @@ export function GridShell({
      */
     const fit_row_heights = useCallback((row: number): void => {
         if (on_row_fit === undefined) return;
-        // App folds an open editor first: what it commits is what is measured.
+        // App folds an open editor first. What the fold commits renders
+        // before anything is measured, and the measuring is done by this
+        // render's callbacks, which paint it.
         if (size_gesture_may_start !== undefined && !size_gesture_may_start()) return;
+        flushSync(() => {});
+        fit_rows_now_ref.current(row);
+    }, [on_row_fit, size_gesture_may_start]);
+    /** `fit_row_heights` past its gate, measuring with the cells this render paints. */
+    const fit_rows_now = useCallback((row: number): void => {
+        if (on_row_fit === undefined) return;
         const projection = pending_projection_ref.current;
         const selected_rows = grid_selection_ref.current.rows;
         const intervals = selected_rows.hasIndex(row)
@@ -10866,32 +10879,48 @@ export function GridShell({
         const ctx = measure_ctx_ref.current;
         if (!ctx) return;
         const glide_theme = { ...getDefaultTheme(), ...theme };
-        const base_font = `${glide_theme.baseFontStyle} ${glide_theme.fontFamily}`;
+        const em_by_font = new Map<string, number>();
+        const em_of = (font: string): number => {
+            let em = em_by_font.get(font);
+            if (em === undefined) {
+                em = getEmHeight(ctx, font);
+                em_by_font.set(font, em);
+            }
+            return em;
+        };
         const metrics = {
-            em_height: getEmHeight(ctx, base_font),
+            em_height: em_of(`${glide_theme.baseFontStyle} ${glide_theme.fontFamily}`),
             line_height_ratio: glide_theme.lineHeight,
             cell_vertical_padding: glide_theme.cellVerticalPadding,
             tooltip_line_height: line_height_for_font(font_size_px),
             default_row_height,
         };
         const padding = glide_theme.cellHorizontalPadding;
-        const line_count = (display_row: number, display_column: number): number => {
+        const measure_cell = (display_row: number, display_column: number): MeasuredCell => {
             const cell = get_cell_content([display_column, display_row]);
             const available = Math.max(0, get_cell_width(display_row, display_column) - 2 * padding);
             if (cell.kind === GridCellKind.Text) {
-                if (cell.displayData === '') return 1;
+                if (cell.displayData === '') return { lines: 1 };
+                // The Text cell paints in its own font (bold or italic), and
+                // takes its line metric from that font too.
                 const font = `${cell.themeOverride?.baseFontStyle ?? glide_theme.baseFontStyle} ${glide_theme.fontFamily}`;
                 // canvas-hypertxt measures with the context's current font.
                 ctx.font = font;
-                return splitMultiLineText(ctx, cell.displayData, font, available).length;
+                return {
+                    lines: splitMultiLineText(ctx, cell.displayData, font, available).length,
+                    em_height: em_of(font),
+                };
             }
             if (cell.kind === GridCellKind.Custom && is_rich_text_cell(cell)) {
-                return rich_cell_wrapped_lines(ctx, cell.data, available, glide_theme.fontFamily).length;
+                // The rich renderer takes its line metric from the base font.
+                return {
+                    lines: rich_cell_wrapped_lines(ctx, cell.data, available, glide_theme.fontFamily).length,
+                };
             }
-            return 1;
+            return { lines: 1 };
         };
         const fitted_height = (display_row: number): number => {
-            const counts: number[] = [];
+            const counts: MeasuredCell[] = [];
             let keep_at_least: number | undefined;
             for (let display_column = 0; display_column < display_column_count; display_column += 1) {
                 const merge = merge_index.entry_at(display_row, display_column);
@@ -10904,7 +10933,7 @@ export function GridShell({
                     }
                     if (merge.startCol !== display_column) continue;
                 }
-                counts.push(line_count(display_row, display_column));
+                counts.push(measure_cell(display_row, display_column));
             }
             return fit_row_height(counts, metrics, keep_at_least);
         };
@@ -10965,10 +10994,23 @@ export function GridShell({
         merge_index,
         on_row_fit,
         pending_rendered_rows,
-        size_gesture_may_start,
         theme,
         write_row_heights_with_pending_rows,
     ]);
+    const fit_rows_now_ref = useRef(fit_rows_now);
+    fit_rows_now_ref.current = fit_rows_now;
+    // The strip sits where a border was when the pointer last moved. A scroll
+    // moves the rows under a still pointer, so the strip would name a row
+    // that is no longer there: take it down until the pointer moves again.
+    // (Ignored mid-drag: `set_target` is pinned while a border is held.)
+    useEffect(() => {
+        const grid_root = grid_root_ref.current;
+        if (!grid_root) return;
+        const clear = () => row_resize_ref.current?.set_target(null);
+        grid_root.addEventListener('scroll', clear, true);
+        return () => grid_root.removeEventListener('scroll', clear, true);
+        // The root is another element once every column is hidden or shown.
+    }, [has_visible_columns]);
     /** A double-click on a row border: fits the row (see `fit_row_heights`). */
     const handle_row_border_double_click = useCallback((row: number): void => {
         const double_clicked = row_border_was_double_clicked(

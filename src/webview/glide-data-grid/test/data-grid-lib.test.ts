@@ -6,6 +6,7 @@ import {
     clearTextMetricsCache,
     drawLastUpdateUnderlay,
     drawTextCell,
+    splitMultiLineText,
 } from "../internal/data-grid/render/data-grid-lib.js";
 import { GridCellKind, type Rectangle } from "../internal/data-grid/data-grid-types.js";
 import { vi, type Mocked, expect, describe, test, it, beforeEach } from "vitest";
@@ -157,6 +158,33 @@ describe("drawTextCell wrapping", () => {
         expect(drawAtWidth(76)).toEqual(["alpha", "beta", "", "gamma", "delta"]);
         expect(drawAtWidth(140)).toEqual(["alpha beta", "", "gamma delta"]);
         expect(drawAtWidth(86)).toEqual(["alpha", "beta", "", "gamma", "delta"]);
+    });
+});
+
+describe("splitMultiLineText", () => {
+    beforeEach(() => clearTextMetricsCache());
+
+    it("returns when a glyph is wider than the width it wraps to", () => {
+        // canvas-hypertxt alone never returns here: "W" (29px) cannot fit in
+        // 24px, so its break search makes no progress.
+        const ctx = {
+            font: "",
+            measureText: (text: string) => ({
+                width: [...text].reduce((width, glyph) => width + (glyph === "W" ? 29 : 10), 0),
+            }),
+        } as unknown as CanvasRenderingContext2D;
+        const lines = splitMultiLineText(ctx, "Wabc def", "13px test", 24);
+        expect(lines.join("").replace(/ /g, "")).toBe("Wabcdef");
+        expect(lines[0]).toBe("W");
+    });
+
+    it("splits as canvas-hypertxt does when every glyph fits", () => {
+        const ctx = {
+            font: "",
+            measureText: (text: string) => ({ width: text.length * 10 }),
+        } as unknown as CanvasRenderingContext2D;
+        expect(splitMultiLineText(ctx, "alpha beta\n\ngamma", "13px test", 60))
+            .toEqual(["alpha", "beta", "", "gamma"]);
     });
 });
 

@@ -8154,6 +8154,16 @@ describe('GridShell row auto-fit', () => {
         });
     });
 
+    it('takes the border strip down when the grid scrolls under a still pointer', async () => {
+        await render_fit({ 0: 'a', 1: 'b', 2: 'c', 3: 'd' });
+        grid_mock.row_resize_set_target.mockClear();
+        // Glide scrolls an element inside the root; scroll does not bubble.
+        const scroller = document.createElement('div');
+        container!.querySelector('.grid-shell-root')!.appendChild(scroller);
+        act(() => scroller.dispatchEvent(new Event('scroll')));
+        expect(grid_mock.row_resize_set_target).toHaveBeenCalledWith(null);
+    });
+
     it('fits nothing when the gesture may not start', async () => {
         const on_row_fit = await render_fit(
             { 0: 'x'.repeat(30), 1: 'b', 2: 'c', 3: 'd' },

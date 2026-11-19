@@ -313,6 +313,7 @@ export function clearTextMetricsCache(): void {
     metricsSize = 0;
     metricsCache = {};
     biasCache.length = 0;
+    widestGlyphCache.clear();
     clearCache();
     textMetricsGeneration++;
 }
@@ -500,6 +501,35 @@ function truncateString(data: string, w: number): string {
     return data;
 }
 
+/** Widest glyph per font and text, for `splitMultiLineText`. Bounded like canvas-hypertxt's own cache. */
+const widestGlyphCache = new Map<string, number>();
+
+/**
+ * The widest single code point of `text` in `fontStyle` (and the first half
+ * of each surrogate pair, which canvas-hypertxt can slice on its own).
+ */
+function widestGlyph(ctx: CanvasRenderingContext2D, text: string, fontStyle: string): number {
+    const key = `${fontStyle}\u0000${text}`;
+    const cached = widestGlyphCache.get(key);
+    if (cached !== undefined) return cached;
+    let widest = 0;
+    const seen = new Set<string>();
+    for (const glyph of text) {
+        for (const piece of glyph.length > 1 ? [glyph, glyph[0]] : [glyph]) {
+            if (seen.has(piece)) continue;
+            seen.add(piece);
+            const width = measureTextCached(piece, ctx, fontStyle).width;
+            if (width > widest) widest = width;
+        }
+    }
+    widestGlyphCache.set(key, widest);
+    if (widestGlyphCache.size > 500) {
+        const oldest = widestGlyphCache.keys().next().value;
+        if (oldest !== undefined) widestGlyphCache.delete(oldest);
+    }
+    return widest;
+}
+
 /**
  * Fork addition: the visual lines `drawMultiLineText` draws `data` as, at
  * `availableWidth` (the cell width less both horizontal paddings). Exported so
@@ -512,6 +542,13 @@ export function splitMultiLineText(
     availableWidth: number,
     hyperWrapping = false
 ): readonly string[] {
+    // canvas-hypertxt never returns when one glyph is wider than the width it
+    // wraps to: its break search settles on index 0 and the line never
+    // shrinks. A column narrower than a wide glyph (an emoji, a large font)
+    // then hung the window. Wrapping at least as wide as the widest glyph
+    // keeps every break moving forward; such a glyph overhangs its line,
+    // clipped by the column, as it does when the row does not wrap.
+    availableWidth = Math.max(availableWidth, widestGlyph(ctx, data, fontStyle));
     // canvas-hypertxt records average glyph width while splitting. Passing an
     // empty hard line makes it divide 0px by 0 characters, poisoning that font's
     // shared metric with NaN. The current width is already cached by then, so the

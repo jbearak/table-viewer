@@ -52,21 +52,34 @@ export function fit_height_for_lines(lines: number, metrics: RowFitMetrics): num
     ));
 }
 
+/** One measured cell: its visual lines and the em box of the font it paints in. */
+export interface MeasuredCell {
+    readonly lines: number;
+    /** The painter's em for this cell's font; the metrics' own when absent. */
+    readonly em_height?: number;
+}
+
 /**
- * A row's fitted height from the visual line counts of its measured cells.
+ * A row's fitted height: the tallest any of its measured cells needs, each
+ * judged in its own font (a bold cell's em can differ from the base font's).
  *
  * `keep_at_least` is the row's current height when the row must not shrink:
  * one inside a vertical merge, whose block paints across rows this fit does
  * not size.
  */
 export function fit_row_height(
-    line_counts: Iterable<number>,
+    cells: Iterable<MeasuredCell>,
     metrics: RowFitMetrics,
     keep_at_least?: number,
 ): number {
-    let lines = 1;
-    for (const count of line_counts) if (count > lines) lines = count;
-    const fitted = fit_height_for_lines(lines, metrics);
+    let fitted = metrics.default_row_height;
+    for (const cell of cells) {
+        const height = fit_height_for_lines(
+            cell.lines,
+            cell.em_height === undefined ? metrics : { ...metrics, em_height: cell.em_height },
+        );
+        if (height > fitted) fitted = height;
+    }
     return keep_at_least === undefined ? fitted : Math.max(fitted, keep_at_least);
 }
 
