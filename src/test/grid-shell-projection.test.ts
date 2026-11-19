@@ -360,6 +360,8 @@ vi.mock('../webview/pending-row-store', async (import_original) => {
     };
 });
 
+// The configured font size, settable per test (reset after each).
+const theme_mock = vi.hoisted(() => ({ font_size_px: 13 }));
 vi.mock('../webview/vscode-theme', () => ({
     use_vscode_theme: () => ({
         theme: {},
@@ -370,7 +372,7 @@ vi.mock('../webview/vscode-theme', () => ({
         diffAddedFg: '#81b88b',
         diffMovedFg: '#9333ea',
     }),
-    theme_font_size_px: () => 13,
+    theme_font_size_px: () => theme_mock.font_size_px,
     // Echoes the color rather than the fallback, which is what the real one
     // does for any parseable color. Returning the fallback unconditionally
     // made every band that shares a fallback look identical here.
@@ -531,6 +533,7 @@ afterEach(() => {
     grid_mock.resident_row_ranges = [{ start: 0, end: 1_000_000 }];
     grid_mock.row_resize_props = null;
     grid_mock.row_resize_set_target.mockReset();
+    theme_mock.font_size_px = 13;
     grid_mock.update_cells.mockReset();
     grid_mock.scroll_to.mockReset();
     grid_mock.focus.mockReset();
@@ -8605,6 +8608,33 @@ describe('GridShell row resizing', () => {
         act(() => resize.on_resize!(1, drawn + 1));
         act(() => resize.on_resize_end!(1, drawn + 1));
         expect(on_row_resize).toHaveBeenCalledWith([{ start: 1, end: 1 }], 27.8, { gesture: true });
+    });
+
+    it('saves a drag of a capped row by where it was dragged to', async () => {
+        const pending = create_pending_row_store({ session_id: 'session' });
+        pending.append_rows('session', ['band-a'], { id: 'plain', format: { kind: 'none' } }, 1);
+        pending.set_row_heights('session', new Set(['band-a']), 8192);
+        const on_row_resize = vi.fn();
+        await render_grid(six_rows({
+            editing_session_held: true,
+            csv_editable: true,
+            edit_session_id: 'session',
+            pending_row_store: pending,
+            on_row_resize,
+        }));
+        const resize = grid_mock.row_resize_props as Record<string, (row: number, height: number) => void>;
+        act(() => resize.on_resize_start!(6, 4096));
+        act(() => resize.on_resize!(6, 3000));
+        act(() => resize.on_resize_end!(6, 3000));
+        // An unsaved row's height is the session's: it changes in the store.
+        expect(on_row_resize.mock.calls.map((call) => call[1])).not.toContain(4096);
+        expect(pending.snapshot().appendedRows[0]!.viewerRowHeight).toBe(3000);
+    });
+
+    it('caps the default row height of a huge font as it caps every drawn height', async () => {
+        theme_mock.font_size_px = 3000;
+        await render_grid(six_rows());
+        expect(grid_mock.props!.rowHeight).toBe(4096);
     });
 
     it('starts a border drag at the drawn height of a row taller than the grid draws', async () => {

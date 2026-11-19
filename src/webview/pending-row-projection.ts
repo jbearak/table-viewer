@@ -657,12 +657,18 @@ function create_layout_row_projection(
                 const high = Math.min(high_index, segment.displayBefore + segment.count - 1);
                 if (high < low) continue;
                 const sourceRow = segment.start + low - segment.displayBefore;
+                const sourceDisplayStart = source_display_row_of(sourceRow);
+                if (sourceDisplayStart === undefined) {
+                    // Body segments always map; were one not to, its rows resolve one by one.
+                    for (let row = low; row <= high; row++) runs.push({ kind: 'row', displayRow: fixed_count + row });
+                    continue;
+                }
                 runs.push({
                     kind: 'source',
                     displayStart: fixed_count + low,
                     count: high - low + 1,
                     sourceRow,
-                    sourceDisplayStart: source_display_row_of(sourceRow)!,
+                    sourceDisplayStart,
                 });
             }
             return runs;

@@ -1133,6 +1133,36 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         expect(calls).toBeGreaterThanOrEqual(rows);
     });
 
+    // Fork test: the scroll height is every row's height added up, with the
+    // index as by the walk.
+    test("Indexed row heights give the scroll height of every row", async () => {
+        // The trailing blank row DataEditor adds after them (row `rows`) is a
+        // tall one, so dropping the last row from the sum would show.
+        const rows = 1004;
+        const height = (r: number) => (r % 7 === 3 ? 48 : 32);
+        const top = (row: number) => row * 32 + (row <= 3 ? 0 : Math.floor((row - 4) / 7) + 1) * 16;
+        const indexed = Object.assign((r: number) => height(r), {
+            rowHeightIndex: { top, rowAtY: (y: number) => Math.max(0, Math.floor(y / 48)) },
+        });
+        const scroll_height = (rowHeight: DataEditorProps["rowHeight"]) => {
+            vi.useFakeTimers();
+            render(<DataEditor {...basicProps} rows={rows} rowHeight={rowHeight} />, { wrapper: Context });
+            prep();
+            const stack = document.querySelector(".dvn-stack");
+            let total = 0;
+            for (const child of Array.from(stack?.children ?? [])) total += Number.parseFloat((child as HTMLElement).style.height || "0");
+            cleanup();
+            return total;
+        };
+        let summed = 0;
+        for (let r = 0; r <= rows; r++) summed += height(r);
+        // What the scroller adds besides the rows (the header), from a uniform height.
+        const besides_rows = scroll_height(32) - (rows + 1) * 32;
+        const walked = scroll_height(height);
+        expect(walked).toBe(summed + besides_rows);
+        expect(scroll_height(indexed)).toBe(walked);
+    });
+
     test("Uneven indexed rows cell click", async () => {
         const spy = vi.fn();
         const height = (r: number) => (r % 2 === 0 ? 32 : 64);
