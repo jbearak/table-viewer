@@ -549,12 +549,12 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, width: number
     // Not `measureTextCached`: candidates are one-off strings, and its key
     // names neither the direction nor, for a long line, a short string.
     const fits = (text: string) => ctx.measureText(text).width <= width;
-    // Spaces alone draw nothing, however many lines they would take.
-    if (/^ *$/.test(line) || fits(line)) return [line];
+    // Whitespace alone draws nothing, however many lines it would take.
+    if (/^\s*$/.test(line) || fits(line)) return [line];
     const lines: string[] = [];
     let current = "";
-    // Each word keeps the spaces before it; trailing spaces are a word too.
-    for (const word of line.match(/ *[^ ]+| +$/g) ?? [line]) {
+    // Each word keeps the whitespace before it; trailing whitespace is a word too.
+    for (const word of line.match(/\s*\S+|\s+$/g) ?? [line]) {
         let fitting: boolean;
         if (current === "") {
             current = word;
@@ -562,8 +562,8 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, width: number
         } else if (fits(current + word)) {
             current += word;
             fitting = true;
-        } else if (/^ +$/.test(word)) {
-            // Trailing spaces past the edge: dropped, as the line's trim would.
+        } else if (/^\s+$/.test(word)) {
+            // Trailing whitespace past the edge: dropped, as the line's trim would.
             continue;
         } else {
             lines.push(current);
@@ -598,7 +598,9 @@ function wrapHardLine(ctx: CanvasRenderingContext2D, line: string, width: number
                 else bad = middle;
             }
             if (good === remaining) break;
-            lines.push(run(from, good));
+            // Indentation wider than the line would be a line of nothing.
+            const piece = run(from, good);
+            if (!/^\s*$/.test(piece)) lines.push(piece);
             from += good;
         }
         current = run(from, count - from);
@@ -622,7 +624,16 @@ export function splitMultiLineText(
     availableWidth: number,
     hyperWrapping = false
 ): readonly string[] {
-    if (hyperWrapping) return splitText(ctx, data, fontStyle, availableWidth, true);
+    if (hyperWrapping) {
+        // canvas-hypertxt divides by a hard line's length while learning its
+        // glyph widths, so an empty one poisons them: blank lines are kept here.
+        const split: string[] = [];
+        for (const hardLine of data.split("\n")) {
+            if (hardLine.length === 0) split.push("");
+            else for (const line of splitText(ctx, hardLine, fontStyle, availableWidth, true)) split.push(line);
+        }
+        return split.map((line, index) => index === 0 ? line.trimEnd() : line.trim());
+    }
     if (availableWidth <= 0) return [];
     const key = `${fontStyle}\u0000${ctx.direction}\u0000${availableWidth}\u0000${data}`;
     const cached = wrapCache.get(key);

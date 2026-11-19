@@ -234,6 +234,13 @@ describe("splitMultiLineText", () => {
         expect(lines).toHaveLength(150_000);
     });
 
+    it("adds no line for whitespace: tabs past the edge, or indentation wider than the line", () => {
+        expect(splitMultiLineText(ctx, "hi" + "\t".repeat(40), "13px test", 52)).toEqual(["hi"]);
+        // Runs of indentation alone add nothing; what is left of it stays on the first line.
+        expect(splitMultiLineText(ctx, " ".repeat(12) + "abcdefgh", "13px test", 50)).toEqual(["  abc", "defgh"]);
+        expect(splitMultiLineText(ctx, "ab\tcd ef", "13px test", 50)).toEqual(["ab\tcd", "ef"]);
+    });
+
     it("keeps no state from earlier text that could change a later wrap", () => {
         // canvas-hypertxt judged a line from a prefix sized by the average
         // glyph width of earlier text: after wide text, a long line of narrow

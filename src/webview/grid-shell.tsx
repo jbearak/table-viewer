@@ -10902,7 +10902,15 @@ export function GridShell({
         const padding = glide_theme.cellHorizontalPadding;
         const measure_cell = (display_row: number, display_column: number): MeasuredCell => {
             const cell = get_cell_content([display_column, display_row]);
-            const available = Math.max(0, get_cell_width(display_row, display_column) - 2 * padding);
+            const width = get_cell_width(display_row, display_column);
+            const available = Math.max(0, width - 2 * padding);
+            // At the default height a cell paints one line, cut at a quarter of
+            // its width in characters whatever their width (both painters do,
+            // to bound the work of a huge value). Text that fits on one line
+            // by measure but is longer than that needs the row tall enough to
+            // wrap, or the fit would hide what it fitted.
+            const one_line = (lines: number, longest: number, cap: number): number =>
+                lines === 1 && longest > cap ? 2 : lines;
             if (cell.kind === GridCellKind.Text) {
                 if (cell.displayData === '') return { lines: 1 };
                 // The Text cell paints in its own font (bold or italic), and
@@ -10914,13 +10922,18 @@ export function GridShell({
                 ctx.direction = direction(cell.displayData) === 'rtl' ? 'rtl' : 'inherit';
                 const lines = splitMultiLineText(ctx, cell.displayData, font, available).length;
                 ctx.direction = 'inherit';
-                return { lines, em_height: em_of(font) };
+                // Glide's truncateString keeps `slice(0, width / 4)`.
+                return { lines: one_line(lines, cell.displayData.length, width / 4), em_height: em_of(font) };
             }
             if (cell.kind === GridCellKind.Custom && is_rich_text_cell(cell)) {
                 // The rich renderer takes its line metric from the base font.
-                return {
-                    lines: rich_cell_wrapped_lines(ctx, cell.data, available, glide_theme.fontFamily).length,
-                };
+                const lines = rich_cell_wrapped_lines(ctx, cell.data, available, glide_theme.fontFamily).length;
+                let longest = 0;
+                for (const line of cell.data.lines) {
+                    for (const segment of line) longest = Math.max(longest, segment.text.length);
+                }
+                // The rich renderer cuts each segment at `ceil(width / 4)`.
+                return { lines: one_line(lines, longest, Math.ceil(width / 4)) };
             }
             return { lines: 1 };
         };

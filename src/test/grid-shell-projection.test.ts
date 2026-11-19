@@ -197,14 +197,25 @@ vi.mock('../webview/glide-data-grid', () => {
             if (ctx.font !== font) throw new Error(`em measured in ${ctx.font}, not ${font}`);
             return 13;
         },
-        // 7px per character: hard lines, each wrapped at whole characters.
+        // 7px per character ("i" 2px): hard lines, each wrapped at whole characters.
         splitMultiLineText: (ctx: { font: string }, data: string, font: string, width: number) => {
             if (ctx.font !== font) throw new Error(`text measured in ${ctx.font}, not ${font}`);
-            const per_line = Math.max(1, Math.floor(width / 7));
             return data.split('\n').flatMap((line) => {
                 const parts: string[] = [];
-                for (let at = 0; at < line.length; at += per_line) parts.push(line.slice(at, at + per_line));
-                return parts.length === 0 ? [''] : parts;
+                let current = '';
+                let current_width = 0;
+                for (const glyph of line) {
+                    const glyph_width = glyph === 'i' ? 2 : 7;
+                    if (current !== '' && current_width + glyph_width > width) {
+                        parts.push(current);
+                        current = '';
+                        current_width = 0;
+                    }
+                    current += glyph;
+                    current_width += glyph_width;
+                }
+                parts.push(current);
+                return parts;
             });
         },
     };
@@ -8107,6 +8118,18 @@ describe('GridShell row auto-fit', () => {
             { start: 0, end: 0, height: null },
             { start: 1, end: 1, height: 62 },
             { start: 2, end: 2, height: 44 },
+        ], undefined);
+    });
+
+    it('keeps a row tall enough to wrap when one line would be cut at a quarter of its width in characters', async () => {
+        // 30 narrow glyphs fit 84px on one line, but the one-line painter
+        // draws at most 100 / 4 = 25 characters.
+        const on_row_fit = await render_fit({ 0: 'i'.repeat(30), 1: 'i'.repeat(25), 2: 'c', 3: 'd' });
+        await select_rows([0, 1]);
+        double_click_border(0);
+        expect(on_row_fit).toHaveBeenCalledExactlyOnceWith([
+            { start: 0, end: 0, height: 44 },
+            { start: 1, end: 1, height: null },
         ], undefined);
     });
 
