@@ -8088,8 +8088,9 @@ describe('GridShell row auto-fit', () => {
         (grid_mock.row_resize_props!.on_resize_start as (row: number, height: number) => void)(row, height);
         (grid_mock.row_resize_props!.on_resize_end as (row: number, height: number) => void)(row, height);
     });
-    const fit = (row: number) => act(() =>
-        (grid_mock.row_resize_props!.on_fit as (row: number) => void)(row));
+    /** The double-click itself, on a strip at `boundary_y` (where the mocked grid puts every row's bottom). */
+    const fit = (row: number, boundary_y = 46) => act(() =>
+        (grid_mock.row_resize_props!.on_fit as (row: number, boundary_y: number) => void)(row, boundary_y));
     const double_click_border = (row: number, height = 24) => {
         click_border(row, height);
         click_border(row, height);
@@ -8233,18 +8234,16 @@ describe('GridShell row auto-fit', () => {
         expect(grid_mock.row_resize_set_target).toHaveBeenCalledWith(null);
     });
 
-    it('takes the border strip down when row heights change under it, and only then', async () => {
-        await render_fit({ 0: 'a', 1: 'b', 2: 'c', 3: 'd' }, { row_heights: { 0: 72 } });
-        grid_mock.row_resize_set_target.mockClear();
-        // A render for something else leaves it where it is.
-        await act(async () => {
-            root!.render(React.createElement(fit_shell, { ...fit_props, show_formatting: true }));
-        });
-        expect(grid_mock.row_resize_set_target).not.toHaveBeenCalled();
-        await act(async () => {
-            root!.render(React.createElement(fit_shell, { ...fit_props, row_heights: {} }));
-        });
-        expect(grid_mock.row_resize_set_target).toHaveBeenCalledWith(null);
+    it('fits nothing when the row\'s border has moved from under the strip', async () => {
+        const on_row_fit = await render_fit({ 0: 'x'.repeat(30), 1: 'b', 2: 'c', 3: 'd' });
+        // The strip took row 0's border to be at 70; its bottom is at 46 now
+        // (an undo of its height, say, with the pointer still).
+        click_border(0);
+        click_border(0);
+        fit(0, 70);
+        expect(on_row_fit).not.toHaveBeenCalled();
+        double_click_border(0);
+        expect(on_row_fit).toHaveBeenCalledOnce();
     });
 
     it('fits nothing when the gesture may not start', async () => {

@@ -38,7 +38,7 @@ export interface RowResizeOverlayProps {
      * (each through `on_resize_end`). Whether it was a double-click on this
      * row's border, and not two drags, is the caller's to judge from them.
      */
-    on_fit?: (row: number) => void;
+    on_fit?: (row: number, boundary_y: number) => void;
 }
 
 interface DragState {
@@ -197,7 +197,7 @@ export const RowResizeOverlay = forwardRef<
                         if (e.button !== 0 || drag_ref.current || !target) return;
                         e.preventDefault();
                         e.stopPropagation();
-                        on_fit?.(target.row);
+                        on_fit?.(target.row, target.boundary_y);
                     }}
                     onContextMenu={(e) => {
                         // Suppress the OS cut/copy/paste menu on the row-header

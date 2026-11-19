@@ -392,7 +392,6 @@ import {
     row_height_layers_with,
     row_height_order_marker,
     type RowHeightLayer,
-    type RowHeightOverrides,
     type RowHeightOverlay,
 } from './row-heights';
 import {
@@ -1114,11 +1113,6 @@ function transform_reconciliation_required(
 
 /** Shared so clearing an already-empty auto-fit queue is not a state change. */
 const EMPTY_PENDING_AUTO_FIT: ReadonlySet<number> = new Set<number>();
-/**
- * A sheet with no stored heights, as one object: the grid takes a new
- * `row_heights` for new row geometry, which takes down the row border strip.
- */
-const NO_ROW_HEIGHTS: RowHeightOverrides = Object.freeze({}) as RowHeightOverrides;
 
 function ExternalChangeItem({
     source_key,
@@ -14838,7 +14832,7 @@ export function App(): React.JSX.Element {
             // display-keyed durable map from naming the wrong rows. The projection is
             // computed against the installed permutation, so it is correct in exactly the
             // case the suppression existed for.
-            row_heights={row_height_projection[active_sheet_index] ?? NO_ROW_HEIGHTS}
+            row_heights={row_height_projection[active_sheet_index] ?? {}}
             row_height_overlay={active_row_height_overlay}
             on_row_resize={handle_row_resize}
             on_row_fit={handle_row_fit}

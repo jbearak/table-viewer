@@ -11049,13 +11049,14 @@ export function GridShell({
         return () => grid_root.removeEventListener('scroll', clear, true);
         // The root is another element once every column is hidden or shown.
     }, [has_visible_columns]);
-    // Likewise when row heights change under it (an undo, another window's
-    // write, an insert): the border it sits on may now end another row.
-    useEffect(() => {
-        row_resize_ref.current?.set_target(null);
-    }, [effective_row_height]);
-    /** A double-click on a row border: fits the row (see `fit_row_heights`). */
-    const handle_row_border_double_click = useCallback((row: number): void => {
+    /**
+     * A double-click on a row border: fits the row (see `fit_row_heights`).
+     * `boundary_y` is where the strip took that border to be. Heights can
+     * change under a still pointer (an undo, a delivery), leaving the strip
+     * where another row's border is now: the fit is taken only while the
+     * row's bottom edge is still there.
+     */
+    const handle_row_border_double_click = useCallback((row: number, boundary_y: number): void => {
         const double_clicked = row_border_was_double_clicked(
             row_border_presses_ref.current,
             row,
@@ -11063,6 +11064,9 @@ export function GridShell({
         );
         row_border_presses_ref.current = [];
         if (!double_clicked) return;
+        // The row marker's cell: never merged, so its bottom is the row's.
+        const bounds = grid_ref.current?.getBounds(-1, row);
+        if (bounds === undefined || Math.abs(bounds.y + bounds.height - boundary_y) > 1) return;
         // The strip's row height and border position are about to change.
         row_resize_ref.current?.set_target(null);
         fit_row_heights(row);
