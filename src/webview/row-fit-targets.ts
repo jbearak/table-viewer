@@ -172,7 +172,7 @@ export function row_fit_targets(
 export function rows_hold_fit_target(
     projection: Pick<
         PendingRowProjection,
-        'layoutMode' | 'first_live_display_row_in' | 'row_state' | 'rowCount' | 'deletedBandStart' | 'pendingBandStart'
+        'layoutMode' | 'first_live_display_row_in' | 'rowCount' | 'deletedBandStart' | 'pendingBandStart'
     >,
     rows: readonly DisplayRowInterval[],
 ): boolean {
@@ -186,9 +186,8 @@ export function rows_hold_fit_target(
         }
         if (end >= projection.pendingBandStart) return true;
         const source_end = Math.min(end, projection.deletedBandStart - 1);
-        for (let row = start; row <= source_end; row += 1) {
-            const state = projection.row_state(row);
-            if (state !== 'removed' && state !== 'tail-removal') return true;
+        if (start <= source_end && projection.first_live_display_row_in(start, source_end) !== undefined) {
+            return true;
         }
     }
     return false;

@@ -112,8 +112,10 @@ export interface PendingRowProjection {
     nearest_live_display_row(from: number, limit?: number): number | undefined;
     /**
      * The first display row in `[start, end]` that is not a Pending Row
-     * Removal or tail removal, or undefined; reads no further than `end`, and
-     * in layout mode skips removed runs whole.
+     * Removal or tail removal, or undefined; reads no further than `end`. In
+     * layout mode removed runs are skipped whole; band mode reads row by row,
+     * stopping at the first row not known removed (one whose page is not
+     * loaded has no state), so at most the rows the loader holds.
      */
     first_live_display_row_in(start: number, end: number): number | undefined;
     /** Expand compressed source-band intervals back into host display space. */
