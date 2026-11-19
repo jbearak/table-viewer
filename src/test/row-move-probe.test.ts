@@ -291,6 +291,33 @@ describe('probe_row_move_runs', () => {
         expect([...seen].sort()).toEqual(['merge-destination', 'merge-split', 'ok']);
     });
 
+    it('answers as move_rows does when a merge’s end rows are removed or moving', () => {
+        // Rows 5-9 merged; the first staying row is past a removed (or moved) head.
+        const ctx = context({ merges: [{ startRow: 5, endRow: 9, startCol: 0, endCol: 1 }] });
+        const seen = new Set<string>();
+        for (const [removed, runs, before] of [
+            [[5], [{ kind: 'source', start: 2, count: 2 }], source(8)],
+            [[5, 6], [{ kind: 'source', start: 2, count: 2 }], source(7)],
+            [[9], [{ kind: 'source', start: 2, count: 2 }], source(7)],
+            [[8, 9], [{ kind: 'source', start: 2, count: 2 }], source(6)],
+            [[5], [{ kind: 'source', start: 11, count: 2 }], source(8)],
+            [[5, 9], [{ kind: 'source', start: 11, count: 2 }], source(6)],
+        ] as [number[], RowSelectionRun[], RowIdentity][]) {
+            const changes = removed.length === 0 ? EMPTY : (() => {
+                // Built without the merge: deleting a merge's first row is refused.
+                const plan = plan_row_delete(EMPTY, context(), removed.map(source), new Map());
+                if (!plan.ok) throw new Error(plan.message);
+                return plan.outcome.next;
+            })();
+            const expected = outcome(move_rows(changes, ctx, identities_of_runs(runs), before));
+            expect(outcome(probe_row_move_runs(changes, ctx, runs, before)), JSON.stringify([removed, runs, before]))
+                .toBe(expected);
+            seen.add(expected.split(':')[0]!);
+        }
+        // Dropping before a merge's first live row lands outside it.
+        expect([...seen].sort()).toEqual(['merge-destination', 'ok']);
+    });
+
     it('answers as move_rows does for discarded pending rows in the selection', () => {
         // A Formula Anchor names the deleted row, so its tombstone stays.
         const ctx = context({ isRowReferenced: () => true });

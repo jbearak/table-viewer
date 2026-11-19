@@ -35,7 +35,18 @@ vi.mock('../worksheet-layout', async (import_original) => {
         },
         probe_row_move(...args: Parameters<typeof original.probe_row_move>) {
             reads.run_probes += 1;
-            return original.probe_row_move(...args);
+            const result = original.probe_row_move(...args);
+            if (!result.ok) return result;
+            // The moved rows' intervals, counting every read of their bounds.
+            return {
+                ...result,
+                movedSources: result.movedSources.map((entry) => new Proxy(entry, {
+                    get(target, key, receiver) {
+                        if (key === 'start' || key === 'count') reads.count += 1;
+                        return Reflect.get(target, key, receiver);
+                    },
+                })),
+            };
         },
         // The interval lists the merge checks search, counting every entry read.
         canonical_source_intervals(intervals: readonly SourceInterval[]) {
@@ -169,5 +180,39 @@ describe('probe_row_move_runs work', () => {
         // Indexing and sorting the removed rows reads them about 20 times over
         // (about 200,000 reads); walking them per merge reads 10 million.
         expect(reads.count).toBeLessThan(1_000_000);
+    });
+
+    it('checks merges inside a million-row block without listing its rows', () => {
+        const rows = 1_000_002;
+        const basis = {
+            kind: 'delimited' as const, byteLength: 40, digest: 'abc', sourceRowCount: rows, sourceColumnCount: 2,
+        };
+        const ctx = {
+            worksheet: { sheetIndex: 0, sheetName: 'data' },
+            bodyStart: BODY_START,
+            sourceRowCount: rows,
+            sourceColumnCount: 2,
+            bodyViewTransformed: false,
+            structuralBasis: basis,
+            // 300 merges spread through the block, each whole inside it.
+            merges: Array.from({ length: 300 }, (_, index) => ({
+                startRow: 100 + 3_000 * index, endRow: 101 + 3_000 * index, startCol: 0, endCol: 1,
+            })),
+        };
+        const changes: PendingStructuralChanges = {
+            formatTemplates: [], appendedRows: [], tailRemovals: [], conflicts: [], structuralBasis: basis,
+        };
+        reads.count = 0;
+        reads.run_probes = 0;
+        reads.identity_moves = 0;
+        const result = probe_row_move_runs(
+            changes, ctx, [{ kind: 'source', start: BODY_START, count: 999_000 }], { kind: 'source', sourceRow: rows - 1 },
+        );
+        expect(result.ok ? 'ok' : result.refusal.message).toBe('ok');
+        expect(reads.run_probes).toBe(1);
+        expect(reads.identity_moves).toBe(0);
+        // A few reads per merge of one-interval lists, not one per moved row
+        // (300 merges over 999,000 rows would be 300 million).
+        expect(reads.count).toBeLessThan(10_000);
     });
 });
