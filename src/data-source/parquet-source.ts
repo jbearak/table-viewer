@@ -907,7 +907,7 @@ export class ParquetReaderSource extends TableReaderSource<ParquetReader> {
         if (raw === null) return rendered_cell(raw_cell, '');
         if (raw_cell.rawType !== 'number') return rendered_cell(raw_cell, raw);
         const plan = this.plans[column];
-        if (is_missing_code(raw)) return rendered_cell(raw_cell, label_for(labels, raw, MISSING) ?? raw);
+        if (is_missing_code(raw)) return rendered_cell(raw_cell, label_for(labels, raw, this.missing_values) ?? raw);
         if (plan.cell === 'decimal') return rendered_cell(raw_cell, raw);
         if (plan.cell === 'bigint') {
             return rendered_cell(raw_cell, format_cell(plan, labels, raw_cell, BigInt(raw)));
