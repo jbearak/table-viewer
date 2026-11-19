@@ -6,14 +6,13 @@ import { describe, expect, it } from 'vitest';
 import {
     MISSING,
     openDta,
-    openParquet,
     writeParquet,
     type Missing,
-    type ParquetReader,
     type ValueLabels,
     type WriteDataset,
     type WriteVariable,
 } from '@jbearak/dta-parser';
+import { openParquet, type ParquetReader } from 'pqparser';
 import { cells_exactly_equal } from '../cell-display';
 import { align_sheet } from '../diff-compare/row-alignment';
 import { DtaDataSource } from '../data-source/dta-source';
@@ -260,6 +259,8 @@ describe('Parquet cells', () => {
                 ['binary (4 bytes): deadbeef', 'binary (4 bytes): deadbeef', 'string'],
             ]);
             expect(rows[1][0].comparisonKey).toBe('stata:missing:.a');
+            // The filter menu's labels, keyed by the reader's own missing values.
+            expect(source.column_filter_metadata(0, 0)?.valueLabel?.('.a')).toBe('Refused');
             expect(rows[2][0].comparisonKey).toBe('stata:missing:.');
             expect(rows[2][3].comparisonKey).toBe('stata:missing:.');
             for (const k of [2, 4, 5, 6]) {

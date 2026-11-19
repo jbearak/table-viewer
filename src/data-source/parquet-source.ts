@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
+import { formatValue } from '@jbearak/dta-parser';
 import {
     MISSING,
-    formatValue,
     isMissing,
     missingValue,
     openParquet,
@@ -14,7 +14,7 @@ import {
     type TableCell,
     type TableColumn,
     type ValueLabels,
-} from '@jbearak/dta-parser';
+} from 'pqparser';
 import {
     assert_safe_sheet_shape,
     create_workbook_budget,
@@ -554,6 +554,7 @@ export function parquet_open_error(error: unknown): Error {
  * at a time, each request bounded by the footer's sizes before it is made.
  */
 export class ParquetReaderSource extends TableReaderSource<ParquetReader> {
+    protected override readonly missing_values = MISSING;
     readonly warnings: string[];
     /** Rows a block decodes: a multiple of 256, from 256 to 2,048. */
     readonly block_rows: number;
@@ -906,7 +907,7 @@ export class ParquetReaderSource extends TableReaderSource<ParquetReader> {
         if (raw === null) return rendered_cell(raw_cell, '');
         if (raw_cell.rawType !== 'number') return rendered_cell(raw_cell, raw);
         const plan = this.plans[column];
-        if (is_missing_code(raw)) return rendered_cell(raw_cell, label_for(labels, raw) ?? raw);
+        if (is_missing_code(raw)) return rendered_cell(raw_cell, label_for(labels, raw, MISSING) ?? raw);
         if (plan.cell === 'decimal') return rendered_cell(raw_cell, raw);
         if (plan.cell === 'bigint') {
             return rendered_cell(raw_cell, format_cell(plan, labels, raw_cell, BigInt(raw)));

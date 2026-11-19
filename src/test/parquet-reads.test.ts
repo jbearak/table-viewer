@@ -2,12 +2,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import {
-    ParquetReader,
-    openParquet,
-    writeParquet,
-    type ReadRange,
-} from '@jbearak/dta-parser';
+import { writeParquet } from '@jbearak/dta-parser';
+import { ParquetReader, openParquet, type ReadRange } from 'pqparser';
 import { FileParquetDataSource } from '../data-source/file-parquet-source';
 import { DEFERRED_COMPARISON_IDENTITY, type RawCell, type RenderedCell } from '../data-source/interface';
 import { ParquetDataSource } from '../data-source/parquet-source';
