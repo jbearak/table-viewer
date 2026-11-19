@@ -3752,6 +3752,83 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         expect(editSpy).toHaveBeenCalledOnce();
     });
 
+    test("a refused row cut leaves the last cut on the clipboard pasteable", async () => {
+        const source = "workbook-1/sheet-1/projection-1";
+        const cell = ([col, row]: Item): GridCell => ({
+            kind: GridCellKind.Text,
+            data: `${col}, ${row}`,
+            displayData: `${col}, ${row}`,
+            allowOverlay: true,
+            clipboardData: {
+                source,
+                location: [col, row] as const,
+                gridLocation: [col, row] as const,
+                rowIdentity: { kind: "source" as const, sourceRow: row + 100 },
+            },
+        });
+        const editSpy = vi.fn();
+        const errorSpy = vi.fn();
+        const limited = vi.fn();
+        const range = (x: number, y: number): GridSelection => ({
+            current: { cell: [x, y], range: { x, y, width: 2, height: 1 }, rangeStack: [] },
+            rows: CompactSelection.empty(),
+            columns: CompactSelection.empty(),
+        });
+        const shown = (gridSelection: GridSelection) => (
+            <DataEditor
+                {...basicProps}
+                getCellContent={cell}
+                onPaste={true}
+                onCellsEdited={editSpy}
+                onClipboardPasteError={errorSpy}
+                maxCopyRows={1}
+                onCopyRowsLimited={limited}
+                gridSelection={gridSelection}
+            />
+        );
+        vi.useFakeTimers();
+        const { rerender } = render(shown(range(1, 2)), { wrapper: Context });
+        prep(false);
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+        const copied = new Map<string, string>();
+        fireEvent.cut(window, {
+            clipboardData: {
+                types: [],
+                setData: (type: string, value: string) => copied.set(type, value),
+            },
+        });
+        await vi.waitFor(() => expect(copied.get("text/html")).toContain("data-tv-operation"));
+        const html = copied.get("text/html")!;
+
+        // Two whole rows are more than this grid lets a cut take.
+        rerender(shown({
+            current: undefined,
+            rows: CompactSelection.fromSingleSelection([4, 6]),
+            columns: CompactSelection.empty(),
+        }));
+        fireEvent.cut(window, { clipboardData: { types: [], setData: vi.fn() } });
+        await vi.waitFor(() => expect(limited).toHaveBeenCalled());
+        expect(limited).toHaveBeenCalledExactlyOnceWith({ action: "cut", selected: 2, copied: 0 });
+
+        Object.assign(navigator, {
+            clipboard: {
+                read: vi.fn(async () => [{
+                    types: ["text/html"],
+                    getType: vi.fn(async () => new Blob([html], { type: "text/html" })),
+                }]),
+            },
+        });
+        rerender(shown(range(1, 3)));
+        fireEvent.paste(window);
+        vi.useRealTimers();
+        await vi.waitFor(() => expect(editSpy).toHaveBeenCalled());
+        expect(errorSpy).not.toHaveBeenCalled();
+        expect(editSpy).toHaveBeenCalledWith(expect.arrayContaining([
+            expect.objectContaining({ location: [1, 3], movedFrom: [1, 2] }),
+        ]), "paste");
+    });
+
     test("refuses a cut after its owner reports a newer source payload", async () => {
         const source = "workbook-1/sheet-1/projection-1";
         const cell = ([col, row]: Item): GridCell => ({

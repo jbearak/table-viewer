@@ -4696,7 +4696,8 @@ export function GridShell({
     useLayoutEffect(() => {
         if (committed_display_rows_key_ref.current === display_rows_key) return;
         committed_display_rows_key_ref.current = display_rows_key;
-        set_context_menu(null);
+        // A column header's menu names no row; it stays.
+        set_context_menu((menu) => (menu?.kind === 'header' ? menu : null));
     }, [display_rows_key]);
     const select_active_display_cell = useCallback((target: Item) => {
         // Merge snapping is required here: the vendored grid's canonicalization
@@ -10808,7 +10809,7 @@ export function GridShell({
             preview_rows: commit_rows?.first() === row ? commit_rows : null,
             start_height: height,
             height,
-            topology_key: pending_selection_topology_key_ref.current,
+            topology_key: display_rows_key_ref.current,
             // Counted in the capture phase, before this press reached the strip.
             ordinal: window_press_count_ref.current,
             moved: false,
@@ -10871,7 +10872,7 @@ export function GridShell({
         // row can stand at one of those indexes (a row inserted or removed, an
         // insert undone from the keyboard while the border was held), the
         // height was dragged for rows that are not there any more.
-        if (preview.topology_key !== pending_selection_topology_key_ref.current) return;
+        if (preview.topology_key !== display_rows_key_ref.current) return;
         // Handed up as intervals, never as the expanded row list this used to pass.
         // `commit_rows` is the user's whole row selection and can be select-all, so the
         // expansion produced one number per row of the sheet purely to say "all of
@@ -11110,7 +11111,7 @@ export function GridShell({
         const double_clicked = row_border_was_double_clicked(
             row_border_presses_ref.current,
             row,
-            pending_selection_topology_key_ref.current,
+            display_rows_key_ref.current,
         );
         row_border_presses_ref.current = [];
         if (!double_clicked) return;
@@ -11522,12 +11523,14 @@ export function GridShell({
     // menu, which no key handler sees) is Glide's: it keeps the cells' rich
     // form and formula origins for Paste. Its row branch reads no more rows
     // than this copy would, and a cut it cannot take whole is refused.
-    const native_copy_row_limit = max_copy_rows_for_columns(
+    // At least one row: a limit of none would write an empty copy over the
+    // clipboard (there are no columns to copy only when every one is hidden).
+    const native_copy_row_limit = Math.max(1, max_copy_rows_for_columns(
         copy_columns.length,
         undefined,
         undefined,
         sheet_meta.estimatedRowBytes,
-    );
+    ));
     const on_copy_rows_limited = useCallback((event: {
         readonly action: 'copy' | 'cut';
         readonly selected: number;

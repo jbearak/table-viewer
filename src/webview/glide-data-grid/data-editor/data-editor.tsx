@@ -4241,6 +4241,20 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             };
 
             if (focused && getCellsForSelection !== undefined) {
+                // Fork: a cut of more whole rows than the host allows takes
+                // nothing, and is refused before this operation replaces the
+                // last one, whose payload stays on the clipboard.
+                const rowLimit = maxCopyRows ?? Number.POSITIVE_INFINITY;
+                if (
+                    action === "cut"
+                    && gridSelection.current === undefined
+                    && selectedRows !== undefined
+                    && selectedRows.length > rowLimit
+                ) {
+                    e?.preventDefault();
+                    onCopyRowsLimited?.({ action, selected: selectedRows.length, copied: 0 });
+                    return;
+                }
                 operationId = globalThis.crypto.randomUUID();
                 pendingClipboardOperationIdRef.current = operationId;
                 pendingCutOperationIdRef.current = action === "cut" ? operationId : undefined;
@@ -4258,20 +4272,12 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                         )
                     );
                 } else if (selectedRows !== undefined && selectedRows.length > 0) {
-                    // Fork: read no more rows than the host allows. A cut that
-                    // would lose rows past the limit is refused whole.
+                    // Fork: read no more rows than the host allows (a cut past
+                    // it was refused above).
                     const selected = selectedRows.length;
-                    const limit = maxCopyRows ?? Number.POSITIVE_INFINITY;
-                    if (selected > limit && action === "cut") {
-                        pendingClipboardOperationIdRef.current = undefined;
-                        pendingCutOperationIdRef.current = undefined;
-                        e?.preventDefault();
-                        onCopyRowsLimited?.({ action, selected, copied: 0 });
-                        return;
-                    }
                     const toCopy: number[] = [];
                     for (const rowIndex of selectedRows) {
-                        if (toCopy.length >= limit) break;
+                        if (toCopy.length >= rowLimit) break;
                         toCopy.push(rowIndex);
                     }
                     if (toCopy.length < selected) onCopyRowsLimited?.({ action, selected, copied: toCopy.length });

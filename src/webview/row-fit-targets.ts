@@ -161,13 +161,18 @@ export function row_fit_targets(
  * Whether `rows` hold a row a fit can size: anything but a row the session
  * will delete (a Pending Row Removal in the layout, or one past the last
  * row). In layout mode removed rows are skipped a run at a time, so a
- * selection of a million removed rows costs no more than one. A sorted or
- * filtered view (band mode) can show inline removals too, scattered: there
- * each interval is read row by row for at most
- * `NEAREST_LIVE_ROW_SCAN_LIMIT` rows, past which it is taken to hold one.
+ * selection of a million removed rows costs no more than one. In band mode
+ * the band of rows removed at the end holds none and the appended rows all
+ * are; the saved rows before them can include rows removed in place (a
+ * sorted or filtered view over a layout), so those are read row by row for
+ * at most `NEAREST_LIVE_ROW_SCAN_LIMIT` rows, past which an interval is
+ * taken to hold one.
  */
 export function rows_hold_fit_target(
-    projection: Pick<PendingRowProjection, 'layoutMode' | 'nearest_live_display_row' | 'row_state' | 'rowCount'>,
+    projection: Pick<
+        PendingRowProjection,
+        'layoutMode' | 'nearest_live_display_row' | 'row_state' | 'rowCount' | 'deletedBandStart' | 'pendingBandStart'
+    >,
     rows: readonly DisplayRowInterval[],
 ): boolean {
     for (const interval of rows) {
@@ -179,12 +184,14 @@ export function rows_hold_fit_target(
             if (live !== undefined && live >= start && live <= end) return true;
             continue;
         }
-        const last = Math.min(end, start + NEAREST_LIVE_ROW_SCAN_LIMIT - 1);
+        if (end >= projection.pendingBandStart) return true;
+        const source_end = Math.min(end, projection.deletedBandStart - 1);
+        const last = Math.min(source_end, start + NEAREST_LIVE_ROW_SCAN_LIMIT - 1);
         for (let row = start; row <= last; row += 1) {
             const state = projection.row_state(row);
             if (state !== 'removed' && state !== 'tail-removal') return true;
         }
-        if (last < end) return true;
+        if (last < source_end) return true;
     }
     return false;
 }
