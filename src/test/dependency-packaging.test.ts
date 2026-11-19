@@ -40,7 +40,7 @@ describe('wasm packages\' third-party notices', () => {
 
     it.each([
         ['@jbearak/dta-parser@1.1.0', 'Third-party notices for @jbearak/dta-parser'],
-        ['pqparser@0.0.2', 'Third-party notices for pqparser'],
+        ['pqparser@0.0.3', 'Third-party notices for pqparser'],
     ])('adds %s\'s third-party notices to the desktop notices', (header, notices) => {
         const out = join(temp_dir(), 'THIRD_PARTY_NOTICES.txt');
         execFileSync(process.execPath, [join(repo_dir, 'desktop', 'collect-licenses.mjs')], {
