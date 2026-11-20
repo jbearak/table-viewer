@@ -8,7 +8,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { test, expect } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
-import { isolated_user_data, launch_app } from './smoke-helpers';
+import { isolated_user_data, launch_app, repo_dir } from './smoke-helpers';
 import { build_fixture_xlsx } from '../../src/test/helpers/xlsx-structure-fixture';
 
 const GRID_CANVAS = '[data-testid="data-grid-canvas"]';
@@ -43,6 +43,23 @@ test('a saved cell keeps its saved value while the workbook is read back', async
     fs.writeFileSync(file, build_fixture_xlsx({
         sheets: [{ name: 'Sheet1', body: `<sheetData>${rows.join('')}</sheetData>` }],
     }));
+    await save_and_watch(file, 'n1');
+});
+
+// A real 7 MB workbook: its own timing exposed an ordering the generated one
+// does not (the grid committing once more with the session just released).
+test('a saved cell keeps its saved value while a real workbook is read back', async () => {
+    test.setTimeout(180_000);
+    const file = path.join(root, 'survey.xlsx');
+    fs.copyFileSync(
+        path.join(repo_dir, 'src', 'test', 'fixtures', 'undesa_pd_2024_wcu_country_data_survey-based.xlsx'),
+        file,
+    );
+    await save_and_watch(file, '');
+});
+
+/** Open `file`, edit A1 (which reads `before`), Save, and check every frame until the read-back. */
+async function save_and_watch(file: string, before: string): Promise<void> {
     app = await launch_app(isolated_user_data('tv-save-shows-saved-data-'), [file]);
     await expect.poll(
         () => app!.windows().filter((candidate) => candidate.url().startsWith(VIEWER_URL_PREFIX)).length,
@@ -50,7 +67,8 @@ test('a saved cell keeps its saved value while the workbook is read back', async
     ).toBe(1);
     page = app.windows().find((candidate) => candidate.url().startsWith(VIEWER_URL_PREFIX))!;
     await page.locator(GRID_CANVAS).first().waitFor({ state: 'visible', timeout: 120_000 });
-    await expect(cell(1, 0)).toHaveText('n1', { timeout: 60_000 });
+    await expect(cell(1, 0)).toHaveText(before, { timeout: 60_000 });
+    await expect(cell(1, 0)).toHaveAttribute('aria-readonly', 'false', { timeout: 60_000 });
 
     // Edit A1.
     const box = (await page.locator(GRID_CANVAS).first().boundingBox())!;
@@ -129,4 +147,4 @@ test('a saved cell keeps its saved value while the workbook is read back', async
     // The read-back took frames, and every one of them showed the saved value.
     expect(gap.length).toBeGreaterThan(0);
     expect([...new Set(gap.map((frame) => frame.text))]).toEqual([saved]);
-});
+}

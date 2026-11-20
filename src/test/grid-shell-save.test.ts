@@ -2969,6 +2969,26 @@ describe('GridShell saved presentation', () => {
         expect(shown()).toBe('9876.5');
     });
 
+    it('keys a saved cell by its source row when the display rows carry other source rows', async () => {
+        grid_mock.source_row_for_display = (display_row) => display_row + 2;
+        grid_mock.text_for_source_row = (source_row) => [`s${source_row}`, '', ''];
+        const grid = await render_grid(undefined, {
+            initial_edits: { '2:0': { value: 'saved', base: 's2' } },
+        });
+        expect(await request_save(grid.editing_ref)).toBe(true);
+        const operation = posted_save(grid.post_message)!;
+        await save_result(true);
+        await grid.rerender({ editing_session_held: false });
+        let shown = false;
+        await act(async () => {
+            shown = grid.editing_ref.current!.present_saved(operation, FACTS);
+        });
+        expect(shown).toBe(true);
+        // Display row 0 shows source row 2; display row 2 shows source row 4.
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('saved');
+        expect(grid_mock.props!.getCellContent!([0, 2]).data).toBe('s4');
+    });
+
     it('shows a number as it reads back, with Formatting off', async () => {
         grid_mock.text_for_source_row = (row) => (row === 0 ? ['1', '', ''] : ['', '', '']);
         const off = await saved_a1('1e3', { edit_syntax: 'markdown', show_formatting: false });
