@@ -2440,7 +2440,9 @@ export function GridShell({
     const restore_saved = useCallback((): boolean => {
         saved_presentation_revision_ref.current = undefined;
         if (!restore_saved_cells()) return false;
-        // A tooltip measured over a saved cell would go on showing it.
+        // Cells changed text: a Find scan under way is stale, and a tooltip
+        // measured over a saved cell would go on showing it.
+        find_epoch_ref.current += 1;
         hide_cell_tooltip_ref.current();
         return true;
     }, [restore_saved_cells]);
@@ -2502,6 +2504,7 @@ export function GridShell({
         }
         present_saved_cells(patches);
         saved_presentation_revision_ref.current = facts.revision;
+        find_epoch_ref.current += 1;
         hide_cell_tooltip_ref.current();
         return true;
     }, [

@@ -312,6 +312,18 @@ describe('refresh end notice', () => {
         expect(live()).toEqual([]);
     });
 
+    it('stops delivering once a file is adopted', async () => {
+        const { notice, posted, live } = harness([false, true]);
+        notice.save_requested(4);
+        notice.ended_without_adoption();
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(live()).toEqual([25]);
+        notice.adopted();
+        expect(live()).toEqual([]);
+        expect(posted).toHaveLength(1);
+    });
+
     it('stops for a new receiver, a disposal, or a later Save', async () => {
         const first = harness([false, true]);
         first.notice.save_requested(1);

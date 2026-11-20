@@ -108,7 +108,11 @@ export function create_refresh_end_notice(options: RefreshEndNoticeOptions): Ref
             awaiting = revision;
         },
         adopted() {
+            // The renderer has the adopted file's rows: nothing a Save showed
+            // is left to end, and a notice still being delivered could only
+            // reach a later Save's.
             awaiting = undefined;
+            stop();
         },
         ended_without_adoption() {
             if (disposed || awaiting === undefined) return;
