@@ -639,6 +639,12 @@ export interface DataEditorProps extends Props, Pick<DataGridSearchProps, "image
      */
     readonly maxCopyRows?: number;
     /** Fork addition: a row selection's copy was clipped, or its cut refused, by `maxCopyRows`. */
+    /**
+     * Called as a cut begins, before the selection is read for the clipboard.
+     * Table Viewer: puts back cells a Save put on screen, so a cut takes what
+     * the grid holds.
+     */
+    readonly onBeforeCut?: () => void;
     readonly onCopyRowsLimited?: (event: {
         readonly action: "copy" | "cut";
         readonly selected: number;
@@ -871,6 +877,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         getCellsForSelection: getCellsForSelectionIn,
         maxCopyRows,
         onCopyRowsLimited,
+        onBeforeCut,
         onGroupHeaderContextMenu,
         onGroupHeaderRenamed,
         onCellEdited,
@@ -4346,9 +4353,10 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 canvasRef.current?.contains(document.activeElement) === true;
 
             if (!focused) return;
+            onBeforeCut?.();
             await onCopy(e, undefined, "cut");
         },
-        [keybindings.cut, onCopy]
+        [keybindings.cut, onBeforeCut, onCopy]
     );
 
     useEventListener("cut", onCut, safeWindow, false, false);

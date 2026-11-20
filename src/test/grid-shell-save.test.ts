@@ -77,7 +77,28 @@ const grid_mock = vi.hoisted(() => ({
     formula_for_source_cell: null as null | ((source_row: number, column: number) => string | undefined),
     // A cell's display text when it differs from its raw value (a formatted date or number).
     formatted_for_source_cell: null as null | ((source_row: number, column: number) => string | undefined),
+    number_format_for_source_cell: null as null | ((source_row: number, column: number) => { code: string } | undefined),
+    // Cells a Save put on screen (RowLoader.present_saved_cells), applied by
+    // every reader below as the real loader applies them to its pages.
+    saved_cells: undefined as undefined | ReadonlyMap<number, ReadonlyMap<number, (cell: never) => unknown>>,
+    restore_saved_cells: vi.fn(),
 }));
+
+// One source cell as the loader holds it, with any saved cell applied.
+const loaded_cell = vi.hoisted(() => (source_row: number, column: number, raw: string) => {
+    const formula = grid_mock.formula_for_source_cell?.(source_row, column);
+    const number_format = grid_mock.number_format_for_source_cell?.(source_row, column);
+    const cell = {
+        raw,
+        formatted: grid_mock.formatted_for_source_cell?.(source_row, column) ?? raw,
+        bold: false,
+        italic: false,
+        ...(formula === undefined ? {} : { formula }),
+        ...(number_format === undefined ? {} : { numberFormat: number_format }),
+    };
+    const patch = grid_mock.saved_cells?.get(source_row)?.get(column);
+    return patch ? patch(cell as never) as typeof cell : cell;
+});
 
 vi.mock('../webview/glide-data-grid', () => {
     const React = require('react') as typeof import('react');
@@ -158,15 +179,8 @@ vi.mock('../webview/use-row-loader', () => ({
             // Page not resident: the real loader returns undefined, which
             // get_cell_raw must forward as "unknown", never as a blank cell.
             if (source_row === undefined) return undefined;
-            return source_row_text(source_row).map((raw, column) => ({
-                raw,
-                formatted: grid_mock.formatted_for_source_cell?.(source_row, column) ?? raw,
-                bold: false,
-                italic: false,
-                ...(grid_mock.formula_for_source_cell?.(source_row, column) === undefined
-                    ? {}
-                    : { formula: grid_mock.formula_for_source_cell(source_row, column) }),
-            }));
+            return source_row_text(source_row).map((raw, column) =>
+                loaded_cell(source_row, column, raw));
         },
         get_source_row: (display_row: number) => (
             grid_mock.source_row_for_display
@@ -176,23 +190,28 @@ vi.mock('../webview/use-row-loader', () => ({
         get_cell_raw_for_source: (source_row: number, col: number) => {
             if (resident_display_row(source_row) === undefined) return undefined;
             const raw = source_row_text(source_row)[col];
-            return raw === undefined ? '' : String(raw);
+            if (raw === undefined) return '';
+            return String(loaded_cell(source_row, col, raw).raw ?? '');
         },
         get_cell_for_source: (source_row: number, col: number) => {
             if (resident_display_row(source_row) === undefined) return undefined;
             const raw = source_row_text(source_row)[col];
             if (raw === undefined) return null;
-            const formula = grid_mock.formula_for_source_cell?.(source_row, col);
-            return {
-                raw,
-                formatted: grid_mock.formatted_for_source_cell?.(source_row, col) ?? raw,
-                bold: false,
-                italic: false,
-                ...(formula === undefined ? {} : { formula }),
-            };
+            return loaded_cell(source_row, col, raw);
         },
         has_source_row: (source_row: number) => resident_display_row(source_row) !== undefined,
         sample_loaded_rows: () => [],
+        present_saved_cells: (patches: typeof grid_mock.saved_cells) => {
+            grid_mock.saved_cells = patches;
+        },
+        restore_saved_cells: () => {
+            const shown = grid_mock.saved_cells !== undefined;
+            grid_mock.saved_cells = undefined;
+            if (shown) grid_mock.restore_saved_cells();
+            return shown;
+        },
+        saved_cells_active: () => grid_mock.saved_cells !== undefined,
+        loaded_generation: () => 1,
         version: 0,
     }),
 }));
@@ -497,6 +516,9 @@ afterEach(() => {
     grid_mock.text_for_source_row = null;
     grid_mock.formula_for_source_cell = null;
     grid_mock.formatted_for_source_cell = null;
+    grid_mock.number_format_for_source_cell = null;
+    grid_mock.saved_cells = undefined;
+    grid_mock.restore_saved_cells.mockReset();
     vi.unstubAllGlobals();
 });
 
@@ -2891,5 +2913,134 @@ describe('GridShell focus with a selection already made', () => {
 
         expect(grid_mock.focus).toHaveBeenCalled();
         expect(grid_mock.props!.gridSelection?.current?.cell).toEqual([2, 0]);
+    });
+});
+
+describe('GridShell saved presentation', () => {
+    const FACTS = { revision: 5, ended_revision: 0, formula_free: true, natural_view: true };
+
+    /**
+     * Edit A1, Save it, and settle the Save as App does: the Save's entries
+     * go, the session is released, then the saved cells are presented.
+     */
+    async function saved_a1(
+        value = 'saved',
+        options: { show_formatting?: boolean; edit_syntax?: 'plain' | 'markdown' } = {},
+    ) {
+        const grid = await render_grid(undefined, {
+            initial_edits: { '0:0': { value, base: 'base' } },
+            ...options,
+        });
+        expect(await request_save(grid.editing_ref)).toBe(true);
+        const operation = posted_save(grid.post_message)!;
+        await save_result(true);
+        expect(grid.edit_session!.snapshot().size).toBe(0);
+        const released = { editing_session_held: false, ...options };
+        await grid.rerender(released);
+        let shown = false;
+        await act(async () => {
+            shown = grid.editing_ref.current!.present_saved(operation, FACTS);
+        });
+        return { ...grid, operation, shown, released };
+    }
+
+    it('shows the saved value through the grid readers until restored', async () => {
+        const { editing_ref, shown } = await saved_a1();
+        expect(shown).toBe(true);
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('saved');
+        let restored = false;
+        await act(async () => {
+            restored = editing_ref.current!.restore_saved();
+        });
+        expect(restored).toBe(true);
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('base');
+    });
+
+    it('shows an .xlsx number formatted as it will reload, and raw with Formatting off', async () => {
+        grid_mock.text_for_source_row = (row) => (row === 0 ? ['1', '', ''] : ['', '', '']);
+        grid_mock.number_format_for_source_cell = (row, column) =>
+            (row === 0 && column === 0 ? { code: '#,##0.00' } : undefined);
+        const on = await saved_a1('9876.5', { edit_syntax: 'markdown', show_formatting: true });
+        expect(on.shown).toBe(true);
+        const shown = () => (grid_mock.props!.getCellContent!([0, 0]) as { displayData?: string }).displayData;
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('9876.5');
+        expect(shown()).toBe('9,876.50');
+        await on.rerender({ ...on.released, show_formatting: false });
+        expect(shown()).toBe('9876.5');
+    });
+
+    it('ends when a session is held again, before the grid takes an edit', async () => {
+        const { rerender } = await saved_a1();
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('saved');
+        await rerender({ editing_session_held: true });
+        expect(grid_mock.restore_saved_cells).toHaveBeenCalledTimes(1);
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('base');
+    });
+
+    it('ends when an entry reaches the worksheet some other way', async () => {
+        const { edit_session, rerender, released } = await saved_a1();
+        await act(async () => {
+            edit_session!.replace('session-1', { '0:1': { value: 'replayed', base: 'middle' } });
+        });
+        await rerender({ ...released });
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('base');
+    });
+
+    it('ends for its own refresh, or a later one, never an earlier one', async () => {
+        const { editing_ref } = await saved_a1();
+        await act(async () => {
+            editing_ref.current!.saved_refresh_ended(FACTS.revision - 1);
+        });
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('saved');
+        await act(async () => {
+            editing_ref.current!.saved_refresh_ended(FACTS.revision);
+        });
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('base');
+    });
+
+    it('ends before a cut reads the selection', async () => {
+        await saved_a1();
+        await act(async () => {
+            (grid_mock.props as unknown as { onBeforeCut: () => void }).onBeforeCut();
+        });
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('base');
+    });
+
+    it('shows nothing for a Save this grid did not propose', async () => {
+        const grid = await render_grid(undefined, {
+            initial_edits: { '0:0': { value: 'saved', base: 'base' } },
+        });
+        expect(await request_save(grid.editing_ref)).toBe(true);
+        const operation = posted_save(grid.post_message)!;
+        await save_result(true);
+        await grid.rerender({ editing_session_held: false });
+        let shown = true;
+        await act(async () => {
+            shown = grid.editing_ref.current!.present_saved(
+                { ...operation, saveRequestId: 'peer:1' },
+                FACTS,
+            );
+        });
+        expect(shown).toBe(false);
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('base');
+    });
+
+    it('shows nothing while an edit is left unsaved on the worksheet', async () => {
+        const grid = await render_grid(undefined, {
+            initial_edits: { '0:0': { value: 'saved', base: 'base' } },
+        });
+        expect(await request_save(grid.editing_ref)).toBe(true);
+        const operation = posted_save(grid.post_message)!;
+        await save_result(true);
+        await act(async () => {
+            grid.edit_session!.replace('session-1', { '0:1': { value: 'later', base: 'middle' } });
+        });
+        await grid.rerender({ editing_session_held: false });
+        let shown = true;
+        await act(async () => {
+            shown = grid.editing_ref.current!.present_saved(operation, FACTS);
+        });
+        expect(shown).toBe(false);
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('base');
     });
 });

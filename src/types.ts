@@ -3644,6 +3644,12 @@ export type HostMessage =
      */
     | { type: 'structuralSaveUnresolved'; notice: StructuralSaveUnresolvedNotice | null }
     | { type: 'saveOperationStarted'; lifecycle: ActiveCsvSaveLifecycle }
+    /**
+     * A refresh begun after the Save with this success lifecycle revision
+     * ended without adopting a file (kept, stopped or failed): the grid shows
+     * the rows it held before that Save again.
+     */
+    | { type: 'refreshEndedWithoutAdoption'; revision: number }
     | {
         type: 'saveResult';
         success: boolean;

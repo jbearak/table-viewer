@@ -2,7 +2,12 @@ import { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from 'rea
 import type { RenderedCell } from '../data-source/interface';
 import type { HostMessage } from '../types';
 import { host_bridge } from './host-bridge';
-import { RowLoader, type CompareRowDiff, type LoadedRowSample } from './row-loader';
+import {
+    RowLoader,
+    type CompareRowDiff,
+    type LoadedRowSample,
+    type SavedCellPatches,
+} from './row-loader';
 
 export { RowLoader };
 
@@ -56,6 +61,17 @@ export interface UseRowLoader {
     get_page_size(): number;
     /** The display rows the loader holds, as ascending inclusive ranges. */
     resident_row_ranges(): { start: number; end: number }[];
+    /**
+     * Show the cells a Save wrote until the reloaded file replaces them; see
+     * RowLoader.present_saved_cells.
+     */
+    present_saved_cells(patches: SavedCellPatches): void;
+    /** Put back the cells the saved ones replaced; true if any were shown. */
+    restore_saved_cells(): boolean;
+    /** Whether saved cells are shown. */
+    saved_cells_active(): boolean;
+    /** The generation the loader holds rows for. */
+    loaded_generation(): number;
     /** Bumps on every ingested page so consumers can re-key Glide redraws. */
     readonly version: number;
 }
@@ -169,6 +185,13 @@ export function use_row_loader(
     const get_page_size = useCallback(() => loader.effective_page_size, [loader]);
     const resident_row_ranges = useCallback(() => loader.resident_row_ranges(), [loader]);
     const sample_loaded_rows = useCallback((max: number) => loader.sample_loaded_rows(max), [loader]);
+    const present_saved_cells = useCallback(
+        (patches: SavedCellPatches) => loader.present_saved_cells(patches),
+        [loader],
+    );
+    const restore_saved_cells = useCallback(() => loader.restore_saved_cells(), [loader]);
+    const saved_cells_active = useCallback(() => loader.saved_cells_active, [loader]);
+    const loaded_generation = useCallback(() => loader.generation, [loader]);
 
     return {
         ensure_rows,
@@ -186,6 +209,10 @@ export function use_row_loader(
         get_compare_status,
         get_compare_base,
         sample_loaded_rows,
+        present_saved_cells,
+        restore_saved_cells,
+        saved_cells_active,
+        loaded_generation,
         get_page_size,
         resident_row_ranges,
         version,

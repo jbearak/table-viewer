@@ -3310,6 +3310,8 @@ export function App(): React.JSX.Element {
     );
     const processed_save_receipts_ref = useRef(new Set<string>());
     const meta_ref = useRef<WorkbookMeta | null>(null);
+    /** The highest Save revision whose refresh ended without adopting a file. */
+    const saved_refresh_ended_revision_ref = useRef(0);
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
     // Settled each time a transform of this window is answered or dropped, for a
     // replay that has to wait for every one of them before it asks for a session.
@@ -4691,6 +4693,23 @@ export function App(): React.JSX.Element {
                 set_csv_edit_session_id(undefined);
                 set_edit_session_pending(false);
                 set_editing_session_held(false);
+                // With the session released and the Save's entries gone, keep
+                // its cells on screen until the reloaded file replaces the rows
+                // (saved-presentation.ts). Here, in the same task as the
+                // tombstone, so no frame shows the rows read before the Save.
+                if (incoming.state === 'succeeded') {
+                    const sheets = meta_ref.current?.sheets ?? [];
+                    editing_ref.current?.present_saved(incoming.operation, {
+                        revision: incoming.revision,
+                        ended_revision: saved_refresh_ended_revision_ref.current,
+                        formula_free: sheets.every((sheet) =>
+                            (sheet.formulaCells?.length ?? 0) === 0
+                            && (sheet.pendingFormulaCells?.length ?? 0) === 0),
+                        natural_view: sheet_views_ref.current[
+                            active_sheet_index_for_focus_ref.current
+                        ]?.permuted === false,
+                    });
+                }
             }
         }
         return { previous, next, changed: true };
@@ -5244,6 +5263,16 @@ export function App(): React.JSX.Element {
 
             if (msg.type === 'saveOperationStarted') {
                 apply_save_lifecycle(msg.lifecycle);
+            }
+            if (
+                msg.type === 'refreshEndedWithoutAdoption'
+                && Number.isSafeInteger(msg.revision)
+            ) {
+                saved_refresh_ended_revision_ref.current = Math.max(
+                    saved_refresh_ended_revision_ref.current,
+                    msg.revision,
+                );
+                editing_ref.current?.saved_refresh_ended(msg.revision);
             }
 
             if (msg.type === 'workbookSnapshot') {
@@ -12028,6 +12057,10 @@ export function App(): React.JSX.Element {
                 set_edit_session_pending(false);
                 set_restore_wake((wake) => wake + 1);
                 if (msg.granted && msg.editSessionId) {
+                    // A Save's cells may still be shown in place of the rows
+                    // the grid holds. Put those rows back before anything that
+                    // waited for this grant reads a cell as an edit's base.
+                    editing_ref.current?.restore_saved();
                     if (!diff_mode_initialized_ref.current) {
                         set_diff_mode(msg.diffOnByDefault ?? diff_on_by_default_ref.current);
                         diff_mode_initialized_ref.current = true;
