@@ -38,6 +38,14 @@ interface CachedPage {
     compare_rows?: (CompareRowDiff | undefined)[];
 }
 
+/**
+ * A saved cell to show in place of a resident one, built from the cell it
+ * replaces so that cell's own format and style carry over.
+ */
+export type SavedCellPatch = (original: RenderedCell | null) => RenderedCell | null;
+/** Saved cells by canonical source row, then source column. */
+export type SavedCellPatches = ReadonlyMap<number, ReadonlyMap<number, SavedCellPatch>>;
+
 let next_loader_id = 0;
 const MAX_CELLS_PER_PAGE = 64 * 1024;
 const DEFAULT_MAX_CACHED_CELLS = 1_000_000;
@@ -119,6 +127,21 @@ export class RowLoader {
      * only the caller knows when it ends.
      */
     private readonly pins = new Map<symbol, { start: number; end: number }>();
+    /**
+     * The cells a Save just wrote, shown in place of the pre-Save rows this
+     * generation still holds until the reloaded file replaces them (see
+     * {@link present_saved_cells}). Undefined when nothing is shown.
+     */
+    private saved_cells: SavedCellPatches | undefined;
+    /**
+     * Each patched page's replaced cells, by row offset then column, so a
+     * restore can put them back. Keyed by the page object: a page that is
+     * evicted or replaced takes its originals with it.
+     */
+    private readonly saved_originals = new WeakMap<
+        CachedPage,
+        Map<number, Map<number, RenderedCell | null>>
+    >();
 
     constructor(
         private readonly post: PostFn,
@@ -374,6 +397,7 @@ export class RowLoader {
             source_rows: msg.sourceRows,
             request_id: msg.requestId,
         };
+        if (this.saved_cells !== undefined) this.patch_page(page, this.saved_cells);
         this.pending.delete(start);
         // Retract-before-insert. A page replaced in place must give up the claims
         // its replacement no longer covers (a shorter or renamed redelivery),
@@ -555,7 +579,75 @@ export class RowLoader {
         return claim.start + claim.offset;
     }
 
+    /**
+     * Show the cells a Save wrote in place of the resident ones, on every page
+     * of this generation, and on every page of it that arrives later, until
+     * {@link restore_saved_cells} or a {@link clear} (a reload's adoption, a
+     * sheet switch). Every reader sees them: the canvas, Copy, Find, the
+     * tooltip, auto-fit, and the editor's initial value. A second call replaces
+     * the first.
+     */
+    present_saved_cells(patches: SavedCellPatches): void {
+        if (this.saved_cells !== undefined) this.unpatch_pages();
+        this.saved_cells = patches;
+        for (const page of this.pages.values()) this.patch_page(page, patches);
+        this.on_change();
+    }
+
+    /** Whether saved cells are shown. */
+    get saved_cells_active(): boolean {
+        return this.saved_cells !== undefined;
+    }
+
+    /**
+     * Put back the cells the saved ones replaced, keeping every page resident,
+     * and stop showing saved cells. Returns whether any were shown.
+     */
+    restore_saved_cells(): boolean {
+        if (this.saved_cells === undefined) return false;
+        this.unpatch_pages();
+        this.saved_cells = undefined;
+        this.on_change();
+        return true;
+    }
+
+    private patch_page(page: CachedPage, patches: SavedCellPatches): void {
+        let originals: Map<number, Map<number, RenderedCell | null>> | undefined;
+        for (let offset = 0; offset < page.source_rows.length; offset++) {
+            const columns = patches.get(page.source_rows[offset]);
+            const row = page.rows[offset];
+            if (columns === undefined || row === undefined) continue;
+            const patched = [...row];
+            const replaced = new Map<number, RenderedCell | null>();
+            for (const [column, patch] of columns) {
+                const original = row[column] ?? null;
+                replaced.set(column, original);
+                patched[column] = patch(original);
+            }
+            page.rows[offset] = patched;
+            originals ??= new Map();
+            originals.set(offset, replaced);
+        }
+        if (originals !== undefined) this.saved_originals.set(page, originals);
+    }
+
+    private unpatch_pages(): void {
+        for (const page of this.pages.values()) {
+            const originals = this.saved_originals.get(page);
+            if (originals === undefined) continue;
+            for (const [offset, columns] of originals) {
+                const row = page.rows[offset];
+                if (row === undefined) continue;
+                const restored = [...row];
+                for (const [column, cell] of columns) restored[column] = cell;
+                page.rows[offset] = restored;
+            }
+            this.saved_originals.delete(page);
+        }
+    }
+
     clear(): void {
+        this.saved_cells = undefined;
         this.pages.clear();
         this.source_to_page.clear();
         this.pending.clear();

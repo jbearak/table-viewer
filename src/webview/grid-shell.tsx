@@ -221,6 +221,7 @@ import { MAX_SHEET_ROWS } from '../spreadsheet-safety';
 import {
     xlsx_edit_writes_formula,
     xlsx_runs_require_inline_string,
+    xlsx_number_read_back,
 } from '../xlsx-cell-value';
 import { UNKNOWN_XLSX_FORMULA_RESULT } from '../xlsx-formula';
 import {
@@ -608,6 +609,12 @@ function dirty_value_overlay_fields(
 }
 
 import { use_row_loader } from './use-row-loader';
+import type { SavedCellPatch } from './row-loader';
+import {
+    saved_presentation_refusal,
+    type SavedPresentationFacts,
+    type SavedPresentationProposal,
+} from './saved-presentation';
 import { theme_font_size_px, tint_from_color, use_vscode_theme } from './vscode-theme';
 
 /** Alpha of the whole-row band behind added/deleted rows in git compare mode.
@@ -1411,6 +1418,20 @@ export interface EditingHandle {
      * editor, menu, dialog, or append surface.
      */
     session_busy(): boolean;
+    /**
+     * After a successful Save, keep its cells on screen until the reloaded
+     * file replaces the rows (see saved-presentation.ts). Called by App right
+     * after it has released the editing session for that Save. True when the
+     * saved cells are now shown.
+     */
+    present_saved(operation: CsvSaveOperation, facts: SavedPresentationFacts): boolean;
+    /** Show the rows as read before the Save again. True if saved cells were shown. */
+    restore_saved(): boolean;
+    /**
+     * A refresh begun for the Save with this success revision, or a later one,
+     * ended without adopting a file: show the rows as read before the Save.
+     */
+    saved_refresh_ended(revision: number): void;
     /**
      * True while keys typed for an editor are held for the session it waits
      * on. Undo and redo then do nothing: in the open editor they would undo
@@ -2364,6 +2385,10 @@ export function GridShell({
         sample_loaded_rows,
         get_page_size,
         resident_row_ranges,
+        present_saved_cells,
+        restore_saved_cells,
+        saved_cells_active,
+        loaded_generation,
         version,
     } = loader;
     const lifecycle_operation = save_lifecycle.state === 'active'
@@ -2403,6 +2428,103 @@ export function GridShell({
         );
     }
     const store = edit_session ?? fallback_store_ref.current!;
+
+    // --- Saved presentation (saved-presentation.ts) --------------------------
+    // The Save this grid proposed, against the rows it then held.
+    const saved_presentation_proposal_ref = useRef<SavedPresentationProposal | undefined>(undefined);
+    // Read through a ref where an effect must not re-run when it changes.
+    const loaded_generation_ref = useRef(loaded_generation);
+    loaded_generation_ref.current = loaded_generation;
+    // The success revision of the Save whose cells are shown, if any.
+    const saved_presentation_revision_ref = useRef<number | undefined>(undefined);
+    const restore_saved = useCallback((): boolean => {
+        saved_presentation_revision_ref.current = undefined;
+        if (!restore_saved_cells()) return false;
+        // Cells changed text: a Find scan under way is stale, and a tooltip
+        // measured over a saved cell would go on showing it.
+        find_epoch_ref.current += 1;
+        hide_cell_tooltip_ref.current();
+        return true;
+    }, [restore_saved_cells]);
+    const present_saved = useCallback((
+        operation: CsvSaveOperation,
+        facts: SavedPresentationFacts,
+    ): boolean => {
+        const proposal = saved_presentation_proposal_ref.current;
+        if (proposal?.save_request_id === operation.saveRequestId) {
+            saved_presentation_proposal_ref.current = undefined;
+        }
+        const worksheet = worksheet_payload(operation);
+        const xlsx_editing = edit_syntax === 'markdown';
+        const refusal = saved_presentation_refusal({
+            operation,
+            worksheet,
+            proposal,
+            generation: loaded_generation(),
+            facts,
+            xlsx_editing,
+            header_source_row: sheet_meta.excelFirstRowHeader?.active === true
+                ? sheet_meta.excelFirstRowHeader.sourceRow ?? 0
+                : undefined,
+            remaining_dirty: store.snapshot().size,
+        });
+        if (refusal !== undefined || worksheet === undefined) return false;
+        const patches = new Map<number, Map<number, SavedCellPatch>>();
+        for (const [key, dirty] of Object.entries(worksheet.dirtyEdits)) {
+            const [row, column] = key.split(':').map(Number) as [number, number];
+            let columns = patches.get(row);
+            if (columns === undefined) patches.set(row, columns = new Map());
+            columns.set(column, (original) => {
+                // As the dirty overlay showed it with formatting on, which is
+                // how the reload will show it; the raw value is what was typed.
+                const overlay = dirty_value_overlay_fields(
+                    dirty, false, true, original, xlsx_editing,
+                );
+                // A number reads back in its own form (`1e3` as `1000`), and
+                // Formatting off shows the raw value. Styled text that needs
+                // its runs is written as text and keeps its spelling.
+                const raw = xlsx_editing && !dirty_requires_rich_text(dirty, original)
+                    ? xlsx_number_read_back(dirty.value) ?? dirty.value
+                    : dirty.value;
+                return {
+                    ...(original ?? BLANK_XLSX_CELL),
+                    raw: raw === '' ? null : raw,
+                    formatted: overlay?.dirty_display ?? dirty.value,
+                    richText: overlay?.dirty_rich,
+                    numericRaw: undefined,
+                    rawType: undefined,
+                    comparisonKey: undefined,
+                    filterKey: undefined,
+                    rawByteLength: undefined,
+                    formula: undefined,
+                    formulaResultPending: undefined,
+                    xlsxIsoDate: undefined,
+                };
+            });
+        }
+        present_saved_cells(patches);
+        saved_presentation_revision_ref.current = facts.revision;
+        find_epoch_ref.current += 1;
+        hide_cell_tooltip_ref.current();
+        return true;
+    }, [
+        edit_syntax,
+        loaded_generation,
+        present_saved_cells,
+        sheet_meta.excelFirstRowHeader,
+        store,
+        worksheet_payload,
+    ]);
+    const saved_refresh_ended = useCallback((revision: number) => {
+        const shown = saved_presentation_revision_ref.current;
+        if (shown !== undefined && revision >= shown) restore_saved();
+    }, [restore_saved]);
+    // An entry that reaches this worksheet while saved cells are shown (an
+    // Undo replay, a recovered or peer snapshot) took its base elsewhere; show
+    // the rows it was made against.
+    useLayoutEffect(() => {
+        if (saved_cells_active() && store.snapshot().size > 0) restore_saved();
+    });
     const pending_store_changes_ref = useRef<PendingRowStoreChange>({ kind: 'reset' });
     const pending_topology_revision_ref = useRef(0);
     const pending_payload_revision_ref = useRef(0);
@@ -3706,7 +3828,10 @@ export function GridShell({
         && !edits_paused
         && !close_barrier_active;
     const append_admission_active = append_admission_but_for_view && !view_request_in_flight;
-    const editable_cells = append_admission_active && !append_in_flight;
+    // Never while a Save's cells are shown. App holds no session then, so this
+    // matters only for a commit that still carries the session App has just
+    // released: no gesture may take a saved cell as its base there.
+    const editable_cells = append_admission_active && !append_in_flight && !saved_cells_active();
     // Editable, with no session behind it yet. Cells accept the same gestures
     // they do under a session; each one asks App for the session first and runs
     // on the grant. Nothing else about the grid changes, so a file that is only
@@ -3758,6 +3883,19 @@ export function GridShell({
      * it; a gesture replayed then would meet the very gates it waited to pass.
      */
     const editable_commit_ref = useRef<PendingSignal<boolean> | null>(null);
+    // Saved cells are shown only while no editing session is held: every
+    // write starts from a held session, so none can take a saved cell as its
+    // base. App's grant restores first; this catches a session that becomes
+    // held any other way, and runs before the effect below lets a gesture see
+    // the grid editable. A becoming, not a state: App releases the Save's
+    // session as it presents the saved cells, and this grid can still commit
+    // once with the session it rendered before that release reached it.
+    const session_held_at_commit_ref = useRef(editing_session_held);
+    useLayoutEffect(() => {
+        const was_held = session_held_at_commit_ref.current;
+        session_held_at_commit_ref.current = editing_session_held;
+        if (editing_session_held && !was_held) restore_saved();
+    });
     useLayoutEffect(() => {
         editable_cells_ref.current = editable_cells;
         edit_armed_ref.current = edit_armed;
@@ -4013,6 +4151,12 @@ export function GridShell({
             || csv_save_operations_equal(save_operation_ref.current, save_operation)
         ) return;
         const worksheet = worksheet_payload(save_operation);
+        if (saved_presentation_proposal_ref.current?.save_request_id !== save_operation.saveRequestId) {
+            saved_presentation_proposal_ref.current = {
+                save_request_id: save_operation.saveRequestId,
+                generation: loaded_generation_ref.current(),
+            };
+        }
         save_operation_ref.current = save_operation;
         saved_edits_ref.current = worksheet ? { ...worksheet.edits } : {};
         save_in_flight_ref.current = true;
@@ -7953,6 +8097,10 @@ export function GridShell({
         ) return false;
         grid_ref.current?.dismissOverlay();
         const worksheet = worksheet_payload(operation);
+        saved_presentation_proposal_ref.current = {
+            save_request_id: operation.saveRequestId,
+            generation: loaded_generation_ref.current(),
+        };
         save_operation_ref.current = operation;
         saved_edits_ref.current = worksheet ? { ...worksheet.edits } : {};
         save_in_flight_ref.current = true;
@@ -8267,6 +8415,9 @@ export function GridShell({
             commit_live_edit_at_close_barrier,
             flush_live_edit,
             has_uncommitted_changes,
+            present_saved,
+            restore_saved,
+            saved_refresh_ended,
             session_busy: () => session_requests_ref.current > 0
                 || drag_holds_session_ref.current
                 || overlay_intent_ref.current !== null
@@ -8301,6 +8452,9 @@ export function GridShell({
         commit_live_edit_at_close_barrier,
         flush_live_edit,
         has_uncommitted_changes,
+        present_saved,
+        restore_saved,
+        saved_refresh_ended,
     ]);
 
     // --- Column auto-fit (canvas measureText over sampled loaded rows) ---------
@@ -13313,6 +13467,7 @@ export function GridShell({
                 getCellsForSelection={true}
                 maxCopyRows={native_copy_row_limit}
                 onCopyRowsLimited={on_copy_rows_limited}
+                onBeforeCut={restore_saved}
                 gridSelection={grid_selection}
                 onGridSelectionChange={on_grid_selection_change}
                 drawHeader={draw_header}

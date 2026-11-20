@@ -3300,4 +3300,77 @@ describe('CSV reload races', () => {
         expect(refresh_snapshots(panel)).toHaveLength(0);
         expect(close_spy).toHaveBeenCalledTimes(1);
     });
+    describe('a Save whose refresh ends without adopting', () => {
+        const ended = (panel: { __messages: unknown[] }) => panel.__messages.filter((message) =>
+            (message as { type?: string })?.type === 'refreshEndedWithoutAdoption');
+        const success_revision = (panel: { __messages: unknown[] }) => (panel.__messages.find((message) =>
+            (message as { type?: string; success?: boolean })?.type === 'saveResult'
+            && (message as { success?: boolean }).success === true) as {
+            lifecycle: { revision: number };
+        }).lifecycle.revision;
+
+        it('says nothing when the refresh adopts the saved file', async () => {
+            let bytes = enc.encode('h\na\n');
+            vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+            vscode_mock.__setReadFileImplementation(async () => bytes);
+            vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+                bytes = new Uint8Array(content);
+            });
+            const panel = open_csv_table(uri('/tmp/presentation-adopted.csv'));
+            await panel.__receive({ type: 'ready' });
+            await panel.__receive({ type: 'requestEditSession' });
+            await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+            await flush_promises();
+            expect(refresh_snapshots(panel).length).toBeGreaterThan(0);
+            expect(ended(panel)).toEqual([]);
+        });
+
+        it('names the Save when the refresh keeps the source because the old bytes came back', async () => {
+            // Another program puts the original bytes back before the refresh
+            // reads the file: it matches the adopted source, which is kept.
+            const original = enc.encode('h\na\n');
+            vscode_mock.__setStatImplementation(async () => ({ size: original.byteLength, mtime: 1 }));
+            vscode_mock.__setReadFileImplementation(async () => original);
+            vscode_mock.__setWriteFileImplementation(async () => {});
+            const panel = open_csv_table(uri('/tmp/presentation-kept.csv'));
+            await panel.__receive({ type: 'ready' });
+            await panel.__receive({ type: 'requestEditSession' });
+            await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+            await flush_promises();
+            expect(ended(panel)).toEqual([{
+                type: 'refreshEndedWithoutAdoption',
+                revision: success_revision(panel),
+            }]);
+            // Another kept refresh, with no Save waiting, says nothing more.
+            await vscode_mock.__getWatchers()[0].__fireChange();
+            await flush_promises();
+            expect(ended(panel)).toHaveLength(1);
+        });
+
+        it('names the Save when the refresh fails', async () => {
+            vi.useFakeTimers();
+            let bytes = enc.encode('h\na\n');
+            let saved = false;
+            vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+            vscode_mock.__setReadFileImplementation(async () => {
+                if (saved) throw new Error('unreadable');
+                return bytes;
+            });
+            vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+                bytes = new Uint8Array(content);
+                saved = true;
+            });
+            vi.spyOn(vscode_mock.window, 'showWarningMessage').mockResolvedValue(undefined as never);
+            const panel = open_csv_table(uri('/tmp/presentation-failed.csv'));
+            await panel.__receive({ type: 'ready' });
+            await panel.__receive({ type: 'requestEditSession' });
+            await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+            await vi.advanceTimersByTimeAsync(FILE_SETTLE_LIMIT_MS * 4);
+            expect(ended(panel)).toEqual([{
+                type: 'refreshEndedWithoutAdoption',
+                revision: success_revision(panel),
+            }]);
+            vi.useRealTimers();
+        });
+    });
 });

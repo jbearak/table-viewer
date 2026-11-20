@@ -74,6 +74,9 @@ const grid_shell_mock = vi.hoisted(() => ({
     commit_live_edit_at_close_barrier: vi.fn(),
     flush_live_edit: vi.fn(),
     stop_edit_admission: vi.fn(),
+    present_saved: vi.fn((_operation: unknown, _facts: unknown) => false),
+    restore_saved: vi.fn(() => false),
+    saved_refresh_ended: vi.fn((_revision: number) => {}),
     focus_grid: vi.fn(),
     has_grid_focus: vi.fn(() => true),
     pending_active_cell: vi.fn(() => undefined as {
@@ -264,6 +267,9 @@ vi.mock('../webview/grid-shell', () => ({
                 cancel_tail_removals: grid_shell_mock.cancel_tail_removals,
                 reveal_source_cell: grid_shell_mock.reveal_source_cell,
                 stop_edit_admission: grid_shell_mock.stop_edit_admission,
+                present_saved: grid_shell_mock.present_saved,
+                restore_saved: grid_shell_mock.restore_saved,
+                saved_refresh_ended: grid_shell_mock.saved_refresh_ended,
                 commit_live_edit: grid_shell_mock.commit_live_edit,
                 commit_live_edit_at_close_barrier:
                     grid_shell_mock.commit_live_edit_at_close_barrier,
@@ -1288,6 +1294,11 @@ function cleanup() {
     grid_shell_mock.commit_live_edit_at_close_barrier.mockReset();
     grid_shell_mock.flush_live_edit.mockReset();
     grid_shell_mock.stop_edit_admission.mockReset();
+    grid_shell_mock.present_saved.mockReset();
+    grid_shell_mock.present_saved.mockImplementation(() => false);
+    grid_shell_mock.restore_saved.mockReset();
+    grid_shell_mock.restore_saved.mockImplementation(() => false);
+    grid_shell_mock.saved_refresh_ended.mockReset();
     grid_shell_mock.focus_grid.mockReset();
     grid_shell_mock.has_grid_focus.mockReset();
     grid_shell_mock.has_grid_focus.mockReturnValue(true);
@@ -32071,5 +32082,216 @@ describe('the header row as a step in history', () => {
             expect(history_labels('redo')).toEqual([]);
             expect(warnings(post_message)).toEqual([]);
         });
+    });
+});
+
+describe('App saved presentation', () => {
+    const operation: CsvSaveOperation = {
+        editSessionId: 'people-session',
+        saveRequestId: 'save-1',
+        worksheets: [{
+            sheetIndex: 0,
+            edits: { '0:0': 'Alicia' },
+            dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+        }],
+    };
+
+    async function saving(meta = make_meta(['People'], false)) {
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(meta, {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await request_edit_session();
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        const store = grid_shell_mock.latest_props?.edit_session as EditSessionStore;
+        await act(async () => {
+            store.commit('people-session', '0:0', { value: 'Alicia', base: 'Alice' });
+        });
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+        return store;
+    }
+
+    it('presents the saved cells once the success has released the session and removed its entries', async () => {
+        const store = await saving();
+        const seen: { entries: number; held: string | null }[] = [];
+        grid_shell_mock.present_saved.mockImplementation(() => {
+            seen.push({
+                entries: store.snapshot().size,
+                held: grid_stub().getAttribute('data-editing-session-held'),
+            });
+            return true;
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+        expect(grid_shell_mock.present_saved).toHaveBeenCalledTimes(1);
+        expect(grid_shell_mock.present_saved).toHaveBeenCalledWith(operation, {
+            revision: 2,
+            ended_revision: 0,
+            formula_free: true,
+            natural_view: true,
+        });
+        expect(seen[0]?.entries).toBe(0);
+        // The same success seen again (here as a snapshot) presents nothing more.
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+        expect(grid_shell_mock.present_saved).toHaveBeenCalledTimes(1);
+    });
+
+    it('presents once when the success arrives in a snapshot before its result', async () => {
+        await saving();
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['People'], false), {
+            generation: 1,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvSaveLifecycle: { revision: 2, state: 'succeeded', operation },
+            },
+        }));
+        expect(grid_shell_mock.present_saved).toHaveBeenCalledTimes(1);
+        expect(grid_shell_mock.present_saved).toHaveBeenCalledWith(
+            operation,
+            expect.objectContaining({ revision: 2 }),
+        );
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+        expect(grid_shell_mock.present_saved).toHaveBeenCalledTimes(1);
+    });
+
+    it('forgets refreshes that ended for another file', async () => {
+        await saving();
+        await dispatch_host_message({ type: 'refreshEndedWithoutAdoption', revision: 9 });
+        // The window moves to another file: its Saves count from the start.
+        await dispatch_host_message(initial_snapshot_message(make_meta(['People'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+            identity: {
+                deliveryId: 1_000,
+                authority: { fileId: 'file:other', revision: 1 },
+                stateRevision: 1,
+                sourceBasis: { physicalRevision: 1, projectionRevision: 0 },
+            } as never,
+        }));
+        await request_edit_session();
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+        grid_shell_mock.present_saved.mockClear();
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+        expect(grid_shell_mock.present_saved).toHaveBeenCalledWith(
+            operation,
+            expect.objectContaining({ revision: 2, ended_revision: 0 }),
+        );
+    });
+
+    it('tells the grid whether any sheet has a formula', async () => {
+        const meta = make_meta(['People', 'Totals'], false);
+        (meta.sheets[1] as { formulaCells?: number[] }).formulaCells = [0, 0];
+        await saving(meta);
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+        expect(grid_shell_mock.present_saved).toHaveBeenCalledWith(
+            operation,
+            expect.objectContaining({ formula_free: false }),
+        );
+    });
+
+    it('presents nothing for a failed Save', async () => {
+        await saving();
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: { revision: 2, state: 'failed', operation },
+        });
+        expect(grid_shell_mock.present_saved).not.toHaveBeenCalled();
+    });
+
+    it('restores the rows before a granted session reaches anything waiting on it', async () => {
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await request_edit_session();
+        let store_when_restored: unknown = 'not restored';
+        grid_shell_mock.restore_saved.mockImplementation(() => {
+            store_when_restored = grid_shell_mock.latest_props?.edit_session_id;
+            return true;
+        });
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        expect(grid_shell_mock.restore_saved).toHaveBeenCalled();
+        // Called inside the grant, before the grid was rendered with it.
+        expect(store_when_restored).not.toBe('people-session');
+    });
+
+    it('shows the rows as read when a projection for other rows is turned away as stale', async () => {
+        await saving();
+        const current = grid_shell_mock.latest_props?.generation as number;
+        grid_shell_mock.restore_saved.mockClear();
+        const stale = (generation: number) => initial_snapshot_message(make_meta(['People'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+            presentation: 'refresh',
+            generation,
+            identity: { deliveryId: 0 } as never,
+        });
+        // A late copy of the rows on screen changes nothing.
+        await dispatch_host_message(stale(current));
+        expect(grid_shell_mock.restore_saved).not.toHaveBeenCalled();
+        await dispatch_host_message(stale(current + 1));
+        expect(grid_shell_mock.restore_saved).toHaveBeenCalled();
+    });
+
+    it('passes a refresh that ended without adopting to the grid, and remembers it for a later success', async () => {
+        await saving();
+        await dispatch_host_message({ type: 'refreshEndedWithoutAdoption', revision: 2 });
+        expect(grid_shell_mock.saved_refresh_ended).toHaveBeenCalledWith(2);
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+        expect(grid_shell_mock.present_saved).toHaveBeenCalledWith(
+            operation,
+            expect.objectContaining({ revision: 2, ended_revision: 2 }),
+        );
     });
 });

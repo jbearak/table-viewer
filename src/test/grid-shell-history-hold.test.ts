@@ -130,6 +130,10 @@ vi.mock('../webview/use-row-loader', () => ({
             get_compare_base: () => undefined,
             sample_loaded_rows: () => [],
             get_page_size: () => 100,
+            present_saved_cells: () => {},
+            restore_saved_cells: () => false,
+            saved_cells_active: () => false,
+            loaded_generation: () => 1,
             version: 0,
         };
     },

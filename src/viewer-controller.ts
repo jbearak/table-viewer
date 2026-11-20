@@ -1,3 +1,4 @@
+import { create_refresh_end_notice } from './refresh-end-notice';
 import { randomUUID } from 'crypto';
 import { worksheet_append_schema_fingerprint } from './append-schema-fingerprint';
 import { CsvDataSource } from './data-source/csv-source';
@@ -3223,6 +3224,38 @@ export function attach_viewer(
      * refresh that reads those same bytes is still the save, not a reload.
      */
     let unadopted_saved_digest: string | undefined;
+    // The renderer may keep a Save's cells on screen until its refresh adopts
+    // the file; this tells it when that refresh ends any other way.
+    const refresh_end_notice = create_refresh_end_notice({
+        post: (message, receiver_epoch) => post_to_receiver(message, receiver_epoch),
+        receiver_epoch: () => session.current_receiver_epoch,
+        scheduler,
+    });
+    /**
+     * Watch one refresh episode from the runner call that starts it. Ending
+     * with a different adoption means a file was adopted; ending still current
+     * with the same one means the refresh kept, stopped or failed. A
+     * superseded episode says nothing: the one that replaced it will.
+     */
+    function watch_refresh_end(
+        running: Promise<unknown>,
+        seq: number,
+        refresh_event?: FileRefreshEvent,
+    ): void {
+        const adoption = session.current_adoption();
+        const ended = () => {
+            if (!load_is_current(seq, refresh_event)) return;
+            if (session.current_adoption() !== adoption) {
+                refresh_end_notice.adopted();
+                return;
+            }
+            // A local refresh that scheduled a retry has not ended: the retry
+            // reports for it.
+            if (local_retry_seq === seq) return;
+            refresh_end_notice.ended_without_adoption();
+        };
+        void running.then(ended, ended);
+    }
     /**
      * The postSave refresh still in flight, so a watcher reporting the save's
      * own write while it reads the saved bytes does not supersede it.
@@ -3337,6 +3370,8 @@ export function attach_viewer(
     // loaded; reopening the file returns to the configured limit.
     let load_all_csv_rows = false;
     let reload_retry_timer: ReturnType<typeof setTimeout> | undefined;
+    /** The load a pending local retry belongs to (see start_local_refresh_retry_timer). */
+    let local_retry_seq: number | undefined;
     // Whether the file a local refresh failed on is still being written; one
     // per local load, reset with its retry budget.
     let local_refresh_settle: FileSettleTracker | undefined;
@@ -5001,6 +5036,7 @@ export function attach_viewer(
 
     const abort_setup = (error: unknown): never => {
         disposed = true;
+        refresh_end_notice.dispose();
         const cleanup = (action: () => void) => {
             try {
                 action();
@@ -10606,7 +10642,9 @@ export function attach_viewer(
     ): Promise<boolean> {
         if (disposed) return Promise.resolve(false);
         const request = { seq: supersede_panel_load() };
-        return run_local_refresh_attempt(request, force, reason, initial);
+        const running = run_local_refresh_attempt(request, force, reason, initial);
+        watch_refresh_end(running, request.seq);
+        return running;
     }
 
     function refresh_if_changed(): Promise<boolean> {
@@ -10761,6 +10799,7 @@ export function attach_viewer(
                 if (!built) tracked.start_next_attempt();
             },
         );
+        watch_refresh_end(completion, request.seq, event);
         if (event.reason === 'postSave' && event.savedDigest !== undefined) {
             let start_next_attempt!: () => void;
             const next_attempt = new Promise<void>((resolve) => { start_next_attempt = resolve; });
@@ -10800,6 +10839,7 @@ export function attach_viewer(
         if (reload_retry_timer !== undefined) {
             clearTimeout(reload_retry_timer);
             reload_retry_timer = undefined;
+            local_retry_seq = undefined;
         }
     }
 
@@ -10875,16 +10915,20 @@ export function attach_viewer(
         delay_ms: number,
     ): void {
         if (reload_retry_timer !== undefined) clearTimeout(reload_retry_timer);
+        local_retry_seq = request.seq;
         reload_retry_timer = setTimeout(() => {
             reload_retry_timer = undefined;
+            local_retry_seq = undefined;
             if (load_is_current(request.seq)) {
-                void run_local_refresh_attempt(
+                const retry = run_local_refresh_attempt(
                     request,
                     force,
                     reason,
                     initial,
                     include_compare_original,
-                ).catch((error: unknown) => {
+                );
+                watch_refresh_end(retry, request.seq);
+                void retry.catch((error: unknown) => {
                     log_sanitized_failure('Failed to retry table viewer refresh', error);
                 });
             }
@@ -13673,6 +13717,7 @@ export function attach_viewer(
         });
         notify_edit_state();
 
+        refresh_end_notice.save_requested(succeeded_lifecycle.revision);
         void refresh_subscription.request('postSave', saved_digest).catch((error) => {
             if (disposed) return;
             log_sanitized_failure('Post-save refresh request failed (file was written)', error);
@@ -18741,6 +18786,7 @@ export function attach_viewer(
             if (disposed) return;
             disposed = true;
             renderer_ready = false;
+            refresh_end_notice.dispose();
             // This panel's commit records go with it: nothing can name them again.
             const provenance = transform_commit_provenance.get(file_key);
             if (provenance !== undefined) {
