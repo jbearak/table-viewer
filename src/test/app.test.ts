@@ -32202,6 +32202,23 @@ describe('App saved presentation', () => {
         expect(store_when_restored).not.toBe('people-session');
     });
 
+    it('shows the rows as read when a projection for other rows is turned away as stale', async () => {
+        await saving();
+        const current = grid_shell_mock.latest_props?.generation as number;
+        grid_shell_mock.restore_saved.mockClear();
+        const stale = (generation: number) => initial_snapshot_message(make_meta(['People'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+            presentation: 'refresh',
+            generation,
+            identity: { deliveryId: 0 } as never,
+        });
+        // A late copy of the rows on screen changes nothing.
+        await dispatch_host_message(stale(current));
+        expect(grid_shell_mock.restore_saved).not.toHaveBeenCalled();
+        await dispatch_host_message(stale(current + 1));
+        expect(grid_shell_mock.restore_saved).toHaveBeenCalled();
+    });
+
     it('passes a refresh that ended without adopting to the grid, and remembers it for a later success', async () => {
         await saving();
         await dispatch_host_message({ type: 'refreshEndedWithoutAdoption', revision: 2 });

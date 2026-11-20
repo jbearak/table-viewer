@@ -2438,7 +2438,10 @@ export function GridShell({
     const saved_presentation_revision_ref = useRef<number | undefined>(undefined);
     const restore_saved = useCallback((): boolean => {
         saved_presentation_revision_ref.current = undefined;
-        return restore_saved_cells();
+        if (!restore_saved_cells()) return false;
+        // A tooltip measured over a saved cell would go on showing it.
+        hide_cell_tooltip_ref.current();
+        return true;
     }, [restore_saved_cells]);
     const present_saved = useCallback((
         operation: CsvSaveOperation,
@@ -2492,6 +2495,7 @@ export function GridShell({
         }
         present_saved_cells(patches);
         saved_presentation_revision_ref.current = facts.revision;
+        hide_cell_tooltip_ref.current();
         return true;
     }, [
         edit_syntax,
@@ -8077,7 +8081,7 @@ export function GridShell({
         const worksheet = worksheet_payload(operation);
         saved_presentation_proposal_ref.current = {
             save_request_id: operation.saveRequestId,
-            generation: loaded_generation(),
+            generation: loaded_generation_ref.current(),
         };
         save_operation_ref.current = operation;
         saved_edits_ref.current = worksheet ? { ...worksheet.edits } : {};

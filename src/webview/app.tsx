@@ -5325,6 +5325,14 @@ export function App(): React.JSX.Element {
                         snapshot.capabilities.csvSaveLifecycle,
                     )
                     : undefined;
+                // A projection turned away as stale, for rows other than the
+                // ones on screen: the host may hold a file this window never
+                // adopted. Saved cells shown over the old rows could then be
+                // neither, so show the rows as they were read. After the
+                // lifecycle above, which may have just presented them.
+                if (disposition === 'stale' && snapshot.generation !== generation_ref.current) {
+                    editing_ref.current?.restore_saved();
+                }
                 let grid_focus_sheet_after_excel_header: number | undefined;
                 const process_command_result = (
                     result: RetainedSnapshotCommandResult | undefined,
