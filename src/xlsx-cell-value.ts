@@ -49,6 +49,20 @@ const NUMBER_RE = /^[+-]?((0|[1-9]\d*)(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
 const MAX_EXACT_DIGITS = 15;
 
 /** Exact value/runs rule used when an XLSX edit chooses formula storage. */
+/**
+ * The raw text a typed number reads back as once saved and re-read (`1e3`
+ * reads back as `1000`, `1.50` as `1.5`), or undefined when the text would not
+ * be written as a number. Dates are not considered.
+ */
+export function xlsx_number_read_back(value: string): string | undefined {
+    const trimmed = value.trim();
+    if (!NUMBER_RE.test(trimmed)) return undefined;
+    const n = Number(trimmed);
+    const underflowed = n === 0 && /[1-9]/.test(trimmed.replace(/[eE][+-]?\d+$/, ''));
+    if (!Number.isFinite(n) || underflowed || !fits_excel_number_precision(trimmed)) return undefined;
+    return String(n);
+}
+
 export function xlsx_edit_writes_formula(
     value: string,
     runs: readonly RichTextRun[] | undefined,

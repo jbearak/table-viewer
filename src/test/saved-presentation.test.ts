@@ -126,6 +126,31 @@ describe('RowLoader saved cells', () => {
         expect(loader.get_row(1)?.[0]?.formatted).toBe('r1c0');
     });
 
+    it('finds a saved cell by its source row wherever that row is displayed', () => {
+        // A view whose display rows carry other source rows (a hidden header
+        // row, an offset): the patch is keyed by source row.
+        const post = vi.fn();
+        const loader = new RowLoader(post, vi.fn());
+        loader.configure(0, PAGE_SIZE * 2, 1);
+        loader.ensure_rows(0, 0);
+        const request = post.mock.calls[0][0] as RequestRows;
+        loader.on_row_data({
+            type: 'rowData',
+            sheetIndex: 0,
+            startRow: 0,
+            rows: Array.from({ length: PAGE_SIZE }, (_, i) => [cell(`s${1000 + i}`)]),
+            sourceRows: Array.from({ length: PAGE_SIZE }, (_, i) => 1000 + i),
+            requestId: request.requestId,
+            generation: 1,
+        });
+        loader.present_saved_cells(saved({ '1003:0': 'saved', '3:0': 'not this one' }).patches);
+        expect(loader.get_row(3)?.[0]?.formatted).toBe('saved');
+        expect(loader.get_cell_for_source(1003, 0)?.raw).toBe('saved');
+        expect(loader.get_row(1003)).toBeUndefined();
+        loader.restore_saved_cells();
+        expect(loader.get_row(3)?.[0]?.formatted).toBe('s1003');
+    });
+
     it('a second presentation replaces the first', () => {
         const { loader } = loader_with_rows([0]);
         loader.present_saved_cells(saved({ '1:0': 'first', '2:0': 'only first' }).patches);

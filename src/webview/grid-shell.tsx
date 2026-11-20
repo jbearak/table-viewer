@@ -221,6 +221,7 @@ import { MAX_SHEET_ROWS } from '../spreadsheet-safety';
 import {
     xlsx_edit_writes_formula,
     xlsx_runs_require_inline_string,
+    xlsx_number_read_back,
 } from '../xlsx-cell-value';
 import { UNKNOWN_XLSX_FORMULA_RESULT } from '../xlsx-formula';
 import {
@@ -2477,9 +2478,14 @@ export function GridShell({
                 const overlay = dirty_value_overlay_fields(
                     dirty, false, true, original, xlsx_editing,
                 );
+                // A number reads back in its own form (`1e3` as `1000`), and
+                // Formatting off shows the raw value.
+                const raw = xlsx_editing && !dirty.valueRuns?.runs?.length
+                    ? xlsx_number_read_back(dirty.value) ?? dirty.value
+                    : dirty.value;
                 return {
                     ...(original ?? BLANK_XLSX_CELL),
-                    raw: dirty.value === '' ? null : dirty.value,
+                    raw: raw === '' ? null : raw,
                     formatted: overlay?.dirty_display ?? dirty.value,
                     richText: overlay?.dirty_rich,
                     numericRaw: undefined,

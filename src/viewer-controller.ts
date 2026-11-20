@@ -3244,11 +3244,14 @@ export function attach_viewer(
     ): void {
         const adoption = session.current_adoption();
         const ended = () => {
+            if (!load_is_current(seq, refresh_event)) return;
             if (session.current_adoption() !== adoption) {
                 refresh_end_notice.adopted();
                 return;
             }
-            if (!load_is_current(seq, refresh_event)) return;
+            // A local refresh that scheduled a retry has not ended: the retry
+            // reports for it.
+            if (local_retry_seq === seq) return;
             refresh_end_notice.ended_without_adoption();
         };
         void running.then(ended, ended);
@@ -3367,6 +3370,8 @@ export function attach_viewer(
     // loaded; reopening the file returns to the configured limit.
     let load_all_csv_rows = false;
     let reload_retry_timer: ReturnType<typeof setTimeout> | undefined;
+    /** The load a pending local retry belongs to (see start_local_refresh_retry_timer). */
+    let local_retry_seq: number | undefined;
     // Whether the file a local refresh failed on is still being written; one
     // per local load, reset with its retry budget.
     let local_refresh_settle: FileSettleTracker | undefined;
@@ -10834,6 +10839,7 @@ export function attach_viewer(
         if (reload_retry_timer !== undefined) {
             clearTimeout(reload_retry_timer);
             reload_retry_timer = undefined;
+            local_retry_seq = undefined;
         }
     }
 
@@ -10909,16 +10915,20 @@ export function attach_viewer(
         delay_ms: number,
     ): void {
         if (reload_retry_timer !== undefined) clearTimeout(reload_retry_timer);
+        local_retry_seq = request.seq;
         reload_retry_timer = setTimeout(() => {
             reload_retry_timer = undefined;
+            local_retry_seq = undefined;
             if (load_is_current(request.seq)) {
-                void run_local_refresh_attempt(
+                const retry = run_local_refresh_attempt(
                     request,
                     force,
                     reason,
                     initial,
                     include_compare_original,
-                ).catch((error: unknown) => {
+                );
+                watch_refresh_end(retry, request.seq);
+                void retry.catch((error: unknown) => {
                     log_sanitized_failure('Failed to retry table viewer refresh', error);
                 });
             }

@@ -2969,6 +2969,13 @@ describe('GridShell saved presentation', () => {
         expect(shown()).toBe('9876.5');
     });
 
+    it('shows a number as it reads back, with Formatting off', async () => {
+        grid_mock.text_for_source_row = (row) => (row === 0 ? ['1', '', ''] : ['', '', '']);
+        const off = await saved_a1('1e3', { edit_syntax: 'markdown', show_formatting: false });
+        expect(off.shown).toBe(true);
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('1000');
+    });
+
     it('ends when a session is held again, before the grid takes an edit', async () => {
         const { rerender } = await saved_a1();
         expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('saved');

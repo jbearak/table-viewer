@@ -32153,6 +32153,67 @@ describe('App saved presentation', () => {
         expect(grid_shell_mock.present_saved).toHaveBeenCalledTimes(1);
     });
 
+    it('presents once when the success arrives in a snapshot before its result', async () => {
+        await saving();
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['People'], false), {
+            generation: 1,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvSaveLifecycle: { revision: 2, state: 'succeeded', operation },
+            },
+        }));
+        expect(grid_shell_mock.present_saved).toHaveBeenCalledTimes(1);
+        expect(grid_shell_mock.present_saved).toHaveBeenCalledWith(
+            operation,
+            expect.objectContaining({ revision: 2 }),
+        );
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+        expect(grid_shell_mock.present_saved).toHaveBeenCalledTimes(1);
+    });
+
+    it('forgets refreshes that ended for another file', async () => {
+        await saving();
+        await dispatch_host_message({ type: 'refreshEndedWithoutAdoption', revision: 9 });
+        // The window moves to another file: its Saves count from the start.
+        await dispatch_host_message(initial_snapshot_message(make_meta(['People'], false), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+            identity: {
+                deliveryId: 1_000,
+                authority: { fileId: 'file:other', revision: 1 },
+                stateRevision: 1,
+                sourceBasis: { physicalRevision: 1, projectionRevision: 0 },
+            } as never,
+        }));
+        await request_edit_session();
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+        grid_shell_mock.present_saved.mockClear();
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+        expect(grid_shell_mock.present_saved).toHaveBeenCalledWith(
+            operation,
+            expect.objectContaining({ revision: 2, ended_revision: 0 }),
+        );
+    });
+
     it('tells the grid whether any sheet has a formula', async () => {
         const meta = make_meta(['People', 'Totals'], false);
         (meta.sheets[1] as { formulaCells?: number[] }).formulaCells = [0, 0];

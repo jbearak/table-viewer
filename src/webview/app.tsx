@@ -4509,6 +4509,8 @@ export function App(): React.JSX.Element {
 
     const reset_save_projection = useCallback(() => {
         save_projection_ref.current = INITIAL_CSV_SAVE_PROJECTION;
+        // Revisions count again from the start for the next file.
+        saved_refresh_ended_revision_ref.current = 0;
         processed_save_receipts_ref.current.clear();
         pending_save_grid_focus_ref.current = null;
         set_save_lifecycle(INITIAL_CSV_SAVE_PROJECTION.authoritative);
