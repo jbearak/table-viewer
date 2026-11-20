@@ -3005,6 +3005,24 @@ describe('GridShell saved presentation', () => {
         expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('base');
     });
 
+    it('survives a commit with the session the grid rendered before the release reached it', async () => {
+        const grid = await render_grid(undefined, {
+            initial_edits: { '0:0': { value: 'saved', base: 'base' } },
+        });
+        expect(await request_save(grid.editing_ref)).toBe(true);
+        const operation = posted_save(grid.post_message)!;
+        await save_result(true);
+        // App has released the session and presents, but this grid commits
+        // once more with `editing_session_held` still true.
+        await act(async () => {
+            grid.editing_ref.current!.present_saved(operation, FACTS);
+        });
+        await grid.rerender({ editing_session_held: true, show_formatting: false });
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('saved');
+        await grid.rerender({ editing_session_held: false });
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('saved');
+    });
+
     it('ends when an entry reaches the worksheet some other way', async () => {
         const { edit_session, rerender, released } = await saved_a1();
         await act(async () => {

@@ -3879,11 +3879,16 @@ export function GridShell({
     const editable_commit_ref = useRef<PendingSignal<boolean> | null>(null);
     // Saved cells are shown only while no editing session is held: every
     // write starts from a held session, so none can take a saved cell as its
-    // base. App's grant restores first; this catches a session held any other
-    // way, and runs before the effect below lets a gesture see the grid
-    // editable.
+    // base. App's grant restores first; this catches a session that becomes
+    // held any other way, and runs before the effect below lets a gesture see
+    // the grid editable. A becoming, not a state: App releases the Save's
+    // session as it presents the saved cells, and this grid can still commit
+    // once with the session it rendered before that release reached it.
+    const session_held_at_commit_ref = useRef(editing_session_held);
     useLayoutEffect(() => {
-        if (editing_session_held) restore_saved();
+        const was_held = session_held_at_commit_ref.current;
+        session_held_at_commit_ref.current = editing_session_held;
+        if (editing_session_held && !was_held) restore_saved();
     });
     useLayoutEffect(() => {
         editable_cells_ref.current = editable_cells;
