@@ -3825,7 +3825,10 @@ export function GridShell({
         && !edits_paused
         && !close_barrier_active;
     const append_admission_active = append_admission_but_for_view && !view_request_in_flight;
-    const editable_cells = append_admission_active && !append_in_flight;
+    // Never while a Save's cells are shown. App holds no session then, so this
+    // matters only for a commit that still carries the session App has just
+    // released: no gesture may take a saved cell as its base there.
+    const editable_cells = append_admission_active && !append_in_flight && !saved_cells_active();
     // Editable, with no session behind it yet. Cells accept the same gestures
     // they do under a session; each one asks App for the session first and runs
     // on the grant. Nothing else about the grid changes, so a file that is only

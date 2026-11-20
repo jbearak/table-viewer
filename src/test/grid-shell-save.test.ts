@@ -3019,6 +3019,8 @@ describe('GridShell saved presentation', () => {
         });
         await grid.rerender({ editing_session_held: true, show_formatting: false });
         expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('saved');
+        // Nor does that commit take an edit over the saved cell.
+        expect(grid_mock.props!.getCellContent!([0, 0]).allowOverlay).toBe(false);
         await grid.rerender({ editing_session_held: false });
         expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('saved');
     });
