@@ -29,6 +29,8 @@ export interface RowContextMenuModelProps {
      * does. Present when at least one of them can be fitted.
      */
     on_auto_fit_rows?: () => void;
+    /** Fit Visible Rows: fit the rows on screen, whichever rows the menu is for. */
+    on_fit_visible_rows?: () => void;
     on_promote_row_to_header: () => void;
     on_copy_rows: () => void;
     pending_row_count?: number;
@@ -61,9 +63,10 @@ export function hide_rows_menu_item(
 }
 
 /**
- * The row menu, most-used first: "Use row as header", Hide, Reset height, and
- * Copy; then, past a separator, the structure items, with Insert and Move
- * folded into submenus so the menu stays short.
+ * The row menu, most-used first: "Use row as header", Hide, Reset height,
+ * Auto-fit, Fit visible rows, and Copy; then, past a separator, the
+ * structure items, with Insert and Move folded into submenus so the menu
+ * stays short.
  */
 export function row_context_menu_items(props: RowContextMenuModelProps): MenuItem[] {
     const selected_row_count = Math.max(1, props.selected_row_count);
@@ -99,6 +102,9 @@ export function row_context_menu_items(props: RowContextMenuModelProps): MenuIte
                 : `Auto-fit ${selected_row_count} row heights`,
             on_click: () => props.on_auto_fit_rows?.(),
         });
+    }
+    if (props.on_fit_visible_rows !== undefined) {
+        items.push({ label: 'Fit visible rows', on_click: () => props.on_fit_visible_rows?.() });
     }
     items.push({
         label: selected_row_count === 1 ? 'Copy row' : `Copy ${selected_row_count} rows`,

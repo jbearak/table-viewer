@@ -2,11 +2,15 @@ import { describe, expect, it } from 'vitest';
 import type { PendingStructuralChanges } from '../pending-changes';
 import { create_pending_row_projection, type PendingRowProjection } from '../webview/pending-row-projection';
 import {
+    is_fit_visible_rows_key,
+    painted_row_span,
     row_fit_targets,
     row_fit_targets_by_resident_rows,
     row_fit_targets_by_rows,
     rows_hold_fit_target,
     type RowFitTargetSources,
+    type RowSpan,
+    visible_display_rows,
 } from '../webview/row-fit-targets';
 import type { DisplayRowInterval } from '../types';
 
@@ -355,5 +359,127 @@ describe('rows_hold_fit_target', () => {
         const started = performance.now();
         expect(rows_hold_fit_target(projection, removed_rows)).toBe(false);
         expect(performance.now() - started).toBeLessThan(1_000);
+    });
+});
+
+describe('visible_display_rows', () => {
+    // A 36px header over 24px rows, 240px tall; `scroll` px scrolled. The
+    // spans are the painted ones: Glide's bounds less the pixel it adds.
+    const header = 36;
+    const body = (height = 240): RowSpan => ({ top: header, bottom: height });
+    const uniform = (scroll: number, row_count = 100) => (row: number): RowSpan | undefined =>
+        row >= row_count ? undefined : { top: header + 24 * row - scroll, bottom: header + 24 * (row + 1) - scroll };
+
+    it('takes the rows partly on screen at the top and the bottom', () => {
+        // Row 0 shows 12px below the header; row 8 shows its top 12px.
+        expect(visible_display_rows(0, 11, uniform(12), body())).toEqual({ start: 0, end: 8 });
+    });
+
+    it('leaves out a row that ends exactly at the header, when the scroll lands on a row boundary', () => {
+        // Glide reports row 0 at y 12, 25 high: its painted bottom is 36.
+        expect(visible_display_rows(0, 10, uniform(24), body())).toEqual({ start: 1, end: 9 });
+    });
+
+    it('leaves out a row that shows one pixel, which the header border or a rounded scroll covers', () => {
+        // Row 0's last pixel is under the header's bottom border.
+        expect(visible_display_rows(0, 10, uniform(23), body())).toEqual({ start: 1, end: 9 });
+        // Glide paints with the scroll rounded but reports its fraction:
+        // row 9 is reported a quarter pixel inside the bottom edge.
+        expect(visible_display_rows(0, 11, uniform(0.25), body(252))).toEqual({ start: 0, end: 8 });
+    });
+
+    it('shows no row in a pane no taller than its header', () => {
+        expect(visible_display_rows(0, 3, uniform(0), { top: 36, bottom: 30 })).toBeNull();
+    });
+
+        it('leaves out a row that starts exactly at the bottom edge', () => {
+        // 9 rows fill 216px of body exactly; row 9 starts at 252.
+        expect(visible_display_rows(0, 11, uniform(0), body(252))).toEqual({ start: 0, end: 8 });
+    });
+
+    it('keeps a tall row whose midpoint is below the viewport but whose top is on it', () => {
+        const spans: RowSpan[] = [
+            { top: 36, bottom: 60 },
+            { top: 60, bottom: 230 },
+            { top: 230, bottom: 630 },
+        ];
+        expect(visible_display_rows(0, 2, (row) => spans[row], body())).toEqual({ start: 0, end: 2 });
+    });
+
+    it('clamps candidates below the first row and skips rows with no geometry', () => {
+        expect(visible_display_rows(-1, 5, uniform(0, 3), body())).toEqual({ start: 0, end: 2 });
+    });
+
+    it('answers null when no row is on screen', () => {
+        expect(visible_display_rows(0, 3, () => undefined, body())).toBeNull();
+        expect(visible_display_rows(0, 3, uniform(1_000), body())).toBeNull();
+    });
+});
+
+describe('painted_row_span', () => {
+    const frame = { top: 100, scale: 1, shift: 0 };
+
+    it('takes off the pixel Glide adds and measures from the grid\'s top', () => {
+        expect(painted_row_span({ y: 148, height: 25 }, frame)).toEqual({ top: 48, bottom: 72 });
+    });
+
+    it('rounds the scroll offset as Glide paints with it', () => {
+        // scrollTop 22.75: ty is -22.75, painted as -23. Row 0 is reported
+        // at 13.25 but painted at 13, so it ends where the header's border
+        // ends and is not on screen.
+        const row_0 = painted_row_span({ y: 113.25, height: 25 }, { ...frame, shift: -0.25 });
+        expect(row_0).toEqual({ top: 13, bottom: 37 });
+        expect(visible_display_rows(0, 0, () => row_0, { top: 36, bottom: 240 })).toBeNull();
+    });
+
+    it('keeps a row\'s fraction of a pixel from the rows above it', () => {
+        // Unscrolled, below a 24.75px first row: row 1 starts at 60.75, and
+        // 1.25px of it shows above a bottom edge at 62.
+        const row_1 = painted_row_span({ y: 160.75, height: 25 }, frame);
+        expect(row_1.top).toBe(60.75);
+        expect(visible_display_rows(1, 1, () => row_1, { top: 36, bottom: 62 })).toEqual({ start: 1, end: 1 });
+    });
+
+    it('converts page pixels to the grid\'s when they differ', () => {
+        // At 1.25 page pixels a grid pixel, row 8 is reported at
+        // 100 + (36 + 192) × 1.25 and 25 × 1.25 high.
+        expect(painted_row_span({ y: 385, height: 31.25 }, { ...frame, scale: 1.25 }))
+            .toEqual({ top: 228, bottom: 252 });
+    });
+});
+
+describe('is_fit_visible_rows_key', () => {
+    const press = (overrides: Partial<Parameters<typeof is_fit_visible_rows_key>[0]>) =>
+        is_fit_visible_rows_key({
+            key: 'H',
+            code: 'KeyH',
+            shiftKey: true,
+            altKey: true,
+            ctrlKey: false,
+            metaKey: false,
+            ...overrides,
+        });
+
+    it('is Shift+Alt+H, by key or, for macOS Option characters, by the physical key', () => {
+        expect(press({})).toBe(true);
+        expect(press({ key: 'h' })).toBe(true);
+        expect(press({ key: 'Ó' })).toBe(true);
+        // H on another physical key (another layout) is still H.
+        expect(press({ code: 'KeyJ' })).toBe(true);
+    });
+
+    it('needs exactly Shift and Alt', () => {
+        expect(press({ shiftKey: false })).toBe(false);
+        expect(press({ altKey: false })).toBe(false);
+        expect(press({ ctrlKey: true })).toBe(false);
+        expect(press({ metaKey: true })).toBe(false);
+    });
+
+    it('leaves another letter on the physical H key, and composing or dead keys, alone', () => {
+        expect(press({ key: 'D' })).toBe(false);
+        expect(press({ key: 'Dead' })).toBe(false);
+        expect(press({ key: 'Process' })).toBe(false);
+        expect(press({ isComposing: true })).toBe(false);
+        expect(press({ key: 'J', code: 'KeyJ' })).toBe(false);
     });
 });
