@@ -2976,6 +2976,27 @@ describe('GridShell saved presentation', () => {
         expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('1000');
     });
 
+    it('shows a styled number as it reads back when its style is the cell style', async () => {
+        grid_mock.text_for_source_row = (row) => (row === 0 ? ['1', '', ''] : ['', '', '']);
+        const grid = await render_grid(undefined, {
+            initial_edits: { '0:0': {
+                value: '1e3',
+                base: 'base',
+                valueRuns: { runs: [{ text: '1e3' }] },
+            } as CsvDirtyEntry },
+            edit_syntax: 'markdown',
+            show_formatting: false,
+        });
+        expect(await request_save(grid.editing_ref)).toBe(true);
+        const operation = posted_save(grid.post_message)!;
+        await save_result(true);
+        await grid.rerender({ editing_session_held: false, edit_syntax: 'markdown', show_formatting: false });
+        await act(async () => {
+            grid.editing_ref.current!.present_saved(operation, FACTS);
+        });
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('1000');
+    });
+
     it('ends when a session is held again, before the grid takes an edit', async () => {
         const { rerender } = await saved_a1();
         expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('saved');

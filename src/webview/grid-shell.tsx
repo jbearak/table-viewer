@@ -2479,8 +2479,9 @@ export function GridShell({
                     dirty, false, true, original, xlsx_editing,
                 );
                 // A number reads back in its own form (`1e3` as `1000`), and
-                // Formatting off shows the raw value.
-                const raw = xlsx_editing && !dirty.valueRuns?.runs?.length
+                // Formatting off shows the raw value. Styled text that needs
+                // its runs is written as text and keeps its spelling.
+                const raw = xlsx_editing && !dirty_requires_rich_text(dirty, original)
                     ? xlsx_number_read_back(dirty.value) ?? dirty.value
                     : dirty.value;
                 return {
