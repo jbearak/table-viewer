@@ -13699,16 +13699,6 @@ export function App(): React.JSX.Element {
         size_gesture_may_start,
     ]);
 
-    /**
-     * The toolbar's Fit Visible Rows: the mounted grid fits the rows on
-     * screen, behind the same gate as a row border's double-click.
-     */
-    const handle_fit_visible_rows = useCallback(() => {
-        const actions = grid_actions_ref.current;
-        if (actions?.sheet_index !== active_sheet_index) return;
-        actions.fit_visible_rows();
-    }, [active_sheet_index]);
-
     const auto_fit_waits_for_transform = useCallback((sheet_index: number) => {
         if (
             pending_transform_request_ids_ref.current[sheet_index]
@@ -15165,7 +15155,6 @@ export function App(): React.JSX.Element {
                 auto_fit_active={auto_fit_active[active_sheet_index] ?? false}
                 on_toggle_auto_fit={handle_toggle_auto_fit}
                 auto_fit_scope_menu={auto_fit_scope_menu}
-                on_fit_visible_rows={handle_fit_visible_rows}
                 auto_fit_disabled={no_visible_columns || transform_pending}
                 auto_fit_disabled_reason={
                     no_visible_columns

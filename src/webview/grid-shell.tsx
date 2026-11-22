@@ -181,13 +181,7 @@ import {
     type FittedSourceRow,
     type MeasuredCell,
 } from './fit-row-model';
-import {
-    is_fit_visible_rows_key,
-    painted_row_span,
-    row_fit_targets,
-    rows_hold_fit_target,
-    visible_display_rows,
-} from './row-fit-targets';
+import { row_fit_targets, rows_hold_fit_target } from './row-fit-targets';
 import { parse_http_external_url } from '../external-url';
 import type { CellHyperlink } from '../cell-content';
 import { HyperlinkDialog, type HyperlinkDialogHandle } from './hyperlink-dialog';
@@ -1536,8 +1530,6 @@ export interface GridActionsHandle {
     find(query: string, direction: FindDirection, inclusive: boolean): Promise<FindScanResult>;
     /** Stop any running find scan without moving the selection. */
     cancel_find(): void;
-    /** Fit Visible Rows: fit the rows on screen to their content, as one row-fit step. */
-    fit_visible_rows(): void;
 }
 
 export interface PendingPreviewScroll {
@@ -1575,8 +1567,6 @@ interface RowResizePreview {
 /** What a row fit fits: see `fit_row_heights` in GridShell. */
 type RowFitTarget =
     | { readonly border: number }
-    /** Fit Visible Rows: the rows on screen when the fit runs, after the fold. */
-    | { readonly visible: true }
     | {
         readonly rows: readonly DisplayRowInterval[];
         /** `display_rows_key` when the rows were read. */
@@ -11109,60 +11099,12 @@ export function GridShell({
     }, [apply_row_resize]);
 
     /**
-     * The display rows on screen now, for Fit Visible Rows: from the row
-     * before the first one Glide drew, the rows whose painted extent shows
-     * in the body (`visible_display_rows`). Read from the row markers,
-     * which are never merged, where Glide paints them (`painted_row_span`).
-     * A pane no taller than its header shows no row.
-     */
-    const visible_rows_now = useCallback((): DisplayRowInterval | null => {
-        const grid = grid_ref.current;
-        const canvas = grid_root_ref.current?.querySelector<HTMLCanvasElement>(
-            'canvas[data-testid="data-grid-canvas"]',
-        );
-        const header = grid?.getBounds(-1, -1);
-        // Read from the render `getBounds` measures: a scroll Glide has
-        // reported may not have committed yet.
-        const scroll = grid?.getVerticalScroll();
-        // The canvas's logical size, which Glide sets as its style. Not
-        // past the scroller's: Glide leaves the canvas as it was when the
-        // scroller has no room left to draw in.
-        const scroller = grid_root_ref.current?.querySelector<HTMLElement>('.dvn-scroller');
-        const width = Number.parseFloat(canvas?.style.width ?? '');
-        const height = Math.min(
-            Number.parseFloat(canvas?.style.height ?? ''),
-            scroller?.clientHeight ?? 0,
-        );
-        if (
-            !grid || !canvas || !header || !scroll
-            || !(width > 0) || !(height > 0) || !((scroller?.clientWidth ?? 0) > 0)
-        ) return null;
-        // Compared in the grid's own pixels, as Glide converts: its bounds
-        // are in the page's.
-        const rect = canvas.getBoundingClientRect();
-        const scale = rect.width / width;
-        const { cellYOffset, translateY } = scroll;
-        const frame = { top: rect.top, scale, shift: Math.round(translateY) - translateY };
-        return visible_display_rows(
-            // The row before the first drawn can show its last pixels.
-            cellYOffset - 1,
-            pending_projection_ref.current.rowCount - 1,
-            (row) => {
-                const bounds = grid.getBounds(-1, row);
-                return bounds === undefined ? undefined : painted_row_span(bounds, frame);
-            },
-            { top: (header.y + header.height - rect.top) / scale, bottom: height },
-        );
-    }, []);
-
-    /**
      * Fit rows to the lines their cells paint, each to its own height:
      * `{ border }` is a double-click on that row's border, which fits the row,
      * or every selected row when the selection holds it; `{ rows }` is the
      * row menu's rows, which it read under `topology_key` and which are not
-     * fitted if another row now stands at one of them; `{ visible }` is Fit
-     * Visible Rows, the rows on screen once the fold has rendered (see
-     * `visible_rows_now`). Shrinks as well as grows.
+     * fitted if another row now stands at one of them. Shrinks as well as
+     * grows.
      *
      * Measures what the grid paints (`get_cell_content`: edits, formula
      * results, Pending Rows and Columns, Diff and Git compare text), split
@@ -11190,15 +11132,6 @@ export function GridShell({
             // Checked after the fold, which can insert or commit a row.
             if (target.topology_key !== display_rows_key_ref.current) return;
             intervals = target.rows;
-        } else if ('visible' in target) {
-            if (display_column_count === 0) return;
-            const visible = visible_rows_now();
-            if (visible === null) return;
-            intervals = [visible];
-            // Heights are about to move under a pointer that may rest on a
-            // border or over a cell, as the border double-click's do.
-            row_resize_ref.current?.set_target(null);
-            hide_cell_tooltip();
         } else {
             const row = target.border;
             const selected_rows = grid_selection_ref.current.rows;
@@ -11321,16 +11254,12 @@ export function GridShell({
         for (const { display_row, id } of targets.pending) pending_heights.set(id, fitted_height(display_row));
         const { skipped } = targets;
         if (skipped > 0) {
-            // A row barely on screen may never have been asked for: the
-            // loader follows Glide's range, which leaves such a row out.
-            const message = 'visible' in target
-                ? skipped === 1
-                    ? 'Fit Visible Rows skipped 1 row that is not loaded yet. Scroll it further into view and try again.'
-                    : `Fit Visible Rows skipped ${skipped.toLocaleString('en-US')} rows that are not loaded yet. Scroll them further into view and try again.`
-                : skipped === 1
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: skipped === 1
                     ? 'Auto-fit skipped 1 row that is not loaded. Scroll to it and try again.'
-                    : `Auto-fit skipped ${skipped.toLocaleString('en-US')} rows that are not loaded. Scroll to them and try again.`;
-            host_bridge.postMessage({ type: 'showWarning', message });
+                    : `Auto-fit skipped ${skipped.toLocaleString('en-US')} rows that are not loaded. Scroll to them and try again.`,
+            });
         }
         const runs = source_height_runs(source_rows);
         write_row_heights_with_pending_rows(pending_heights, (on_result) => {
@@ -11348,13 +11277,11 @@ export function GridShell({
         get_cell_width,
         get_row,
         get_source_row,
-        hide_cell_tooltip,
         merge_index,
         on_row_fit,
         pending_rendered_rows,
         resident_row_ranges,
         theme,
-        visible_rows_now,
         write_row_heights_with_pending_rows,
     ]);
     const fit_rows_now_ref = useRef(fit_rows_now);
@@ -11889,22 +11816,12 @@ export function GridShell({
             copy_selection,
             find,
             cancel_find,
-            fit_visible_rows: () => fit_row_heights({ visible: true }),
         };
         grid_actions_ref.current = handle;
         return () => {
             if (grid_actions_ref.current === handle) grid_actions_ref.current = null;
         };
-    }, [
-        cancel_find,
-        copy_selection,
-        copy_sheet,
-        find,
-        fit_row_heights,
-        grid_actions_ref,
-        select_all,
-        sheet_index,
-    ]);
+    }, [cancel_find, copy_selection, copy_sheet, find, grid_actions_ref, select_all, sheet_index]);
 
     const hide_source_column = useCallback((source_column: number) => {
         if (display_column_count === 1) {
@@ -12541,30 +12458,6 @@ export function GridShell({
                 key: args.key,
                 code: args.rawEvent?.code ?? '',
             });
-            // Shift+Alt+H: Fit Visible Rows. After the transform shortcuts,
-            // which keep every chord they match. A held chord is one fit:
-            // its repeats would fit the rows the first fit brought on screen.
-            if (
-                on_row_fit !== undefined
-                && !is_editable_target(args.rawEvent?.target ?? null)
-                && shortcut === null
-                && is_fit_visible_rows_key({
-                    key: args.key,
-                    code: args.rawEvent?.code ?? '',
-                    shiftKey: args.shiftKey,
-                    altKey: args.altKey,
-                    ctrlKey: args.ctrlKey,
-                    metaKey: args.metaKey,
-                    isComposing: args.rawEvent?.nativeEvent?.isComposing,
-                })
-            ) {
-                args.cancel();
-                args.preventDefault();
-                // The webview's host would otherwise see the chord too.
-                args.rawEvent?.stopPropagation();
-                if (args.rawEvent?.repeat !== true) fit_row_heights({ visible: true });
-                return;
-            }
             if (
                 shortcut
                 && transform_sections
@@ -12701,13 +12594,11 @@ export function GridShell({
             display_column_for_source,
             cells_accept_edits,
             edits_held_by_pause,
-            fit_row_heights,
             inserted_rows_lock,
             merge_index,
             merges,
             on_edit_paused_gesture,
             on_open_filter,
-            on_row_fit,
             on_transform_change,
             row_count,
             select_active_display_cell,
@@ -13840,11 +13731,6 @@ export function GridShell({
                             // border fits them; nothing if they have moved.
                             ...(row_menu.can_fit_rows
                                 ? { on_auto_fit_rows: () => fit_row_heights(row_menu.display_rows) }
-                                : {}),
-                            // The rows on screen, whichever rows were clicked:
-                            // offered wherever the menu offers fitting at all.
-                            ...(on_row_fit !== undefined && !preview_mode
-                                ? { on_fit_visible_rows: () => fit_row_heights({ visible: true }) }
                                 : {}),
                             ...(only_pending ? {
                                 pending_row_count: selected_pending_ids.size,

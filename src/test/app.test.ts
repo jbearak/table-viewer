@@ -94,7 +94,6 @@ const grid_shell_mock = vi.hoisted(() => ({
         kind: 'none',
     }) as import('../webview/find-model').FindScanResult),
     cancel_find: vi.fn(),
-    fit_visible_rows: vi.fn(),
     auto_fit_result: { 0: 120 } as Record<number, number> | null,
     pending_auto_fit_result: {} as Record<string, number>,
     latest_props: null as Record<string, unknown> | null,
@@ -212,7 +211,6 @@ vi.mock('../webview/grid-shell', () => ({
                 find: (query: string, direction: 1 | -1, inclusive: boolean) =>
                     grid_shell_mock.find(query, direction, inclusive),
                 cancel_find: () => grid_shell_mock.cancel_find(),
-                fit_visible_rows: () => grid_shell_mock.fit_visible_rows(),
             };
             props.grid_actions_ref.current = handle;
             return () => {

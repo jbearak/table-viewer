@@ -83,8 +83,6 @@ export interface ToolbarProps {
     auto_fit_disabled?: boolean;
     auto_fit_disabled_reason?: string;
     auto_fit_scope_menu?: ToolbarScopeMenu;
-    /** Fit Visible Rows: fit the rows on screen to their content. */
-    on_fit_visible_rows: () => void;
     /** The file can be edited: Save is offered, and Diff and Discard with it. */
     editable: boolean;
     diff_mode: boolean;
@@ -177,9 +175,8 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
         ),
     ].filter(Boolean);
 
-    // Actions that change how the active worksheet is displayed. Columns,
-    // Auto-fit and Fit Visible Rows are unconditional, so this group never
-    // empties.
+    // Actions that change how the active worksheet is displayed. Columns and
+    // Auto-fit are unconditional, so this group never empties.
     const worksheet_actions = [
         props.show_formatting_button && (
             <ToolbarButton
@@ -242,13 +239,6 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             disabled={props.auto_fit_disabled}
             menu_key="auto-fit"
             scope_menu={props.auto_fit_scope_menu}
-        />,
-        <ToolbarButton
-            key="fit-visible-rows"
-            label="Fit Visible Rows"
-            tooltip_text="Fit the rows on screen to their content (Shift+Alt+H)."
-            onClick={props.on_fit_visible_rows}
-            on_action_complete={props.on_action_complete}
         />,
     ].filter(Boolean);
 
