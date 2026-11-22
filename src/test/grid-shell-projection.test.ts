@@ -122,6 +122,7 @@ const grid_mock = vi.hoisted(() => ({
     scroll_to: vi.fn(),
     focus: vi.fn(),
     dismiss_overlay: vi.fn(),
+    get_vertical_scroll: vi.fn(() => ({ cellYOffset: 0, translateY: 0 })),
     get_bounds: vi.fn((): { x: number; y: number; width: number; height: number } | undefined => ({
         x: 30, y: 10, width: 100, height: 36,
     })),
@@ -181,6 +182,7 @@ vi.mock('../webview/glide-data-grid', () => {
                 focus: grid_mock.focus,
                 dismissOverlay: grid_mock.dismiss_overlay,
                 getBounds: grid_mock.get_bounds,
+                getVerticalScroll: grid_mock.get_vertical_scroll,
             }));
             return React.createElement('div', {
                 className: 'data-editor-stub',
@@ -546,6 +548,8 @@ afterEach(() => {
     grid_mock.get_bounds.mockImplementation(() => ({
         x: 30, y: 10, width: 100, height: 36,
     }));
+    grid_mock.get_vertical_scroll.mockReset();
+    grid_mock.get_vertical_scroll.mockImplementation(() => ({ cellYOffset: 0, translateY: 0 }));
     grid_mock.ensure_rows.mockReset();
     grid_mock.ensure_row_intervals.mockReset();
     grid_mock.ensure_rows_loaded.mockReset();
@@ -8493,6 +8497,120 @@ describe('GridShell row auto-fit', () => {
         root_element.appendChild(scroller);
         act(() => scroller.dispatchEvent(new Event('scroll')));
         expect(grid_mock.row_resize_set_target).toHaveBeenCalledWith(null);
+    });
+
+    describe('Fit Visible Rows', () => {
+        // A 36px header over 24px rows, scrolled by one row, in an 84px
+        // canvas: rows 1 and 2 are on screen, row 0 ends exactly at the
+        // header and row 3 starts exactly at the bottom. Glide reports each
+        // row one pixel taller than it paints. The mocked grid has no layout,
+        // so this proves the wiring; the geometry is `visible_display_rows`'.
+        const on_screen = () => {
+            grid_mock.get_bounds.mockImplementation(((column: number, row: number) => row === -1
+                ? { x: 0, y: 0, width: 32, height: 36 }
+                : { x: 0, y: 36 + 24 * row - 24, width: 32, height: 25 }) as any);
+            const root_element = container!.querySelector('.grid-shell-root')!;
+            // Glide's canvas, at its logical size.
+            const canvas = document.createElement('canvas');
+            canvas.dataset.testid = 'data-grid-canvas';
+            canvas.style.width = '300px';
+            canvas.style.height = '84px';
+            canvas.getBoundingClientRect = () => ({ top: 0, width: 300 } as DOMRect);
+            root_element.prepend(canvas);
+            const scroller = document.createElement('div');
+            scroller.className = 'dvn-scroller';
+            Object.defineProperty(scroller, 'clientWidth', { value: 300 });
+            Object.defineProperty(scroller, 'clientHeight', { value: 84, configurable: true });
+            root_element.prepend(scroller);
+            grid_mock.get_vertical_scroll.mockReturnValue({ cellYOffset: 1, translateY: 0 });
+            // A scroll Glide has reported but not yet drawn: not where the
+            // rows the bounds measure are.
+            act(() => (grid_mock.props!.onVisibleRegionChanged as (range: unknown) => void)(
+                { x: 0, y: 40, width: 3, height: 4 },
+            ));
+            return scroller;
+        };
+        const press_fit = (raw: Record<string, unknown> = {}) => {
+            const args = {
+                key: 'Ó',
+                altKey: true,
+                shiftKey: true,
+                ctrlKey: false,
+                metaKey: false,
+                rawEvent: {
+                    code: 'KeyH',
+                    target: document.createElement('canvas'),
+                    repeat: false,
+                    nativeEvent: { isComposing: false },
+                    stopPropagation: vi.fn(),
+                    ...raw,
+                },
+                cancel: vi.fn(),
+                preventDefault: vi.fn(),
+            };
+            act(() => (grid_mock.props!.onKeyDown as (args: unknown) => void)(args));
+            return args;
+        };
+        const rows = { 0: 'x'.repeat(30), 1: 'x'.repeat(30), 2: 'two\nlines', 3: 'x'.repeat(30) };
+
+        it('Shift+Alt+H fits the rows on screen, each to its own height, and keeps the chord', async () => {
+            const on_row_fit = await render_fit(rows);
+            on_screen();
+            expect(on_row_fit).not.toHaveBeenCalled();
+            grid_mock.row_resize_set_target.mockClear();
+            const pressed = press_fit();
+            expect(on_row_fit).toHaveBeenCalledExactlyOnceWith([
+                { start: 1, end: 1, height: 62 },
+                { start: 2, end: 2, height: 44 },
+            ], undefined);
+            expect(pressed.cancel).toHaveBeenCalled();
+            expect(pressed.preventDefault).toHaveBeenCalled();
+            expect(pressed.rawEvent.stopPropagation).toHaveBeenCalled();
+            // Heights move under a pointer that may rest on a border.
+            expect(grid_mock.row_resize_set_target).toHaveBeenCalledWith(null);
+        });
+
+        it('fits once for a held chord, and leaves a chord typed into an editor alone', async () => {
+            const on_row_fit = await render_fit(rows);
+            on_screen();
+            const repeated = press_fit({ repeat: true });
+            expect(repeated.cancel).toHaveBeenCalled();
+            const typed = press_fit({ target: document.createElement('textarea') });
+            expect(typed.cancel).not.toHaveBeenCalled();
+            expect(on_row_fit).not.toHaveBeenCalled();
+        });
+
+        it('is the grid actions\' fit_visible_rows, in a preview too', async () => {
+            const grid_actions_ref: { current: import('../webview/grid-shell').GridActionsHandle | null } = { current: null };
+            const on_row_fit = await render_fit(rows, { grid_actions_ref, preview_mode: true });
+            on_screen();
+            act(() => grid_actions_ref.current!.fit_visible_rows());
+            expect(on_row_fit).toHaveBeenCalledExactlyOnceWith([
+                { start: 1, end: 1, height: 62 },
+                { start: 2, end: 2, height: 44 },
+            ], undefined);
+        });
+
+        it('fits nothing when the pane has no room left to draw rows in', async () => {
+            const on_row_fit = await render_fit(rows);
+            const scroller = on_screen();
+            // A horizontal scrollbar took the rest of a short pane; Glide
+            // keeps the canvas it last drew.
+            Object.defineProperty(scroller, 'clientHeight', { value: 0 });
+            press_fit();
+            expect(on_row_fit).not.toHaveBeenCalled();
+        });
+
+        it('says rows on screen that are still loading are skipped', async () => {
+            const on_row_fit = await render_fit({ 1: 'x'.repeat(30) });
+            on_screen();
+            press_fit();
+            expect(on_row_fit).toHaveBeenCalledExactlyOnceWith([{ start: 1, end: 1, height: 62 }], undefined);
+            expect(grid_mock.post_message).toHaveBeenCalledWith({
+                type: 'showWarning',
+                message: 'Fit Visible Rows skipped 1 row that is not loaded yet. Scroll it further into view and try again.',
+            });
+        });
     });
 
     it('fits only while the row\'s border is under the double-click, and drops a strip that is out of date', async () => {
