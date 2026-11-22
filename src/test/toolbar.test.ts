@@ -51,7 +51,6 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
         },
         auto_fit_active: false,
         on_toggle_auto_fit: vi.fn(),
-        on_fit_visible_rows: vi.fn(),
         editable: false,
         diff_mode: false,
         on_toggle_diff_mode: vi.fn(),
@@ -237,23 +236,11 @@ describe('Toolbar', () => {
             show_excel_header_button: true,
         });
 
-        for (const label of ['Save', 'Formatting', 'Header Row', 'Auto-fit Columns', 'Fit Visible Rows']) {
+        for (const label of ['Save', 'Formatting', 'Header Row', 'Auto-fit Columns']) {
             act(() => get_button(label).click());
         }
 
-        expect(on_action_complete).toHaveBeenCalledTimes(5);
-    });
-
-    it('fits the visible rows through its handler, as a command with its shortcut in the tooltip', () => {
-        const on_fit_visible_rows = vi.fn();
-        render_toolbar({ on_fit_visible_rows });
-        const fit = get_button('Fit Visible Rows');
-        // A command, not a toggle: nothing stays pressed after it.
-        expect(fit.hasAttribute('aria-pressed')).toBe(false);
-        act(() => fit.click());
-        expect(on_fit_visible_rows).toHaveBeenCalledTimes(1);
-        dispatch_mouse_event(fit, 'mouseover');
-        expect(get_tooltip()?.textContent).toBe('Fit the rows on screen to their content (Shift+Alt+H).');
+        expect(on_action_complete).toHaveBeenCalledTimes(4);
     });
 
     it('separates Save from the worksheet display actions', () => {
@@ -269,7 +256,6 @@ describe('Toolbar', () => {
             'Header Row',
             'Columns',
             'Auto-fit Columns',
-            'Fit Visible Rows',
         ]);
     });
 
@@ -323,7 +309,6 @@ describe('Toolbar', () => {
             'Formatting',
             'Columns',
             'Auto-fit Columns',
-            'Fit Visible Rows',
         ]);
     });
 
@@ -402,7 +387,7 @@ describe('Toolbar', () => {
         });
 
         expect(get_action_labels(container))
-            .toEqual(['Save', '|', 'Columns', 'Auto-fit Columns', 'Fit Visible Rows']);
+            .toEqual(['Save', '|', 'Columns', 'Auto-fit Columns']);
     });
 
     it('separates only Save for every combination of optional actions', () => {
@@ -422,7 +407,6 @@ describe('Toolbar', () => {
                         'Header Row',
                         'Columns',
                         'Auto-fit Columns',
-                        'Fit Visible Rows',
                     ]);
                 } else {
                     expect(labels.filter((label) => label === '|')).toHaveLength(1);
@@ -433,7 +417,6 @@ describe('Toolbar', () => {
                         'Header Row',
                         'Columns',
                         'Auto-fit Columns',
-                        'Fit Visible Rows',
                     ]);
                 }
                 cleanup();
@@ -888,6 +871,32 @@ describe('Toolbar scope menus', () => {
             (item) => item.textContent,
         );
     }
+
+    it('passes a toggle item\'s check, and a separator, through to the menu', () => {
+        const on_click = vi.fn();
+        render_toolbar({
+            auto_fit_scope_menu: {
+                aria_label: 'Auto-fit options',
+                items: [
+                    ...scope_menu().items,
+                    { kind: 'separator' },
+                    { label: 'Auto-fit Rows', checked: true, on_click },
+                ],
+            },
+        });
+        open_caret();
+
+        expect(menu_labels()).toEqual([
+            'Auto-fit columns on all 3 sheets',
+            'Restore original widths on all 3 sheets',
+        ]);
+        expect(document.querySelectorAll('.context-menu-divider[role="separator"]')).toHaveLength(1);
+        const toggle = document.querySelector<HTMLButtonElement>('[role="menuitemcheckbox"]')!;
+        expect(toggle.getAttribute('aria-checked')).toBe('true');
+        expect(toggle.textContent).toContain('Auto-fit Rows');
+        act(() => toggle.click());
+        expect(on_click).toHaveBeenCalledTimes(1);
+    });
 
     it('adds no in-flow box to the action row when a menu opens', () => {
         // The row is right-aligned and gap-spaced, so any child that generates a box

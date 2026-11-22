@@ -309,12 +309,6 @@ const fillHandleClickSize = 6;
 export interface DataGridRef {
     focus: () => void;
     getBounds: (col?: number, row?: number) => Rectangle | undefined;
-    /**
-     * Fork addition: the first row drawn and the vertical offset into it
-     * that `getBounds` measures from (the offset unrounded; the painter
-     * rounds it), from the same committed render.
-     */
-    getVerticalScroll: () => { readonly cellYOffset: number; readonly translateY: number };
     damage: (cells: DamageUpdateList) => void;
 }
 
@@ -1716,10 +1710,9 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
 
                 return getBoundsForItem(canvasRef.current, col ?? 0, row ?? -1);
             },
-            getVerticalScroll: () => ({ cellYOffset, translateY }),
             damage,
         }),
-        [canvasRef, cellYOffset, damage, getBoundsForItem, translateY]
+        [canvasRef, damage, getBoundsForItem]
     );
 
     const lastFocusedSubdomNode = React.useRef<Item>();

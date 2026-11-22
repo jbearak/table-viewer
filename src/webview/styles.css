@@ -2091,6 +2091,42 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     background: var(--vscode-list-hoverBackground, #2a2d2e);
 }
 
+/* Auto-fit Rows measuring every row: covers the whole window so nothing
+   changes under the measurement, and fades in only after a moment so a
+   small sheet does not flash it. */
+.row-fit-progress {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.25);
+    opacity: 0;
+    animation: row-fit-progress-show 120ms ease-out 250ms forwards;
+}
+
+@keyframes row-fit-progress-show {
+    to { opacity: 1; }
+}
+
+.row-fit-progress-panel {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    width: min(360px, calc(100vw - 32px));
+    padding: 20px 16px;
+    border-radius: 6px;
+    border: 1px solid var(--vscode-editorWidget-border, #3c3c3c);
+    background: var(--vscode-editorWidget-background, #252526);
+    color: var(--vscode-foreground, #ccc);
+}
+
+.row-fit-progress-panel .compare-progress-track {
+    width: 100%;
+}
+
 /* Which file is which. Above the counts row because it identifies the document
    rather than describing the findings. */
 .compare-strip-sides {

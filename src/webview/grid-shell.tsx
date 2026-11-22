@@ -46,6 +46,7 @@ import {
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type DisplayRowInterval,
+    MAX_PERSISTED_ROW_HEIGHTS,
     type HostMessage,
     type MergeRange,
     type ScrollPosition,
@@ -181,13 +182,7 @@ import {
     type FittedSourceRow,
     type MeasuredCell,
 } from './fit-row-model';
-import {
-    is_fit_visible_rows_key,
-    painted_row_span,
-    row_fit_targets,
-    rows_hold_fit_target,
-    visible_display_rows,
-} from './row-fit-targets';
+import { row_fit_targets, rows_hold_fit_target } from './row-fit-targets';
 import { parse_http_external_url } from '../external-url';
 import type { CellHyperlink } from '../cell-content';
 import { HyperlinkDialog, type HyperlinkDialogHandle } from './hyperlink-dialog';
@@ -1536,8 +1531,10 @@ export interface GridActionsHandle {
     find(query: string, direction: FindDirection, inclusive: boolean): Promise<FindScanResult>;
     /** Stop any running find scan without moving the selection. */
     cancel_find(): void;
-    /** Fit Visible Rows: fit the rows on screen to their content, as one row-fit step. */
-    fit_visible_rows(): void;
+    /** Auto-fit Rows: measure every saved row of the view; see `scan_row_fits`. */
+    scan_row_fits(on_progress?: (done: number, total: number) => void): Promise<RowFitScanOutcome>;
+    /** Stop a running Auto-fit Rows scan, which then answers `cancelled`. */
+    cancel_row_fit_scan(): void;
 }
 
 export interface PendingPreviewScroll {
@@ -1572,11 +1569,17 @@ interface RowResizePreview {
     moved: boolean;
 }
 
+/** Loader pages Auto-fit Rows loads and measures at a time. */
+const ROW_FIT_SCAN_CHUNK_PAGES = 16;
+
+/** How an Auto-fit Rows scan ended: see `scan_row_fits` in GridShell. */
+export type RowFitScanOutcome =
+    | { readonly kind: 'fitted'; readonly runs: readonly SourceRowHeightRun[] }
+    | { readonly kind: 'cancelled' | 'changed' | 'unloaded' | 'limit' };
+
 /** What a row fit fits: see `fit_row_heights` in GridShell. */
 type RowFitTarget =
     | { readonly border: number }
-    /** Fit Visible Rows: the rows on screen when the fit runs, after the fold. */
-    | { readonly visible: true }
     | {
         readonly rows: readonly DisplayRowInterval[];
         /** `display_rows_key` when the rows were read. */
@@ -5083,7 +5086,11 @@ export function GridShell({
      * FIND_CHUNK_PAGES distinct pages. Rows that are not source-backed need no
      * page; FIND_CHUNK_MAX_ROWS bounds the planning walk over long runs of them.
      */
-    const plan_find_chunk = useCallback((row: number, direction: FindDirection): FindChunk => {
+    const plan_find_chunk = useCallback((
+        row: number,
+        direction: FindDirection,
+        max_pages = FIND_CHUNK_PAGES,
+    ): FindChunk => {
         const projection = pending_projection_ref.current;
         const page_size = get_page_size();
         const pages = new Set<number>();
@@ -5100,7 +5107,7 @@ export function GridShell({
                 : projected.kind === 'source' ? projected.sourceDisplayRow : undefined;
             if (source_display_row !== undefined) {
                 const page = Math.floor(source_display_row / page_size);
-                if (!pages.has(page) && pages.size === FIND_CHUNK_PAGES) break;
+                if (!pages.has(page) && pages.size === max_pages) break;
                 pages.add(page);
             }
             if (direction === 1) end = next;
@@ -8378,6 +8385,9 @@ export function GridShell({
         const handler = (e: KeyboardEvent) => {
             if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
                 e.preventDefault();
+                // A Save asked for during an Auto-fit Rows scan ends the scan,
+                // as one from the toolbar does: what it measured may not hold.
+                row_fit_scan_ref.current?.cancel();
                 if (editable_cells) request_save();
                 else on_save_paused?.();
             }
@@ -11109,60 +11119,12 @@ export function GridShell({
     }, [apply_row_resize]);
 
     /**
-     * The display rows on screen now, for Fit Visible Rows: from the row
-     * before the first one Glide drew, the rows whose painted extent shows
-     * in the body (`visible_display_rows`). Read from the row markers,
-     * which are never merged, where Glide paints them (`painted_row_span`).
-     * A pane no taller than its header shows no row.
-     */
-    const visible_rows_now = useCallback((): DisplayRowInterval | null => {
-        const grid = grid_ref.current;
-        const canvas = grid_root_ref.current?.querySelector<HTMLCanvasElement>(
-            'canvas[data-testid="data-grid-canvas"]',
-        );
-        const header = grid?.getBounds(-1, -1);
-        // Read from the render `getBounds` measures: a scroll Glide has
-        // reported may not have committed yet.
-        const scroll = grid?.getVerticalScroll();
-        // The canvas's logical size, which Glide sets as its style. Not
-        // past the scroller's: Glide leaves the canvas as it was when the
-        // scroller has no room left to draw in.
-        const scroller = grid_root_ref.current?.querySelector<HTMLElement>('.dvn-scroller');
-        const width = Number.parseFloat(canvas?.style.width ?? '');
-        const height = Math.min(
-            Number.parseFloat(canvas?.style.height ?? ''),
-            scroller?.clientHeight ?? 0,
-        );
-        if (
-            !grid || !canvas || !header || !scroll
-            || !(width > 0) || !(height > 0) || !((scroller?.clientWidth ?? 0) > 0)
-        ) return null;
-        // Compared in the grid's own pixels, as Glide converts: its bounds
-        // are in the page's.
-        const rect = canvas.getBoundingClientRect();
-        const scale = rect.width / width;
-        const { cellYOffset, translateY } = scroll;
-        const frame = { top: rect.top, scale, shift: Math.round(translateY) - translateY };
-        return visible_display_rows(
-            // The row before the first drawn can show its last pixels.
-            cellYOffset - 1,
-            pending_projection_ref.current.rowCount - 1,
-            (row) => {
-                const bounds = grid.getBounds(-1, row);
-                return bounds === undefined ? undefined : painted_row_span(bounds, frame);
-            },
-            { top: (header.y + header.height - rect.top) / scale, bottom: height },
-        );
-    }, []);
-
-    /**
      * Fit rows to the lines their cells paint, each to its own height:
      * `{ border }` is a double-click on that row's border, which fits the row,
      * or every selected row when the selection holds it; `{ rows }` is the
      * row menu's rows, which it read under `topology_key` and which are not
-     * fitted if another row now stands at one of them; `{ visible }` is Fit
-     * Visible Rows, the rows on screen once the fold has rendered (see
-     * `visible_rows_now`). Shrinks as well as grows.
+     * fitted if another row now stands at one of them. Shrinks as well as
+     * grows.
      *
      * Measures what the grid paints (`get_cell_content`: edits, formula
      * results, Pending Rows and Columns, Diff and Git compare text), split
@@ -11181,39 +11143,23 @@ export function GridShell({
         flushSync(() => {});
         fit_rows_now_ref.current(target);
     }, [on_row_fit, size_gesture_may_start]);
-    /** `fit_row_heights` past its gate, measuring with the cells this render paints. */
-    const fit_rows_now = useCallback((target: RowFitTarget): void => {
-        if (on_row_fit === undefined) return;
+    /**
+     * Measure the rows of `intervals` with the cells this render paints: each
+     * loaded saved row's fitted height by source row (`null` at the default),
+     * each rendered Pending Row's by id, and how many rows could not be
+     * measured because their content is not loaded. Null without a canvas.
+     */
+    const measure_row_fits = useCallback((intervals: readonly DisplayRowInterval[]): {
+        readonly source_rows: FittedSourceRow[];
+        readonly pending_heights: Map<string, number>;
+        readonly skipped: number;
+    } | null => {
         const projection = pending_projection_ref.current;
-        let intervals: readonly DisplayRowInterval[];
-        if ('rows' in target) {
-            // Checked after the fold, which can insert or commit a row.
-            if (target.topology_key !== display_rows_key_ref.current) return;
-            intervals = target.rows;
-        } else if ('visible' in target) {
-            if (display_column_count === 0) return;
-            const visible = visible_rows_now();
-            if (visible === null) return;
-            intervals = [visible];
-            // Heights are about to move under a pointer that may rest on a
-            // border or over a cell, as the border double-click's do.
-            row_resize_ref.current?.set_target(null);
-            hide_cell_tooltip();
-        } else {
-            const row = target.border;
-            const selected_rows = grid_selection_ref.current.rows;
-            intervals = selected_rows.hasIndex(row)
-                ? selected_display_row_intervals(
-                    { columns: CompactSelection.empty(), rows: selected_rows },
-                    projection.rowCount,
-                ) ?? [{ start: row, end: row }]
-                : [{ start: row, end: row }];
-        }
         if (!measure_ctx_ref.current) {
             measure_ctx_ref.current = document.createElement('canvas').getContext('2d');
         }
         const ctx = measure_ctx_ref.current;
-        if (!ctx) return;
+        if (!ctx) return null;
         const glide_theme = { ...getDefaultTheme(), ...theme };
         const em_by_font = new Map<string, number>();
         const em_of = (font: string): number => {
@@ -11319,25 +11265,7 @@ export function GridShell({
         });
         const pending_heights = new Map<string, number>();
         for (const { display_row, id } of targets.pending) pending_heights.set(id, fitted_height(display_row));
-        const { skipped } = targets;
-        if (skipped > 0) {
-            // A row barely on screen may never have been asked for: the
-            // loader follows Glide's range, which leaves such a row out.
-            const message = 'visible' in target
-                ? skipped === 1
-                    ? 'Fit Visible Rows skipped 1 row that is not loaded yet. Scroll it further into view and try again.'
-                    : `Fit Visible Rows skipped ${skipped.toLocaleString('en-US')} rows that are not loaded yet. Scroll them further into view and try again.`
-                : skipped === 1
-                    ? 'Auto-fit skipped 1 row that is not loaded. Scroll to it and try again.'
-                    : `Auto-fit skipped ${skipped.toLocaleString('en-US')} rows that are not loaded. Scroll to them and try again.`;
-            host_bridge.postMessage({ type: 'showWarning', message });
-        }
-        const runs = source_height_runs(source_rows);
-        write_row_heights_with_pending_rows(pending_heights, (on_result) => {
-            if (runs.length === 0) return false;
-            on_row_fit(runs, on_result);
-            return true;
-        });
+        return { source_rows, pending_heights, skipped: targets.skipped };
     }, [
         auto_fit_active,
         default_row_height,
@@ -11348,17 +11276,170 @@ export function GridShell({
         get_cell_width,
         get_row,
         get_source_row,
-        hide_cell_tooltip,
         merge_index,
-        on_row_fit,
         pending_rendered_rows,
         resident_row_ranges,
         theme,
-        visible_rows_now,
+    ]);
+    const measure_row_fits_ref = useRef(measure_row_fits);
+    measure_row_fits_ref.current = measure_row_fits;
+    /** `fit_row_heights` past its gate, measuring with the cells this render paints. */
+    const fit_rows_now = useCallback((target: RowFitTarget): void => {
+        if (on_row_fit === undefined) return;
+        const projection = pending_projection_ref.current;
+        let intervals: readonly DisplayRowInterval[];
+        if ('rows' in target) {
+            // Checked after the fold, which can insert or commit a row.
+            if (target.topology_key !== display_rows_key_ref.current) return;
+            intervals = target.rows;
+        } else {
+            const row = target.border;
+            const selected_rows = grid_selection_ref.current.rows;
+            intervals = selected_rows.hasIndex(row)
+                ? selected_display_row_intervals(
+                    { columns: CompactSelection.empty(), rows: selected_rows },
+                    projection.rowCount,
+                ) ?? [{ start: row, end: row }]
+                : [{ start: row, end: row }];
+        }
+        const measured = measure_row_fits(intervals);
+        if (measured === null) return;
+        const { source_rows, pending_heights, skipped } = measured;
+        if (skipped > 0) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: skipped === 1
+                    ? 'Auto-fit skipped 1 row that is not loaded. Scroll to it and try again.'
+                    : `Auto-fit skipped ${skipped.toLocaleString('en-US')} rows that are not loaded. Scroll to them and try again.`,
+            });
+        }
+        const runs = source_height_runs(source_rows);
+        write_row_heights_with_pending_rows(pending_heights, (on_result) => {
+            if (runs.length === 0) return false;
+            on_row_fit(runs, on_result);
+            return true;
+        });
+    }, [
+        measure_row_fits,
+        on_row_fit,
         write_row_heights_with_pending_rows,
     ]);
     const fit_rows_now_ref = useRef(fit_rows_now);
     fit_rows_now_ref.current = fit_rows_now;
+    const visible_columns_key = visible_source_columns.join(',');
+    const visible_columns_key_ref = useRef(visible_columns_key);
+    visible_columns_key_ref.current = visible_columns_key;
+    /** The running Auto-fit Rows scan: Cancel and an unmount stop it. */
+    const row_fit_scan_ref = useRef<{ cancel: () => void } | null>(null);
+    /**
+     * Auto-fit Rows' measurement: every saved display row of the view,
+     * loaded a chunk of pages at a time, measured with the cells the latest
+     * render paints, and released again. Pending Rows are left as they are.
+     *
+     * Nothing is written here. It answers the saved rows' fitted heights as
+     * runs, or why there are none: Cancel or an unmount, a change to which
+     * rows or columns the grid shows (the rows it was measuring are no
+     * longer the view's), a load the loader gave up on (a reload or sheet
+     * switch), or more rows needing a custom height than a worksheet may
+     * keep. `on_progress` hears how many display rows are done.
+     */
+    const scan_row_fits = useCallback(async (
+        on_progress?: (done: number, total: number) => void,
+    ): Promise<RowFitScanOutcome> => {
+        row_fit_scan_ref.current?.cancel();
+        let cancelled = false;
+        let wake: () => void = () => {};
+        const cancel_signal = new Promise<'cancelled'>((resolve) => {
+            wake = () => resolve('cancelled');
+        });
+        const token = {
+            cancel: () => {
+                cancelled = true;
+                wake();
+            },
+        };
+        row_fit_scan_ref.current = token;
+        const rows_key = display_rows_key_ref.current;
+        const columns_key = visible_columns_key_ref.current;
+        const total = pending_projection_ref.current.rowCount;
+        const by_source = new Map<number, number | null>();
+        let custom = 0;
+        const stopped = (): RowFitScanOutcome | undefined => {
+            if (cancelled || grid_unmounted_ref.current) return { kind: 'cancelled' };
+            if (
+                display_rows_key_ref.current !== rows_key
+                || visible_columns_key_ref.current !== columns_key
+            ) return { kind: 'changed' };
+            return undefined;
+        };
+        try {
+            on_progress?.(0, total);
+            for (let row = 0; row < total;) {
+                const chunk = plan_find_chunk(row, 1, ROW_FIT_SCAN_CHUNK_PAGES);
+                const loading = load_find_chunk(chunk);
+                const release = await Promise.race([loading, cancel_signal]);
+                if (release === 'cancelled') {
+                    // Its pins go once its pages have come or the loader gave up.
+                    void loading.then((late) => {
+                        if (late) late();
+                    });
+                    return { kind: 'cancelled' };
+                }
+                const halted = stopped();
+                if (halted !== undefined) {
+                    if (release) release();
+                    return halted;
+                }
+                if (!release) return { kind: 'unloaded' };
+                let measured: ReturnType<typeof measure_row_fits>;
+                try {
+                    // The rows that just landed render before they are read,
+                    // through this render's measuring callbacks.
+                    flushSync(() => {});
+                    measured = measure_row_fits_ref.current([chunk]);
+                } finally {
+                    release();
+                }
+                if (measured === null) return { kind: 'cancelled' };
+                // Every saved row of the chunk was measured: Pending Rows,
+                // which are not fitted, are the only ones left out.
+                const projection = pending_projection_ref.current;
+                let saved_rows = 0;
+                for (let at = chunk.start; at <= chunk.end; at += 1) {
+                    const kind = projection.row_at(at)?.kind;
+                    if (kind === undefined || kind === 'source') saved_rows += 1;
+                }
+                if (measured.source_rows.length < saved_rows) return { kind: 'unloaded' };
+                for (const { source_row, height } of measured.source_rows) {
+                    const prior = by_source.get(source_row);
+                    if (prior !== undefined && prior !== null) custom -= 1;
+                    by_source.set(source_row, height);
+                    if (height !== null) custom += 1;
+                }
+                if (custom > MAX_PERSISTED_ROW_HEIGHTS) return { kind: 'limit' };
+                row = chunk.end + 1;
+                on_progress?.(row, total);
+                // A chunk already resident answers at once: let the window
+                // paint and take input (Cancel) between chunks.
+                await Promise.race([
+                    new Promise<void>((resolve) => setTimeout(resolve, 0)),
+                    cancel_signal,
+                ]);
+                const halted_after = stopped();
+                if (halted_after !== undefined) return halted_after;
+            }
+            return {
+                kind: 'fitted',
+                runs: source_height_runs(
+                    [...by_source].map(([source_row, height]) => ({ source_row, height })),
+                ),
+            };
+        } finally {
+            if (row_fit_scan_ref.current === token) row_fit_scan_ref.current = null;
+        }
+    }, [load_find_chunk, plan_find_chunk]);
+    const cancel_row_fit_scan = useCallback(() => row_fit_scan_ref.current?.cancel(), []);
+    useEffect(() => () => row_fit_scan_ref.current?.cancel(), []);
     // The strip sits where a border was when the pointer last moved. A scroll
     // moves the rows under a still pointer, so the strip would name a row
     // that is no longer there: take it down until the pointer moves again.
@@ -11889,7 +11970,8 @@ export function GridShell({
             copy_selection,
             find,
             cancel_find,
-            fit_visible_rows: () => fit_row_heights({ visible: true }),
+            scan_row_fits,
+            cancel_row_fit_scan,
         };
         grid_actions_ref.current = handle;
         return () => {
@@ -11897,11 +11979,12 @@ export function GridShell({
         };
     }, [
         cancel_find,
+        cancel_row_fit_scan,
         copy_selection,
         copy_sheet,
         find,
-        fit_row_heights,
         grid_actions_ref,
+        scan_row_fits,
         select_all,
         sheet_index,
     ]);
@@ -12541,30 +12624,6 @@ export function GridShell({
                 key: args.key,
                 code: args.rawEvent?.code ?? '',
             });
-            // Shift+Alt+H: Fit Visible Rows. After the transform shortcuts,
-            // which keep every chord they match. A held chord is one fit:
-            // its repeats would fit the rows the first fit brought on screen.
-            if (
-                on_row_fit !== undefined
-                && !is_editable_target(args.rawEvent?.target ?? null)
-                && shortcut === null
-                && is_fit_visible_rows_key({
-                    key: args.key,
-                    code: args.rawEvent?.code ?? '',
-                    shiftKey: args.shiftKey,
-                    altKey: args.altKey,
-                    ctrlKey: args.ctrlKey,
-                    metaKey: args.metaKey,
-                    isComposing: args.rawEvent?.nativeEvent?.isComposing,
-                })
-            ) {
-                args.cancel();
-                args.preventDefault();
-                // The webview's host would otherwise see the chord too.
-                args.rawEvent?.stopPropagation();
-                if (args.rawEvent?.repeat !== true) fit_row_heights({ visible: true });
-                return;
-            }
             if (
                 shortcut
                 && transform_sections
@@ -12701,13 +12760,11 @@ export function GridShell({
             display_column_for_source,
             cells_accept_edits,
             edits_held_by_pause,
-            fit_row_heights,
             inserted_rows_lock,
             merge_index,
             merges,
             on_edit_paused_gesture,
             on_open_filter,
-            on_row_fit,
             on_transform_change,
             row_count,
             select_active_display_cell,
@@ -13840,11 +13897,6 @@ export function GridShell({
                             // border fits them; nothing if they have moved.
                             ...(row_menu.can_fit_rows
                                 ? { on_auto_fit_rows: () => fit_row_heights(row_menu.display_rows) }
-                                : {}),
-                            // The rows on screen, whichever rows were clicked:
-                            // offered wherever the menu offers fitting at all.
-                            ...(on_row_fit !== undefined && !preview_mode
-                                ? { on_fit_visible_rows: () => fit_row_heights({ visible: true }) }
                                 : {}),
                             ...(only_pending ? {
                                 pending_row_count: selected_pending_ids.size,

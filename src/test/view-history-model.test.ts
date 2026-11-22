@@ -8,6 +8,7 @@ import {
 } from '../types';
 import {
     auto_fit_after_width_replay,
+    auto_fit_rows_after_replay,
     column_widths_label,
     column_widths_replay_target,
     column_widths_view_step,
@@ -499,6 +500,39 @@ describe('a row-height write as a view step', () => {
             rows: [],
             skipped: ['rows-gone'],
         });
+    });
+});
+
+describe('Auto-fit Rows as a view step', () => {
+    const requested = [{ start: 0, end: 1, height: 60 }];
+    const before = [{ start: 0, end: 1, height: null }];
+
+    it('is labelled as the toggle and says which way it went', () => {
+        expect(row_fit_view_step(SHEET, requested, before, 'on')).toMatchObject({
+            label: 'Auto-fit rows',
+            delta: { slice: 'rowHeights', autoFit: 'on' },
+        });
+        expect(row_fit_view_step(SHEET, requested, before, 'off')).toMatchObject({
+            label: 'Restore row heights',
+            delta: { slice: 'rowHeights', autoFit: 'off' },
+        });
+        expect(row_fit_view_step(SHEET, requested, before)?.delta).not.toHaveProperty('autoFit');
+        expect(row_fit_view_step(SHEET, requested, [], 'on')).toBeUndefined();
+    });
+
+    it('is on after a replay only when the toggle\'s step was walked in full towards on', () => {
+        const delta = (auto_fit?: 'on' | 'off') => {
+            const step = row_fit_view_step(SHEET, requested, before, auto_fit);
+            if (step?.delta.slice !== 'rowHeights') throw new Error('expected a row-height step');
+            return step.delta;
+        };
+        expect(auto_fit_rows_after_replay(delta('on'), 'redo', [])).toBe(true);
+        expect(auto_fit_rows_after_replay(delta('on'), 'undo', [])).toBe(false);
+        expect(auto_fit_rows_after_replay(delta('off'), 'undo', [])).toBe(true);
+        expect(auto_fit_rows_after_replay(delta('off'), 'redo', [])).toBe(false);
+        // Any other row-height step ends it, and so does one walked in part.
+        expect(auto_fit_rows_after_replay(delta(), 'redo', [])).toBe(false);
+        expect(auto_fit_rows_after_replay(delta('on'), 'redo', ['rows-gone'])).toBe(false);
     });
 });
 

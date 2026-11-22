@@ -781,11 +781,6 @@ export interface DataEditorRef {
      */
     getBounds: DataGridRef["getBounds"];
     /**
-     * Fork addition: the first row drawn and the vertical offset into it,
-     * from the render `getBounds` measures. Undefined before the grid mounts.
-     */
-    getVerticalScroll: () => ReturnType<DataGridRef["getVerticalScroll"]> | undefined;
-    /**
      * Triggers the data grid to focus itself or the correct accessibility element.
      */
     focus: DataGridRef["focus"];
@@ -4481,7 +4476,6 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 }
                 return gridRef.current?.getBounds((col ?? 0) + rowMarkerOffset, row);
             },
-            getVerticalScroll: () => gridRef.current?.getVerticalScroll(),
             focus: () => gridRef.current?.focus(),
             dismissOverlay: () => setOverlay(undefined),
             openOverlay: (cell, initialValue) => {

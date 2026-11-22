@@ -94,7 +94,10 @@ const grid_shell_mock = vi.hoisted(() => ({
         kind: 'none',
     }) as import('../webview/find-model').FindScanResult),
     cancel_find: vi.fn(),
-    fit_visible_rows: vi.fn(),
+    scan_row_fits: vi.fn(async (_on_progress?: (done: number, total: number) => void) => ({
+        kind: 'cancelled',
+    }) as import('../webview/grid-shell').RowFitScanOutcome),
+    cancel_row_fit_scan: vi.fn(),
     auto_fit_result: { 0: 120 } as Record<number, number> | null,
     pending_auto_fit_result: {} as Record<string, number>,
     latest_props: null as Record<string, unknown> | null,
@@ -212,7 +215,9 @@ vi.mock('../webview/grid-shell', () => ({
                 find: (query: string, direction: 1 | -1, inclusive: boolean) =>
                     grid_shell_mock.find(query, direction, inclusive),
                 cancel_find: () => grid_shell_mock.cancel_find(),
-                fit_visible_rows: () => grid_shell_mock.fit_visible_rows(),
+                scan_row_fits: (on_progress?: (done: number, total: number) => void) =>
+                    grid_shell_mock.scan_row_fits(on_progress),
+                cancel_row_fit_scan: () => grid_shell_mock.cancel_row_fit_scan(),
             };
             props.grid_actions_ref.current = handle;
             return () => {
@@ -1314,6 +1319,9 @@ function cleanup() {
     grid_shell_mock.find.mockReset();
     grid_shell_mock.find.mockResolvedValue({ kind: 'none' });
     grid_shell_mock.cancel_find.mockReset();
+    grid_shell_mock.scan_row_fits.mockReset();
+    grid_shell_mock.scan_row_fits.mockResolvedValue({ kind: 'cancelled' });
+    grid_shell_mock.cancel_row_fit_scan.mockReset();
     grid_shell_mock.auto_fit_result = { 0: 120 };
     grid_shell_mock.pending_auto_fit_result = {};
     grid_shell_mock.mount_edits = null;
@@ -2342,12 +2350,18 @@ describe('formatting toggle', () => {
         expect(grid_stub().getAttribute('data-show-formatting')).toBe('true');
     });
 
-    it('offers no scope menu for a single-sheet workbook', async () => {
-        // The chevron could only restate the button.
+    it('offers no all-sheets menu for a single-sheet workbook, only Auto-fit Rows', async () => {
+        // An all-sheets chevron could only restate the button. Auto-fit
+        // Columns keeps one for Auto-fit Rows, which is this sheet's own.
         await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['Only'])));
 
-        expect(document.querySelector('.toolbar-split-caret')).toBeNull();
+        const carets = Array.from(document.querySelectorAll('.toolbar-split-caret'))
+            .map((caret) => caret.getAttribute('aria-label'));
+        expect(carets).toEqual(['Auto-fit options']);
+        await open_scope_menu('Auto-fit options');
+        expect(Array.from(document.querySelectorAll('[role^="menuitem"]'), (item) => item.textContent))
+            .toEqual(['Auto-fit Rows']);
     });
 
     it('hides the Formatting button when the workbook has no formatting', async () => {
@@ -5993,7 +6007,7 @@ describe('auto-fit state', () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
         expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 120 });
@@ -6025,7 +6039,7 @@ describe('auto-fit state', () => {
     it('carries out a press held behind an owed fit that a refresh of another source overtook', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
         await answer_width_write(post_message);
         grid_shell_mock.auto_fit_result = { 0: 220 };
@@ -6070,7 +6084,7 @@ describe('auto-fit state', () => {
             },
         }));
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
         await answer_width_write(post_message);
 
@@ -6098,7 +6112,7 @@ describe('auto-fit state', () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
         await answer_width_write(post_message);
 
@@ -6132,10 +6146,10 @@ describe('auto-fit state', () => {
         }
         await dispatch_host_message(initial_snapshot_message(meta));
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         const restore = get_menu_item('Restore original widths on all 2 sheets');
         expect(restore.getAttribute('aria-disabled')).toBe('true');
         expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
@@ -6150,11 +6164,11 @@ describe('auto-fit state', () => {
         await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         const restore = get_menu_item('Restore original widths on all 2 sheets');
         expect(restore.disabled).toBe(false);
 
@@ -6169,7 +6183,7 @@ describe('auto-fit state', () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
         expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 120 });
         await answer_width_write(post_message);
@@ -6177,11 +6191,11 @@ describe('auto-fit state', () => {
         // B is still owed, so the action remains available. Repeating it must not
         // treat A's fitted widths as the restore point for a second fit.
         grid_shell_mock.auto_fit_result = { 0: 180 };
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
         expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 120 });
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Restore original widths on all 2 sheets');
         expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({});
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
@@ -6193,7 +6207,7 @@ describe('auto-fit state', () => {
         await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
 
         await dispatch_host_message(workbook_snapshot_message(make_meta(['C', 'D']), {
@@ -6212,7 +6226,7 @@ describe('auto-fit state', () => {
         await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
 
         // A same-file reload may reorder sheets. Bare queue indices from the old row
@@ -6228,7 +6242,7 @@ describe('auto-fit state', () => {
         await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
 
         grid_shell_mock.auto_fit_result = null;
@@ -6266,7 +6280,7 @@ describe('auto-fit state', () => {
             state: { transforms: [undefined, saved_transform] },
         }));
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
         await answer_width_write(post_message);
         grid_shell_mock.auto_fit_result = null;
@@ -6308,7 +6322,7 @@ describe('auto-fit state', () => {
             state: { transforms: [undefined, saved_transform] },
         }));
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
         grid_shell_mock.auto_fit_result = null;
         await click_sheet_tab('B');
@@ -6326,7 +6340,7 @@ describe('auto-fit state', () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
         await answer_width_write(post_message);
         grid_shell_mock.auto_fit_result = null;
@@ -6349,7 +6363,7 @@ describe('auto-fit state', () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
         await answer_width_write(post_message);
         grid_shell_mock.auto_fit_result = null;
@@ -6378,7 +6392,7 @@ describe('auto-fit state', () => {
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B', 'C'])));
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 3 sheets');
         await answer_width_write(post_message);
 
@@ -6416,7 +6430,7 @@ describe('auto-fit state', () => {
         }));
         await click_sheet_tab('A');
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Auto-fit columns on all 2 sheets');
         grid_shell_mock.auto_fit_result = { 0: 220 };
         await click_sheet_tab('B');
@@ -22807,7 +22821,7 @@ describe('auto-fit with Pending Columns', () => {
         await answer_width_write(post_message);
         expect(fitted()).toBe(true);
 
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Restore original widths on all 2 sheets');
 
         expect(latest_width_write(post_message).sheets).toEqual([
@@ -22823,7 +22837,7 @@ describe('auto-fit with Pending Columns', () => {
 
         // Restored again and stored, both worksheets end restored, and
         // Sheet1 still knows the width from before its fit.
-        await open_scope_menu('Auto-fit scope');
+        await open_scope_menu('Auto-fit options');
         await click_menu_item('Restore original widths on all 2 sheets');
         await answer_width_write(post_message, { stored: [undefined, { 0: 120 }] });
         expect(fitted()).toBe(false);
@@ -28581,6 +28595,193 @@ describe('view steps in history', () => {
             });
         });
 
+        describe('Auto-fit Rows', () => {
+            const fitted = [
+                { start: 0, end: 1, height: 60 },
+                { start: 2, end: 2, height: null },
+                { start: 5, end: 5, height: 42 },
+            ];
+            // What the fit replaced: rows 0-1 had none, row 2 had 50 (row 5 already held 42).
+            const replaced = [{ start: 0, end: 1, height: null }, { start: 2, end: 2, height: 50 }];
+            const rows_item = () => Array.from(
+                document.querySelectorAll<HTMLButtonElement>('[role="menuitemcheckbox"]'),
+            ).find((node) => node.textContent?.includes('Auto-fit Rows'));
+            async function choose_from_menu() {
+                await open_scope_menu('Auto-fit options');
+                const item = rows_item();
+                expect(item, 'no Auto-fit Rows item').toBeDefined();
+                await act(async () => item!.click());
+            }
+            async function menu_checked(): Promise<boolean> {
+                await open_scope_menu('Auto-fit options');
+                const checked = rows_item()!.getAttribute('aria-checked') === 'true';
+                await act(async () => {
+                    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+                });
+                expect(rows_item()).toBeUndefined();
+                return checked;
+            }
+            const toggle = choose_from_menu;
+
+            it('fits every row from its menu item, puts back what it replaced, and walks history as pressed', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                grid_shell_mock.scan_row_fits.mockResolvedValueOnce({ kind: 'fitted', runs: fitted });
+
+                await choose_from_menu();
+                expect(grid_shell_mock.scan_row_fits).toHaveBeenCalledTimes(1);
+                expect(row_height_writes(post_message).at(-1)).toMatchObject({
+                    type: 'setSourceRowHeights',
+                    sheetIndex: 0,
+                    sourceGeneration: 1,
+                    rows: fitted,
+                });
+                await answer_row_heights(post_message, { before: replaced });
+                expect(undo_labels()).toEqual(['Auto-fit rows']);
+                expect(await menu_checked()).toBe(true);
+
+                // On: choosing it again puts back what the fit replaced, measuring nothing.
+                await toggle();
+                expect(grid_shell_mock.scan_row_fits).toHaveBeenCalledTimes(1);
+                expect(row_height_writes(post_message).at(-1)).toMatchObject({ rows: replaced });
+                await answer_row_heights(post_message, {
+                    before: [{ start: 0, end: 1, height: 60 }, { start: 2, end: 2, height: null }],
+                });
+                expect(undo_labels()).toEqual(['Auto-fit rows', 'Restore row heights']);
+                expect(await menu_checked()).toBe(false);
+
+                // Undoing the restore turns it on again, ready to put back
+                // what that undo replaced, as the host answers it.
+                await undo();
+                expect(row_height_writes(post_message).at(-1)).toMatchObject({
+                    rows: [{ start: 0, end: 1, height: 60 }, { start: 2, end: 2, height: null }],
+                });
+                await answer_row_heights(post_message, { before: [{ start: 0, end: 2, height: null }] });
+                expect(await menu_checked()).toBe(true);
+                await undo();
+                await answer_row_heights(post_message, { before: [{ start: 0, end: 1, height: 60 }] });
+                expect(await menu_checked()).toBe(false);
+                await redo();
+                await answer_row_heights(post_message, { before: [{ start: 0, end: 1, height: 33 }] });
+                expect(await menu_checked()).toBe(true);
+                await toggle();
+                expect(row_height_writes(post_message).at(-1)).toMatchObject({
+                    rows: [{ start: 0, end: 1, height: 33 }],
+                });
+            });
+
+            it('turns off when another resize of the sheet\'s rows lands', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                grid_shell_mock.scan_row_fits.mockResolvedValueOnce({ kind: 'fitted', runs: fitted });
+                await toggle();
+                await answer_row_heights(post_message, { before: replaced });
+                expect(await menu_checked()).toBe(true);
+
+                await resize_rows([{ start: 1, end: 1 }], 70);
+                await answer_row_heights(post_message, { before: [{ start: 1, end: 1, height: 60 }] });
+                expect(await menu_checked()).toBe(false);
+                // Off, so choosing it fits again rather than restoring.
+                await toggle();
+                expect(grid_shell_mock.scan_row_fits).toHaveBeenCalledTimes(2);
+            });
+
+            it('turns on with nothing to put back when the fit changes nothing', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                grid_shell_mock.scan_row_fits.mockResolvedValueOnce({ kind: 'fitted', runs: fitted });
+                await toggle();
+                await answer_row_heights(post_message, { before: [] });
+                expect(undo_labels()).toEqual([]);
+                expect(await menu_checked()).toBe(true);
+                const writes = row_height_writes(post_message).length;
+                await toggle();
+                expect(row_height_writes(post_message)).toHaveLength(writes);
+                expect(await menu_checked()).toBe(false);
+            });
+
+            it('writes nothing when the scan is cancelled or stops, and says why it stopped', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                for (const kind of ['cancelled', 'changed', 'unloaded', 'limit'] as const) {
+                    grid_shell_mock.scan_row_fits.mockResolvedValueOnce({ kind });
+                    await toggle();
+                }
+                expect(row_height_writes(post_message)).toEqual([]);
+                expect(warnings(post_message)).toEqual([
+                    'Auto-fit Rows stopped because the rows or columns shown changed. No height was changed.',
+                    'Auto-fit Rows stopped because some rows could not be loaded. No height was changed.',
+                    'Too many resized rows to persist: a sheet may keep at most 10,000 custom row heights.',
+                ]);
+                expect(await menu_checked()).toBe(false);
+            });
+
+            it('clears its window and writes nothing when the scan fails', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                const console_error = vi.spyOn(console, 'error').mockImplementation(() => {});
+                grid_shell_mock.scan_row_fits.mockRejectedValueOnce(new Error('lost'));
+                await toggle();
+                console_error.mockRestore();
+                expect(document.querySelector('[role="dialog"][aria-label="Auto-fitting rows"]')).toBeNull();
+                expect(document.querySelector('.viewer')!.hasAttribute('inert')).toBe(false);
+                expect(warnings(post_message)).toEqual([
+                    'Auto-fit Rows stopped because some rows could not be loaded. No height was changed.',
+                ]);
+                expect(row_height_writes(post_message)).toEqual([]);
+                expect(await menu_checked()).toBe(false);
+            });
+
+            it('covers the window while it measures, and Cancel or Undo stops it', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                let finish!: (outcome: import('../webview/grid-shell').RowFitScanOutcome) => void;
+                grid_shell_mock.scan_row_fits.mockImplementation((on_progress) => {
+                    on_progress?.(1_200, 5_000);
+                    return new Promise((resolve) => {
+                        finish = resolve;
+                    });
+                });
+                grid_shell_mock.cancel_row_fit_scan.mockImplementation(() => finish({ kind: 'cancelled' }));
+
+                await toggle();
+                const dialog = document.querySelector('[role="dialog"][aria-label="Auto-fitting rows"]');
+                expect(dialog?.textContent).toContain('1,200 of 5,000 rows');
+                // Nothing behind it takes focus or input.
+                const viewer = document.querySelector('.viewer')!;
+                expect(viewer.hasAttribute('inert')).toBe(true);
+                expect(viewer.contains(dialog)).toBe(false);
+                const cancel = Array.from(dialog!.querySelectorAll('button'))
+                    .find((button) => button.textContent === 'Cancel')!;
+                expect(document.activeElement).toBe(cancel);
+                // A second press while it measures starts nothing.
+                await toggle();
+                expect(grid_shell_mock.scan_row_fits).toHaveBeenCalledTimes(1);
+                await act(async () => cancel.click());
+                expect(document.querySelector('[role="dialog"][aria-label="Auto-fitting rows"]')).toBeNull();
+                expect(viewer.hasAttribute('inert')).toBe(false);
+
+                await toggle();
+                expect(grid_shell_mock.scan_row_fits).toHaveBeenCalledTimes(2);
+                const cancels = grid_shell_mock.cancel_row_fit_scan.mock.calls.length;
+                await undo();
+                expect(grid_shell_mock.cancel_row_fit_scan.mock.calls.length).toBeGreaterThan(cancels);
+                expect(document.querySelector('[role="dialog"][aria-label="Auto-fitting rows"]')).toBeNull();
+                expect(row_height_writes(post_message)).toEqual([]);
+            });
+
+            it('turns off on a new source', async () => {
+                const { post_message } = await render_app();
+                await open(post_message);
+                grid_shell_mock.scan_row_fits.mockResolvedValueOnce({ kind: 'fitted', runs: fitted });
+                await toggle();
+                await answer_row_heights(post_message, { before: replaced });
+                expect(await menu_checked()).toBe(true);
+                await dispatch_host_message(initial_snapshot_message(table_meta(), { capabilities: CSV, sourceGeneration: 2 }));
+                expect(await menu_checked()).toBe(false);
+            });
+        });
+
         describe('Reset row height', () => {
             it('posts a reset, paints nothing ahead of the host, and records what was reset', async () => {
                 const { post_message } = await render_app();
@@ -28858,7 +29059,7 @@ describe('view steps in history', () => {
             const two_sheets = () => table_meta(['Sheet1', 'Sheet2']);
             const fit_is_owed_here = () => props().on_auto_fit_sample_change !== undefined;
             async function fit_all(post_message: ReturnType<typeof vi.fn>) {
-                await open_scope_menu('Auto-fit scope');
+                await open_scope_menu('Auto-fit options');
                 await click_menu_item('Auto-fit columns on all 2 sheets');
                 // The active worksheet's fit, written and answered.
                 await deliver_widths([{ 0: 120 }], two_sheets());
@@ -29235,7 +29436,7 @@ describe('view steps in history', () => {
                 const { post_message } = await render_app();
                 await open(post_message, {}, two_sheets());
                 // Nothing can be measured yet: both worksheets are owed a fit.
-                await open_scope_menu('Auto-fit scope');
+                await open_scope_menu('Auto-fit options');
                 await click_menu_item('Auto-fit columns on all 2 sheets');
                 expect(fit_is_owed_here()).toBe(true);
 
@@ -29264,7 +29465,7 @@ describe('view steps in history', () => {
 
                 // "Restore on all sheets", refused: Sheet1 is fitted again and
                 // Sheet2 is still owed its fit.
-                await open_scope_menu('Auto-fit scope');
+                await open_scope_menu('Auto-fit options');
                 await click_menu_item('Restore original widths on all 2 sheets');
                 await answer_width_write(post_message, { applied: false });
                 expect(auto_fit_on()).toBe(true);
@@ -29286,7 +29487,7 @@ describe('view steps in history', () => {
 
                 // A column drag is still being written.
                 await resize_columns([{ column: 1, width: 180 }]);
-                await open_scope_menu('Auto-fit scope');
+                await open_scope_menu('Auto-fit options');
                 await click_menu_item('Auto-fit columns on all 2 sheets');
                 expect(warnings(post_message)).toEqual(['Wait for the table view to finish updating.']);
                 expect(width_writes(post_message)).toHaveLength(1);
@@ -29300,12 +29501,12 @@ describe('view steps in history', () => {
 
                 // Fit all: Sheet1 fitted, Sheet2 owed. Then a drag still being
                 // written when "restore on all sheets" is chosen.
-                await open_scope_menu('Auto-fit scope');
+                await open_scope_menu('Auto-fit options');
                 await click_menu_item('Auto-fit columns on all 2 sheets');
                 await answer_width_write(post_message, { stored: [{ 1: 180 }] });
                 await resize_columns([{ column: 2, width: 150 }]);
                 post_message.mockClear();
-                await open_scope_menu('Auto-fit scope');
+                await open_scope_menu('Auto-fit options');
                 await click_menu_item('Restore original widths on all 2 sheets');
                 expect(warnings(post_message)).toEqual(['Wait for the table view to finish updating.']);
                 expect(width_writes(post_message)).toEqual([]);
@@ -29325,7 +29526,7 @@ describe('view steps in history', () => {
                 grid_shell_mock.auto_fit_result = { 0: 120 };
                 const { post_message } = await render_app();
                 await open(post_message, { state: { columnWidths: [{ 0: 80 }, undefined] } }, two_sheets());
-                await open_scope_menu('Auto-fit scope');
+                await open_scope_menu('Auto-fit options');
                 await click_menu_item('Auto-fit columns on all 2 sheets');
                 await deliver_widths([{ 0: 120 }, undefined], two_sheets());
                 await answer_width_write(post_message, { stored: [{ 0: 80 }] });
@@ -29335,7 +29536,7 @@ describe('view steps in history', () => {
                 await answer_width_write(post_message, { stored: [{ 0: 120 }] });
                 post_message.mockClear();
 
-                await open_scope_menu('Auto-fit scope');
+                await open_scope_menu('Auto-fit options');
                 await click_menu_item('Restore original widths on all 2 sheets');
 
                 expect(width_writes(post_message)).toEqual([expect.objectContaining({
@@ -29375,13 +29576,13 @@ describe('view steps in history', () => {
                 grid_shell_mock.auto_fit_result = { 0: 120 };
                 const { post_message } = await render_app();
                 await open(post_message, { state: { columnWidths: [{ 0: 80 }, { 0: 70 }] } }, two_sheets());
-                await open_scope_menu('Auto-fit scope');
+                await open_scope_menu('Auto-fit options');
                 await click_menu_item('Auto-fit columns on all 2 sheets');
                 await answer_width_write(post_message, { stored: [{ 0: 80 }] });
                 await click_button('Sheet2');
                 await vi.waitFor(() => expect(width_writes(post_message)).toHaveLength(2));
                 await answer_width_write(post_message, { stored: [{ 0: 80 }, { 0: 70 }] });
-                await open_scope_menu('Auto-fit scope');
+                await open_scope_menu('Auto-fit options');
                 await click_menu_item('Restore original widths on all 2 sheets');
                 await answer_width_write(post_message, { stored: [{ 0: 120 }, { 0: 120 }] });
                 expect(undo_labels().at(-1)).toBe('Restore column widths');

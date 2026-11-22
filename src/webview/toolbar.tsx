@@ -26,22 +26,32 @@ export interface ToolbarFocusHandle {
  * The all-sheets actions behind a toggle's chevron.
  *
  * One rule holds across every control that has one: the button means this sheet, and
- * the menu holds only all-sheets actions, each naming its action *and* its scope. A
+ * the menu holds all-sheets actions, each naming its action *and* its scope. A
  * lone "Restore original widths" under an "…all 3 sheets" item is unreadable — the
  * reader has to guess whether the omission means "this sheet" or "same as above". And
  * because each of these buttons already toggles in both directions, "this sheet" needs
  * no menu entry: pressing the button is that entry.
  *
- * Absent for a single-sheet workbook, where the chevron could only restate the button.
+ * One exception: Auto-fit Columns' menu also holds Auto-fit Rows, a toggle of its
+ * own for this sheet, shown checked while it is on, and so on every workbook.
+ *
+ * Otherwise absent for a single-sheet workbook, where the chevron could only restate
+ * the button.
  */
 export interface ToolbarScopeMenu {
-    items: readonly {
-        label: string;
-        on_click: () => void;
-        /** Greyed when the action would change nothing — every sheet is already there. */
-        disabled?: boolean;
-    }[];
-    /** Names the menu for assistive tech, e.g. "Auto-fit scope". */
+    items: readonly (
+        | {
+            kind?: 'item';
+            label: string;
+            on_click: () => void;
+            /** Greyed when the action would change nothing — every sheet is already there. */
+            disabled?: boolean;
+            /** A toggle's item: checked while it is on. */
+            checked?: boolean;
+        }
+        | { kind: 'separator' }
+    )[];
+    /** Names the menu for assistive tech, e.g. "Auto-fit options". */
     aria_label: string;
 }
 
@@ -83,8 +93,6 @@ export interface ToolbarProps {
     auto_fit_disabled?: boolean;
     auto_fit_disabled_reason?: string;
     auto_fit_scope_menu?: ToolbarScopeMenu;
-    /** Fit Visible Rows: fit the rows on screen to their content. */
-    on_fit_visible_rows: () => void;
     /** The file can be edited: Save is offered, and Diff and Discard with it. */
     editable: boolean;
     diff_mode: boolean;
@@ -177,9 +185,8 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
         ),
     ].filter(Boolean);
 
-    // Actions that change how the active worksheet is displayed. Columns,
-    // Auto-fit and Fit Visible Rows are unconditional, so this group never
-    // empties.
+    // Actions that change how the active worksheet is displayed. Columns and
+    // Auto-fit are unconditional, so this group never empties.
     const worksheet_actions = [
         props.show_formatting_button && (
             <ToolbarButton
@@ -242,13 +249,6 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             disabled={props.auto_fit_disabled}
             menu_key="auto-fit"
             scope_menu={props.auto_fit_scope_menu}
-        />,
-        <ToolbarButton
-            key="fit-visible-rows"
-            label="Fit Visible Rows"
-            tooltip_text="Fit the rows on screen to their content (Shift+Alt+H)."
-            onClick={props.on_fit_visible_rows}
-            on_action_complete={props.on_action_complete}
         />,
     ].filter(Boolean);
 
@@ -426,9 +426,10 @@ function ToolbarButton({
     };
     const close_menu = () => scope_context?.set_open(null);
 
-    const menu_items: MenuItem[] = (scope_menu?.items ?? []).map((item) => ({
+    const menu_items: MenuItem[] = (scope_menu?.items ?? []).map((item): MenuItem => item.kind === 'separator' ? item : ({
         label: item.label,
         disabled: item.disabled,
+        ...(item.checked === undefined ? {} : { checked: item.checked }),
         on_click: (event) => {
             close_menu();
             // `detail` counts clicks: non-zero is a real press, zero is a keyboard
