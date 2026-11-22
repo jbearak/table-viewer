@@ -28,6 +28,7 @@ import React, {
     useMemo,
     useLayoutEffect,
 } from 'react';
+import { createPortal, flushSync } from 'react-dom';
 import {
     EMPTY_TRANSFORM,
     MAX_PERSISTED_HIDDEN_ROWS,
@@ -175,7 +176,8 @@ import {
     type WorkbookSnapshotCompare,
     type WorkbookSnapshotIdentity,
 } from '../viewer-snapshot';
-import { Toolbar, type ToolbarFocusHandle } from './toolbar';
+import { RowFitProgress } from './row-fit-progress';
+import { Toolbar, type ToolbarFocusHandle, type ToolbarScopeMenu } from './toolbar';
 import { FilterPopover } from './filter-popover';
 import {
     order_relevant_dirty_keys,
@@ -214,6 +216,7 @@ import {
     type PendingHostGesture,
     type CellFocus,
     type PendingRowFocus,
+    type RowFitScanOutcome,
     type SavedRowFocus,
 } from './grid-shell';
 import {
@@ -305,6 +308,7 @@ import {
     ordered_skips,
     overtaken_transform_step,
     row_heights_replay_target,
+    auto_fit_rows_after_replay,
     row_fit_view_step,
     row_heights_view_step,
     transform_replay_target,
@@ -455,6 +459,13 @@ interface GestureAdmissionOptions {
 }
 
 /** A view step's replay in flight: the entry it moves when the host answers. */
+/** Auto-fit Rows stopped because the rows it was measuring are no longer the view's. */
+const AUTO_FIT_ROWS_CHANGED_MESSAGE =
+    'Auto-fit Rows stopped because the rows or columns shown changed. No height was changed.';
+/** Auto-fit Rows stopped because a page of rows could not be loaded. */
+const AUTO_FIT_ROWS_UNLOADED_MESSAGE =
+    'Auto-fit Rows stopped because some rows could not be loaded. No height was changed.';
+
 interface ViewReplay {
     readonly entry: HistoryEntry;
     readonly direction: HistoryDirection;
@@ -654,6 +665,10 @@ interface PendingRowResize {
      * step pairs them with the rows the host says the write changed.
      */
     readonly fitRuns?: readonly SourceRowHeightRun[];
+    /** The fit was Auto-fit Rows turning on, or its restore turning it off. */
+    readonly autoFitRows?: AutoFitChange;
+    /** A replay that leaves Auto-fit Rows on once applied (`auto_fit_rows_after_replay`). */
+    readonly autoFitRowsAfterReplay?: boolean;
     /** The Pending Rows half of a mixed resize, committed or dropped with the answer. */
     readonly finish?: (applied: boolean) => void;
 }
@@ -1287,6 +1302,32 @@ export function App(): React.JSX.Element {
         });
     }, []);
     const [auto_fit_active, set_auto_fit_active] = useState<boolean[]>([]);
+    /**
+     * Auto-fit Rows, per sheet: the inverse of the write that turned it on,
+     * which is what its restore writes back (the host's `changedRows`), or
+     * undefined while it is off. Like Auto-fit Columns it lasts only as long
+     * as this window's view of the source, and any other row-height write on
+     * the sheet ends it.
+     */
+    const [row_auto_fit, set_row_auto_fit] =
+        useState<readonly (readonly SourceRowHeightRun[] | undefined)[]>([]);
+    const row_auto_fit_ref = useRef<readonly (readonly SourceRowHeightRun[] | undefined)[]>([]);
+    const set_row_auto_fit_for_sheet = useCallback((
+        sheet_index: number,
+        inverse: readonly SourceRowHeightRun[] | undefined,
+    ) => {
+        if (inverse === undefined && row_auto_fit_ref.current[sheet_index] === undefined) return;
+        const next = [...row_auto_fit_ref.current];
+        next[sheet_index] = inverse;
+        row_auto_fit_ref.current = next;
+        set_row_auto_fit(next);
+    }, []);
+    /** The running Auto-fit Rows scan's progress; null while none runs. */
+    const [row_fit_scan, set_row_fit_scan] =
+        useState<{ readonly done: number; readonly total: number } | null>(null);
+    const row_fit_scan_running_ref = useRef(false);
+    /** Auto-fit Rows cannot start (no column shows, or sorting and filtering are pending). */
+    const auto_fit_rows_start_blocked_ref = useRef(false);
     /**
      * Whether history has something to redo, and how many snapshots have been
      * applied: what a fit still owed to a worksheet waits on, read into state
@@ -4332,6 +4373,9 @@ export function App(): React.JSX.Element {
     }, [clear_save_verdict, release_edit_session]);
 
     const discard_edit_session = useCallback(() => {
+        // A command the window takes during an Auto-fit Rows scan ends the
+        // scan, which writes nothing: what it measured may no longer hold.
+        grid_actions_ref.current?.cancel_row_fit_scan();
         if (!csv_edit_session_id) return;
         // Nothing this window holds is sent, and a Discard is recorded: it
         // waits for the reopen like every other change.
@@ -5098,6 +5142,16 @@ export function App(): React.JSX.Element {
                 if (pending.replay !== undefined && pending.worksheet !== undefined) {
                     const { replay, worksheet } = pending;
                     if (applied) {
+                        // Walking history leaves Auto-fit Rows as the step's
+                        // gesture left it, ready to put back what this replay
+                        // replaced.
+                        const index = worksheet_target_index(meta_ref.current?.sheets ?? [], worksheet);
+                        if (index !== undefined) {
+                            set_row_auto_fit_for_sheet(
+                                index,
+                                pending.autoFitRowsAfterReplay === true ? msg.changedRows ?? [] : undefined,
+                            );
+                        }
                         land_view_replay(replay, worksheet, false);
                     } else if (!msg.applied && msg.refused === 'limit') {
                         // A rule, not a race, and one this window cannot
@@ -5143,7 +5197,17 @@ export function App(): React.JSX.Element {
                                 },
                                 pending.fitRuns,
                                 msg.changedRows ?? [],
+                                pending.autoFitRows,
                             ));
+                            // On: its restore writes back what the fit
+                            // replaced. A fit that changed nothing turns it
+                            // on all the same, with nothing to put back.
+                            if (pending.autoFitRows !== undefined) {
+                                set_row_auto_fit_for_sheet(
+                                    index,
+                                    pending.autoFitRows === 'on' ? msg.changedRows ?? [] : undefined,
+                                );
+                            }
                         }
                     } else if (applied && msg.change !== undefined && pending.worksheet !== undefined) {
                         // The step is what the host says the write changed:
@@ -6428,6 +6492,15 @@ export function App(): React.JSX.Element {
                         ...changed_mapping_indices,
                         ...header_changed,
                     ]);
+                    // Auto-fit Rows' inverse is keyed by source row, which a
+                    // sort or filter keeps. A new source (a Save, a reload,
+                    // a header promotion's) or a changed header row may not.
+                    if (source_changed) {
+                        row_auto_fit_ref.current = [];
+                        set_row_auto_fit([]);
+                    } else {
+                        header_changed.forEach((index) => set_row_auto_fit_for_sheet(index, undefined));
+                    }
                     if (source_changed) {
                         auto_fit_active_ref.current = [];
                         auto_fit_snapshot_ref.current = [];
@@ -8892,6 +8965,7 @@ export function App(): React.JSX.Element {
                 worksheet,
                 gesture: false,
                 replay,
+                autoFitRowsAfterReplay: auto_fit_rows_after_replay(delta, direction, target.skipped),
             });
             mark_row_height_request(index, request_id);
             sync_view_request_pending();
@@ -9504,6 +9578,9 @@ export function App(): React.JSX.Element {
      * `epoch` it was given when the key was pressed.
      */
     const press_history = useCallback((direction: HistoryDirection, handed_on?: HistoryPress) => {
+        // A command the window takes during an Auto-fit Rows scan ends the
+        // scan, which writes nothing: what it measured may no longer hold.
+        grid_actions_ref.current?.cancel_row_fit_scan();
         if (handed_on === undefined) perf_mark('tv:press', { direction });
         if (handed_on !== undefined) {
             void run_history_command(handed_on);
@@ -9905,6 +9982,9 @@ export function App(): React.JSX.Element {
         // A press that was held for typed keys and is sent on by the drain.
         handed_on?: HistoryPress,
     ) => {
+        // A command the window takes during an Auto-fit Rows scan ends the
+        // scan, which writes nothing: what it measured may no longer hold.
+        grid_actions_ref.current?.cancel_row_fit_scan();
         // Before the text-field branch: Find opens from a cell editor too,
         // rather than copying the field.
         if (command === 'find') {
@@ -12010,6 +12090,9 @@ export function App(): React.JSX.Element {
     ]);
 
     const request_save_or_remain_dirty = useCallback(() => {
+        // A command the window takes during an Auto-fit Rows scan ends the
+        // scan, which writes nothing: what it measured may no longer hold.
+        grid_actions_ref.current?.cancel_row_fit_scan();
         // See `begin_save_operation`: nothing is saved from a window that must
         // be reopened, or across a header change.
         if (reopen_required_ref.current) {
@@ -13374,6 +13457,9 @@ export function App(): React.JSX.Element {
             // clamps (`row-resize-model`), so this is the case that should not arise
             // rather than one that does.
             const clamped = height === null ? null : clamp_row_height(height);
+            // A resize, a reset or a grown row is not a height Auto-fit Rows
+            // would put back.
+            set_row_auto_fit_for_sheet(active_sheet_index, undefined);
             // Every write is answered, so a refused one never leaves its
             // height painted. Only a gesture, or a write Pending Rows wait on,
             // is also waited for here: the row a committed edit grows holds
@@ -13473,7 +13559,7 @@ export function App(): React.JSX.Element {
                 return next;
             });
         },
-        [active_sheet_index, mark_row_height_request, sync_view_request_pending]
+        [active_sheet_index, mark_row_height_request, set_row_auto_fit_for_sheet, sync_view_request_pending]
     );
     /**
      * A row auto-fit on the active sheet: each source row with its own height
@@ -13482,12 +13568,20 @@ export function App(): React.JSX.Element {
      * knows; a permutation that moves afterwards cannot misplace them. It
      * paints nothing ahead of the host, like a reset: the delivery does.
      */
-    const handle_row_fit = useCallback(
+    const post_row_fit = useCallback(
         (
+            sheet_index: number,
             runs: readonly SourceRowHeightRun[],
-            on_result?: (applied: boolean) => void,
+            options: {
+                readonly auto_fit_rows?: AutoFitChange;
+                /** The source the rows were measured on; the current one by default. */
+                readonly source_generation?: number;
+                readonly on_result?: (applied: boolean) => void;
+            } = {},
         ) => {
-            const sheet = meta_ref.current?.sheets[active_sheet_index];
+            const { auto_fit_rows, on_result } = options;
+            const source_generation = options.source_generation ?? source_generation_ref.current;
+            const sheet = meta_ref.current?.sheets[sheet_index];
             if (runs.length === 0 || sheet === undefined) {
                 on_result?.(false);
                 return;
@@ -13498,28 +13592,40 @@ export function App(): React.JSX.Element {
                 ++row_resize_request_seq_ref.current,
             ].join(':');
             pending_row_resize_requests_ref.current.set(request_id, {
-                sourceGeneration: source_generation_ref.current,
+                sourceGeneration: source_generation,
                 worksheet: {
-                    sheetIndex: active_sheet_index,
+                    sheetIndex: sheet_index,
                     sheetName: sheet.name,
                     ...(sheet.worksheetId === undefined ? {} : { worksheetId: sheet.worksheetId }),
                 },
                 gesture: true,
                 fitRuns: runs,
+                ...(auto_fit_rows === undefined ? {} : { autoFitRows: auto_fit_rows }),
                 ...(on_result === undefined ? {} : { finish: on_result }),
             });
-            mark_row_height_request(active_sheet_index, request_id);
+            mark_row_height_request(sheet_index, request_id);
             sync_view_request_pending();
             host_bridge.postMessage({
                 type: 'setSourceRowHeights',
                 requestId: request_id,
-                sheetIndex: active_sheet_index,
+                sheetIndex: sheet_index,
                 sheetName: sheet.name,
-                sourceGeneration: source_generation_ref.current,
+                sourceGeneration: source_generation,
                 rows: runs,
             });
         },
-        [active_sheet_index, mark_row_height_request, sync_view_request_pending]
+        [mark_row_height_request, sync_view_request_pending]
+    );
+    const handle_row_fit = useCallback(
+        (
+            runs: readonly SourceRowHeightRun[],
+            on_result?: (applied: boolean) => void,
+        ) => {
+            // Another fit's heights are not the ones Auto-fit Rows would put back.
+            set_row_auto_fit_for_sheet(active_sheet_index, undefined);
+            post_row_fit(active_sheet_index, runs, on_result === undefined ? {} : { on_result });
+        },
+        [active_sheet_index, post_row_fit, set_row_auto_fit_for_sheet]
     );
 
     /**
@@ -13698,6 +13804,80 @@ export function App(): React.JSX.Element {
         restore_widths_for_sheets,
         size_gesture_may_start,
     ]);
+
+    /**
+     * Auto-fit Rows, from the Auto-fit Columns menu: fit every row of the
+     * active sheet's view, or put back the heights the fit
+     * replaced. A size gesture like Auto-fit Columns, behind the same gate,
+     * which it passes again once the measuring is done and before anything
+     * is written: the window may have started something meanwhile.
+     */
+    const handle_toggle_auto_fit_rows = useCallback(() => {
+        if (row_fit_scan_running_ref.current) return;
+        const sheet_index = active_sheet_index;
+        const inverse = row_auto_fit_ref.current[sheet_index];
+        if (inverse !== undefined) {
+            if (!size_gesture_may_start()) return;
+            // Nothing to put back: the fit changed nothing.
+            if (inverse.length === 0) {
+                set_row_auto_fit_for_sheet(sheet_index, undefined);
+                return;
+            }
+            post_row_fit(sheet_index, inverse, { auto_fit_rows: 'off' });
+            return;
+        }
+        if (auto_fit_rows_start_blocked_ref.current) return;
+        if (!size_gesture_may_start()) return;
+        const actions = grid_actions_ref.current;
+        if (actions?.sheet_index !== sheet_index) return;
+        const source_generation = source_generation_ref.current;
+        row_fit_scan_running_ref.current = true;
+        set_row_fit_scan({ done: 0, total: 0 });
+        void actions.scan_row_fits((done, total) => set_row_fit_scan({ done, total }))
+            .catch((error: unknown): RowFitScanOutcome => {
+                console.error('Auto-fit Rows could not read the rows', error);
+                return { kind: 'unloaded' };
+            })
+            .then((outcome) => {
+                row_fit_scan_running_ref.current = false;
+                // The window stops being inert before the grid takes focus back.
+                flushSync(() => set_row_fit_scan(null));
+                grid_focus_ref.current?.focus();
+                if (outcome.kind === 'cancelled') return;
+                if (outcome.kind === 'changed') {
+                    show_warning(AUTO_FIT_ROWS_CHANGED_MESSAGE);
+                    return;
+                }
+                if (outcome.kind === 'unloaded') {
+                    show_warning(AUTO_FIT_ROWS_UNLOADED_MESSAGE);
+                    return;
+                }
+                if (outcome.kind !== 'fitted') {
+                    show_warning(ROW_HEIGHT_LIMIT_WARNING);
+                    return;
+                }
+                // Measured on a source this window no longer shows.
+                if (
+                    source_generation_ref.current !== source_generation
+                    || grid_actions_ref.current?.sheet_index !== sheet_index
+                ) return;
+                if (!size_gesture_may_start()) return;
+                if (outcome.runs.length === 0) {
+                    set_row_auto_fit_for_sheet(sheet_index, []);
+                    return;
+                }
+                post_row_fit(sheet_index, outcome.runs, { auto_fit_rows: 'on', source_generation });
+            });
+    }, [
+        active_sheet_index,
+        post_row_fit,
+        set_row_auto_fit_for_sheet,
+        show_warning,
+        size_gesture_may_start,
+    ]);
+    const cancel_row_fit_scan = useCallback(() => {
+        grid_actions_ref.current?.cancel_row_fit_scan();
+    }, []);
 
     const auto_fit_waits_for_transform = useCallback((sheet_index: number) => {
         if (
@@ -14463,31 +14643,46 @@ export function App(): React.JSX.Element {
     const no_visible_columns =
         current_column_projection.visible_to_source.length === 0;
 
-    const auto_fit_scope_menu = has_multiple_sheets
-        ? {
-            aria_label: 'Auto-fit scope',
-            items: [
-                {
-                    label: `Auto-fit columns on ${all_sheets}`,
-                    disabled: no_visible_columns
-                        || transform_pending
-                        || sheet_indices.every((index) => auto_fit_active[index]),
-                    on_click: handle_auto_fit_all_sheets,
-                },
-                {
-                    // Dead until something has been fitted — restoring widths nobody
-                    // changed is the definition of an action that does nothing. A fit
-                    // that is only *owed* counts: it will apply as each sheet is
-                    // opened, and calling it off is the one thing this item can do
-                    // that nothing else can.
-                    label: `Restore original widths on ${all_sheets}`,
-                    disabled: pending_auto_fit_sheets.size === 0
-                        && !sheet_indices.some((index) => auto_fit_active[index]),
-                    on_click: handle_restore_widths_all_sheets,
-                },
-            ],
-        }
-        : undefined;
+    // Auto-fit Rows rides in the Auto-fit Columns menu, on every workbook.
+    // It needs a column to measure only to turn on: putting heights back
+    // measures nothing.
+    const auto_fit_rows_on = row_auto_fit[active_sheet_index] !== undefined;
+    const auto_fit_rows_start_blocked = no_visible_columns || transform_pending;
+    auto_fit_rows_start_blocked_ref.current = auto_fit_rows_start_blocked;
+    const auto_fit_scope_menu: ToolbarScopeMenu = {
+        aria_label: 'Auto-fit options',
+        items: [
+            ...(has_multiple_sheets
+                ? [
+                    {
+                        label: `Auto-fit columns on ${all_sheets}`,
+                        disabled: no_visible_columns
+                            || transform_pending
+                            || sheet_indices.every((index) => auto_fit_active[index]),
+                        on_click: handle_auto_fit_all_sheets,
+                    },
+                    {
+                        // Dead until something has been fitted — restoring widths nobody
+                        // changed is the definition of an action that does nothing. A fit
+                        // that is only *owed* counts: it will apply as each sheet is
+                        // opened, and calling it off is the one thing this item can do
+                        // that nothing else can.
+                        label: `Restore original widths on ${all_sheets}`,
+                        disabled: pending_auto_fit_sheets.size === 0
+                            && !sheet_indices.some((index) => auto_fit_active[index]),
+                        on_click: handle_restore_widths_all_sheets,
+                    },
+                    { kind: 'separator' as const },
+                ]
+                : []),
+            {
+                label: 'Auto-fit Rows',
+                checked: auto_fit_rows_on,
+                disabled: !auto_fit_rows_on && auto_fit_rows_start_blocked,
+                on_click: handle_toggle_auto_fit_rows,
+            },
+        ],
+    };
 
     /**
      * The one reason set that hides or disables transform affordances, shared by
@@ -15110,7 +15305,12 @@ export function App(): React.JSX.Element {
     );
 
     return (
-        <div className={`viewer ${effective_vertical_tabs ? 'vertical-tabs' : ''}`}>
+        <div
+            className={`viewer ${effective_vertical_tabs ? 'vertical-tabs' : ''}`}
+            // While Auto-fit Rows measures, nothing behind its progress window
+            // takes focus or input: not a focus a menu hands back, not Tab.
+            {...(row_fit_scan ? { inert: '' } : {})}
+        >
             <Toolbar
                 ref={toolbar_focus_ref}
                 on_action_complete={focus_grid_after_toolbar_action}
@@ -15789,6 +15989,14 @@ export function App(): React.JSX.Element {
                             .item(menu_sheet_index)?.focus();
                     }}
                 />
+            )}
+            {row_fit_scan && createPortal(
+                <RowFitProgress
+                    done={row_fit_scan.done}
+                    total={row_fit_scan.total}
+                    on_cancel={cancel_row_fit_scan}
+                />,
+                document.body,
             )}
         </div>
     );

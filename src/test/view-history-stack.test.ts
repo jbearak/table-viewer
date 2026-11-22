@@ -388,6 +388,23 @@ describe('a size step in the stack', () => {
         expect(view_step_change(state.undoStack[0].action)!.delta).toEqual(expected);
     });
 
+    it('keeps Auto-fit Rows\' on and off through Undo and Redo', () => {
+        for (const auto_fit of ['on', 'off'] as const) {
+            const step = action_of(row_fit_view_step(
+                SHEET,
+                [{ start: 0, end: 1, height: 60 }],
+                [{ start: 0, end: 1, height: null }],
+                auto_fit,
+            ));
+            let state = recorded(empty_history_stack(), step);
+            expect(state.undoStack[0].action.label)
+                .toBe(auto_fit === 'on' ? 'Auto-fit rows' : 'Restore row heights');
+            expect(view_step_change(state.undoStack[0].action)!.delta).toMatchObject({ autoFit: auto_fit });
+            state = moved(state, 'undo');
+            expect(view_step_change(state.redoStack[0].action)!.delta).toMatchObject({ autoFit: auto_fit });
+        }
+    });
+
     it('holds one width change per worksheet when a gesture spans worksheets', () => {
         const action = restore_all_action();
         const state = recorded(empty_history_stack(), action);

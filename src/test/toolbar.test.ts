@@ -872,6 +872,32 @@ describe('Toolbar scope menus', () => {
         );
     }
 
+    it('passes a toggle item\'s check, and a separator, through to the menu', () => {
+        const on_click = vi.fn();
+        render_toolbar({
+            auto_fit_scope_menu: {
+                aria_label: 'Auto-fit options',
+                items: [
+                    ...scope_menu().items,
+                    { kind: 'separator' },
+                    { label: 'Auto-fit Rows', checked: true, on_click },
+                ],
+            },
+        });
+        open_caret();
+
+        expect(menu_labels()).toEqual([
+            'Auto-fit columns on all 3 sheets',
+            'Restore original widths on all 3 sheets',
+        ]);
+        expect(document.querySelectorAll('.context-menu-divider[role="separator"]')).toHaveLength(1);
+        const toggle = document.querySelector<HTMLButtonElement>('[role="menuitemcheckbox"]')!;
+        expect(toggle.getAttribute('aria-checked')).toBe('true');
+        expect(toggle.textContent).toContain('Auto-fit Rows');
+        act(() => toggle.click());
+        expect(on_click).toHaveBeenCalledTimes(1);
+    });
+
     it('adds no in-flow box to the action row when a menu opens', () => {
         // The row is right-aligned and gap-spaced, so any child that generates a box
         // widens it and slides every control left — by the 6px gap alone, even for a

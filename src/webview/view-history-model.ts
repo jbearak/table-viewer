@@ -110,6 +110,8 @@ export interface RowHeightsViewDelta {
      * `null`: no custom height.
      */
     readonly before: readonly SourceRowHeightRun[];
+    /** Set when the gesture turned Auto-fit Rows on or off for the worksheet. */
+    readonly autoFit?: AutoFitChange;
 }
 
 /** The Header Row of one worksheet, and the hidden rows that changed with it. */
@@ -511,18 +513,40 @@ export function row_fit_view_step(
     worksheet: WorksheetTarget,
     requested: readonly SourceRowHeightRun[],
     before: readonly SourceRowHeightRun[],
+    // Set when the write was Auto-fit Rows itself: its fit, or its restore.
+    auto_fit?: AutoFitChange,
 ): ViewStep | undefined {
     const rows = run_row_count(before);
     if (rows === 0) return undefined;
     return {
-        label: rows === 1 ? 'Auto-fit row height' : `Auto-fit ${rows} row heights`,
+        label: auto_fit === 'on'
+            ? 'Auto-fit rows'
+            : auto_fit === 'off'
+            ? 'Restore row heights'
+            : rows === 1 ? 'Auto-fit row height' : `Auto-fit ${rows} row heights`,
         delta: {
             worksheet,
             slice: 'rowHeights',
             after: runs_within(requested, before),
             before: before.map(({ start, end, height }) => ({ start, end, height })),
+            ...(auto_fit === undefined ? {} : { autoFit: auto_fit }),
         },
     };
+}
+
+/**
+ * Whether Auto-fit Rows is on for a worksheet after a row-height step's
+ * replay applied: on only when the step was the toggle, the replay left none
+ * of it out, and it leaves the toggle on (redo of a fit, undo of a restore).
+ * Every other row-height write ends it, as a resize does.
+ */
+export function auto_fit_rows_after_replay(
+    delta: RowHeightsViewDelta,
+    direction: ViewDirection,
+    skipped: readonly ViewSkipReason[],
+): boolean {
+    if (delta.autoFit === undefined || skipped.length > 0) return false;
+    return (direction === 'redo') === (delta.autoFit === 'on');
 }
 
 /**

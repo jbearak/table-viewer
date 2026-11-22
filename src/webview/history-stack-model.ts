@@ -3281,6 +3281,9 @@ function own_view_history_delta(
             // An auto-fit's step carries each changed row's own height.
             after: Array.isArray(after) ? runs(after) : size(after as number | null),
             before: runs(delta.before),
+            ...(delta.autoFit === undefined
+                ? {}
+                : { autoFit: delta.autoFit === 'on' ? 'on' as const : 'off' as const }),
         });
     }
     const schema = owner.own_string(String(delta.schema));

@@ -8341,6 +8341,119 @@ describe('GridShell row auto-fit', () => {
             rows: compact(rows),
         }));
 
+    describe('Auto-fit Rows', () => {
+        const rows = { 0: 'x'.repeat(30), 1: 'x'.repeat(30), 2: 'two\nlines', 3: 'x'.repeat(30) };
+        const actions = () => {
+            const grid_actions_ref: { current: import('../webview/grid-shell').GridActionsHandle | null } = { current: null };
+            return grid_actions_ref;
+        };
+
+        it('measures every row, loading them first, and writes nothing itself', async () => {
+            const grid_actions_ref = actions();
+            const on_row_fit = await render_fit(rows, { grid_actions_ref });
+            const progress: [number, number][] = [];
+            let outcome: import('../webview/grid-shell').RowFitScanOutcome | undefined;
+            await act(async () => {
+                outcome = await grid_actions_ref.current!.scan_row_fits((done, total) => progress.push([done, total]));
+            });
+            expect(outcome).toEqual({
+                kind: 'fitted',
+                runs: [
+                    { start: 0, end: 1, height: 62 },
+                    { start: 2, end: 2, height: 44 },
+                    { start: 3, end: 3, height: 62 },
+                ],
+            });
+            expect(grid_mock.ensure_rows_loaded).toHaveBeenCalledWith(0, 3);
+            expect(grid_mock.unpin_rows).toHaveBeenCalled();
+            expect(progress.at(0)).toEqual([0, 4]);
+            expect(progress.at(-1)).toEqual([4, 4]);
+            expect(on_row_fit).not.toHaveBeenCalled();
+        });
+
+        it('answers cancelled at once when cancelled mid-load, and lets the load\'s pins go when it settles', async () => {
+            const grid_actions_ref = actions();
+            await render_fit(rows, { grid_actions_ref });
+            let land!: (loaded: boolean) => void;
+            grid_mock.ensure_rows_loaded.mockImplementation(() => new Promise<boolean>((resolve) => {
+                land = resolve;
+            }));
+            let outcome: import('../webview/grid-shell').RowFitScanOutcome | undefined;
+            let scanning!: Promise<void>;
+            act(() => {
+                scanning = grid_actions_ref.current!.scan_row_fits().then((answer) => {
+                    outcome = answer;
+                });
+            });
+            await act(async () => {
+                grid_actions_ref.current!.cancel_row_fit_scan();
+                await scanning;
+            });
+            expect(outcome).toEqual({ kind: 'cancelled' });
+            expect(grid_mock.unpin_rows).not.toHaveBeenCalled();
+            await act(async () => land(true));
+            expect(grid_mock.unpin_rows).toHaveBeenCalled();
+        });
+
+        it('is cancelled by Cmd+S, which the window takes before the grid', async () => {
+            const grid_actions_ref = actions();
+            const on_save_paused = vi.fn();
+            await render_fit(rows, {
+                grid_actions_ref,
+                edits_paused: true,
+                on_save_paused,
+                on_request_edit_session: vi.fn(),
+            });
+            grid_mock.ensure_rows_loaded.mockImplementation(() => new Promise<boolean>(() => {}));
+            let outcome: import('../webview/grid-shell').RowFitScanOutcome | undefined;
+            act(() => {
+                void grid_actions_ref.current!.scan_row_fits().then((answer) => {
+                    outcome = answer;
+                });
+            });
+            await act(async () => {
+                window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true }));
+            });
+            expect(on_save_paused).toHaveBeenCalledOnce();
+            expect(outcome).toEqual({ kind: 'cancelled' });
+        });
+
+        it('stops when the rows it measures change under it, or one cannot be read', async () => {
+            const grid_actions_ref = actions();
+            await render_fit(rows, { grid_actions_ref });
+            let land!: (loaded: boolean) => void;
+            grid_mock.ensure_rows_loaded.mockImplementationOnce(() => new Promise<boolean>((resolve) => {
+                land = resolve;
+            }));
+            let outcome: import('../webview/grid-shell').RowFitScanOutcome | undefined;
+            act(() => {
+                void grid_actions_ref.current!.scan_row_fits().then((answer) => {
+                    outcome = answer;
+                });
+            });
+            await act(async () => {
+                // A column shown: the rows measured so far are not the view's.
+                root!.render(React.createElement(fit_shell, {
+                    ...fit_props,
+                    column_projection: {
+                        visible_to_source: [0, 1, 2],
+                        source_to_visible: [0, 1, 2],
+                        hidden_count: 0,
+                    },
+                }));
+            });
+            await act(async () => land(true));
+            await vi.waitFor(() => expect(outcome).toEqual({ kind: 'changed' }));
+
+            grid_mock.get_row.mockImplementation(((row: number) =>
+                row === 1 ? undefined : cells('x')) as any);
+            await act(async () => {
+                outcome = await grid_actions_ref.current!.scan_row_fits();
+            });
+            expect(outcome).toEqual({ kind: 'unloaded' });
+        });
+    });
+
     it('fits the row to the lines its cells paint, written by source row', async () => {
         // Display row 1 is source row 3.
         grid_mock.source_row_for_display = (display_row: number) => [2, 3, 0, 1][display_row];
