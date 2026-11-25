@@ -12,7 +12,7 @@ What you do while reviewing a table — sorting, filtering, hiding columns, resi
 
 Open an `.xlsx`, `.xls`, `.csv`, `.tsv`, `.dta`, or `.parquet` file and it opens in Table Viewer, which registers as VS Code's default editor for those types. `.xlsx`, CSV, and TSV files are editable; legacy `.xls` workbooks, `.dta` datasets, and `.parquet` files are read-only. If another viewer is registered for one of these formats, VS Code may ask which editor you'd like to use.
 
-To see a CSV or TSV file as plain text, click **Open in Text Editor** in the table's title bar. The text editor's title bar then has two Table Viewer buttons: the **preview icon** opens a read-only table beside the text that scrolls with it, and the **table icon** opens the editable table again. To change which editor a file type opens in, right-click a tab, choose **Reopen Editor With…**, then **Configure Default Editor**.
+To see a CSV or TSV file as plain text, click **Open in Text Editor** in the table's title bar, or right-click its tab and choose **Reopen Editor With… → Text Editor**. The text editor's title bar then has two Table Viewer buttons: the **preview icon** opens a read-only table beside the text that scrolls with it, and the **table icon** opens the editable table again. To change which editor a file type opens in, right-click a tab, choose **Reopen Editor With…**, then **Configure Default Editor**.
 
 The [VS Code setup and 10-minute try-out guide](docs/setup-guide-vscode-extension.md) walks through two sample workbooks, including what happens to your saved view when a file is replaced.
 
