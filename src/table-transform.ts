@@ -174,6 +174,28 @@ export async function compute_transform(
             survivor_count = 0;
             let first_group = hidden_rows.size === 0 && only_changed === undefined;
             for (const [column_index, filters] of filter_groups) {
+                const overrides = cell_overrides?.get(column_index);
+                // Operands are checked against the saved column, as a restore or a
+                // replay will check them, so a rule unsaved values let in is not
+                // one those refuse. The unsaved values only decide which rows match.
+                if (
+                    overrides !== undefined
+                    && filters.some((filter) => NUMERIC_FILTER_OPERATORS.has(filter.operator))
+                ) {
+                    const saved = await acquire_transform_column(
+                        source,
+                        sheet_index,
+                        column_index,
+                        sheet.rowCount,
+                        false,
+                        column_cache,
+                        is_cancelled,
+                        sort_instrumentation,
+                    );
+                    const saved_numeric = saved.columnKind === 'numeric';
+                    release_transform_column(saved, sort_instrumentation);
+                    validate_filter_operands(filters, saved_numeric);
+                }
                 const column = await acquire_transform_column(
                     source,
                     sheet_index,
@@ -183,16 +205,16 @@ export async function compute_transform(
                     column_cache,
                     is_cancelled,
                     sort_instrumentation,
-                    cell_overrides?.get(column_index),
+                    overrides,
                 );
                 try {
                     const compiled = compile_filter_group(
                         filters,
                         column.columnKind === 'numeric',
-                        // Strict over saved values. Over unsaved ones, an edit that
-                        // turns a text column numeric must not refuse the filter
-                        // the person already has.
-                        cell_overrides?.has(column_index) !== true,
+                        // Strict over saved values. Over unsaved ones, checked above
+                        // against the saved column: an edit that turns a text column
+                        // numeric must not refuse the filter the person already has.
+                        overrides === undefined,
                         sort_instrumentation,
                         await present_special_filter_identities(
                             column,

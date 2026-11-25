@@ -4116,8 +4116,14 @@ export function App(): React.JSX.Element {
         pending_transform_states_ref.current[sheet_index] = state;
         pending_transform_origins_ref.current[sheet_index] = origin;
         // A request that read unsaved values, replaced by the next request on its
-        // sheet (a Cancel, say), is superseded: its read values are not taken.
-        if (previous_request_id !== undefined) {
+        // sheet (a Cancel, say), is superseded: its read values are not taken. One
+        // the view action owns is still installed when answered, so it keeps them.
+        const owner = view_action_ref.current;
+        if (
+            previous_request_id !== undefined
+            && !(owner?.action.sheetIndex === sheet_index
+                && view_action_owns(owner.action, previous_request_id))
+        ) {
             transform_request_read_values_ref.current.delete(previous_request_id);
         }
         // An XLSX formula has no result the
@@ -7419,6 +7425,9 @@ export function App(): React.JSX.Element {
                 const action_owned = pending_action !== undefined
                     && pending_action.action.sheetIndex === msg.sheetIndex
                     && view_action_owns(pending_action.action, msg.requestId);
+                const request_read_values =
+                    transform_request_read_values_ref.current.get(msg.requestId);
+                transform_request_read_values_ref.current.delete(msg.requestId);
                 if (!answers_newest && !action_owned) return;
                 if (!answers_newest && msg.view.basis.generation <= generation_ref.current) return;
                 const view = msg.view;
@@ -7487,9 +7496,6 @@ export function App(): React.JSX.Element {
                 // host answers a restore or cancel whose rules it already holds with a
                 // no-op ack, which read no values, so what the view reflects stays.
                 const recomputed = view.basis.generation !== generation_ref.current;
-                const request_read_values =
-                    transform_request_read_values_ref.current.get(msg.requestId);
-                transform_request_read_values_ref.current.delete(msg.requestId);
                 if (view.basis.generation !== generation_ref.current) {
                     // An action's request folded the open editor when it was made,
                     // and cells have offered none since, like any view request's.

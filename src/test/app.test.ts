@@ -18062,6 +18062,32 @@ describe('stale-view banner', () => {
         expect(banner()).toBeNull();
     });
 
+    it('keeps what a replaced choice read when its install lands and the newer one is refused', async () => {
+        const post_message = await session_sorted_on_column_0();
+        await commit_edits(dirty('0:0'));
+        const click = (name: string) => act(async () => (
+            container!.querySelector(name) as HTMLButtonElement
+        ).click());
+        await click('.stub-header-transform');
+        const first = latest_transform_request(post_message);
+        await click('.stub-shortcut-transform');
+        const second = latest_transform_request(post_message);
+        expect(second.requestId).not.toBe(first.requestId);
+
+        // The replaced sort still installs, by the edit it read.
+        await acknowledge_transform(first, 3);
+        await dispatch_host_message({
+            type: 'transformRefused',
+            sheetIndex: second.sheetIndex,
+            requestId: second.requestId,
+            intent: second.intent,
+            reason: 'Refused.',
+            terminal: true,
+        });
+        expect(grid_stub().getAttribute('data-generation')).toBe('3');
+        expect(banner()).toBeNull();
+    });
+
     it('reads unsaved values for a hide, which installs the sort again', async () => {
         const post_message = await session_sorted_on_column_0();
         await commit_edits(dirty('0:0'));
