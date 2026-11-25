@@ -15,7 +15,7 @@
     "compare",
     "git"
   ],
-  "version": "0.20.1",
+  "version": "0.20.0",
   "publisher": "jbearak",
   "icon": "media/icon-128.png",
   "license": "GPL-3.0",
@@ -266,7 +266,7 @@
     "desktop:package:win": "npm run desktop:prepackage && node scripts/package-desktop-windows.mjs",
     "test:desktop-smoke": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts",
     "test:desktop-smoke:relaunch": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts desktop/test-smoke/state-relaunch.spec.ts desktop/test-smoke/structure-relaunch.spec.ts",
-    "test:desktop-smoke:unfocused": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts desktop/test-smoke/structure-smoke.spec.ts desktop/test-smoke/edit-without-mode.spec.ts desktop/test-smoke/append-row-lifecycle.spec.ts desktop/test-smoke/append-relaunch-close.spec.ts desktop/test-smoke/composer-shutdown.spec.ts desktop/test-smoke/update-window.spec.ts desktop/test-smoke/undo-redo-release.spec.ts desktop/test-smoke/undo-redo-header.spec.ts desktop/test-smoke/undo-redo-header-step.spec.ts desktop/test-smoke/undo-redo-view.spec.ts desktop/test-smoke/undo-redo-size.spec.ts desktop/test-smoke/undo-redo-held-border.spec.ts desktop/test-smoke/undo-redo-back-to-back.spec.ts desktop/test-smoke/paste-append-rows.spec.ts desktop/test-smoke/reapply-stale-view.spec.ts desktop/test-smoke/save-shows-saved-values.spec.ts desktop/test-smoke/auto-fit-rows.spec.ts",
+    "test:desktop-smoke:unfocused": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts desktop/test-smoke/structure-smoke.spec.ts desktop/test-smoke/edit-without-mode.spec.ts desktop/test-smoke/append-row-lifecycle.spec.ts desktop/test-smoke/append-relaunch-close.spec.ts desktop/test-smoke/composer-shutdown.spec.ts desktop/test-smoke/update-window.spec.ts desktop/test-smoke/undo-redo-release.spec.ts desktop/test-smoke/undo-redo-header.spec.ts desktop/test-smoke/undo-redo-header-step.spec.ts desktop/test-smoke/undo-redo-view.spec.ts desktop/test-smoke/undo-redo-size.spec.ts desktop/test-smoke/undo-redo-held-border.spec.ts desktop/test-smoke/undo-redo-back-to-back.spec.ts desktop/test-smoke/paste-append-rows.spec.ts desktop/test-smoke/reapply-stale-view.spec.ts desktop/test-smoke/save-shows-saved-values.spec.ts desktop/test-smoke/auto-fit-rows.spec.ts desktop/test-smoke/main-evaluate-busy.spec.ts",
     "test:desktop-perf": "npm run desktop:prepackage && playwright test --config=desktop/test-performance/playwright.config.ts",
     "perf:compare": "node benchmarks/grid/compare.mjs",
     "perf:ooxml": "node benchmarks/ooxml/run.mjs --compare benchmarks/ooxml/baselines/main-string-scanner.json",

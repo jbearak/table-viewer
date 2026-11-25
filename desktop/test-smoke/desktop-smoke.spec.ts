@@ -12,6 +12,7 @@ import * as path from 'path';
 import { test, expect, _electron as electron } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
 import {
+    answer_main_evaluates_after_main_yields,
     click_menu_item as click_menu,
     close_preferences,
     main_js,
@@ -170,14 +171,14 @@ test.beforeAll(async () => {
     fs.mkdirSync(user_data_dir);
     editable_csv = path.join(smoke_root, 'basic.csv');
     fs.copyFileSync(csv_fixture, editable_csv);
-    app = await electron.launch({
+    app = answer_main_evaluates_after_main_yields(await electron.launch({
         args: [main_js, editable_csv, xlsx_fixture],
         cwd: repo_dir,
         env: {
             ...process.env,
             TABLE_VIEWER_USER_DATA_DIR: user_data_dir,
         },
-    });
+    }));
 });
 
 // One viewer window per file on the command line, each with its grid painted.
