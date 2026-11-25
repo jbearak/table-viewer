@@ -25,3 +25,6 @@ test-results/**
 # the one the marketplace listing uses and must stay in the .vsix.
 build/**
 design_handoff_app_icon/**
+# The Marketplace README is README.vscode.md (see `--readme-path` in the package
+# script); vsce packs it as extension/readme.md, which would clash with this one.
+README.md

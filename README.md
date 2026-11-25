@@ -8,8 +8,6 @@ Table Viewer supports editing modern Excel (`.xlsx`), `.csv`, and `.tsv` files, 
 
 What you do while reviewing a table — sorting, filtering, hiding columns, resizing, highlighting cells — is stored alongside the file rather than inside it, so the file on disk is untouched and your sorts, filters, and highlights are still there the next time you open it, even if the file was regenerated in the meantime. Table Viewer also reloads on its own when the file changes on disk.
 
-<img src="docs/images/app-column-header-menu-hero.png" alt="The Roast column's context menu in Table Viewer, with sorting, filtering, copying, and hiding actions" width="751">
-
 Follow the [setup and 10-minute try-out guide](docs/setup-guide.md) to choose the standalone app or VS Code extension, install it, try two sample workbooks, and see Table Viewer preserve a saved view when a file is replaced.
 
 ## Installation
@@ -31,24 +29,24 @@ The desktop app requires an Apple Silicon Mac (M1 or newer) running macOS 12 or 
 brew install --cask jbearak/table-viewer/table-viewer
 ```
 
-Or install it from a disk image:
-
-1. Open the [latest release](https://github.com/jbearak/table-viewer/releases/latest) and expand **Assets**.
-2. Download `table-viewer-<version>-arm64.dmg`. This is the macOS installer; the similarly named `.zip` and `latest-mac.yml` files are used by the automatic updater.
-3. Open the DMG and drag **Table Viewer** into **Applications**, then launch it from Applications or Spotlight.
+Or download `table-viewer-<version>-arm64.dmg` from the [latest release](https://github.com/jbearak/table-viewer/releases/latest), open it, and drag **Table Viewer** into **Applications**.
 
 ### Windows desktop app
 
-The desktop app requires Windows 10 or 11. Open the [latest release](https://github.com/jbearak/table-viewer/releases/latest), expand **Assets**, and download one of these four files. The no-install version is a single `.exe` that runs directly without an installer:
+The desktop app requires Windows 10 or 11. From the [latest release](https://github.com/jbearak/table-viewer/releases/latest), download `table-viewer-<version>-x64-setup.exe` for most PCs, or `table-viewer-<version>-arm64-setup.exe` for an Arm-based PC such as a Snapdragon laptop. Each also comes as a no-install `-portable.exe`. Windows builds are unsigned, so SmartScreen may show **Windows protected your PC** the first time; click **More info**, confirm that the app is Table Viewer, then click **Run anyway**.
 
-| Your PC | Standard installer | No-install version |
-|---|---|---|
-| Most Intel or AMD PCs | `table-viewer-<version>-x64-setup.exe` | `table-viewer-<version>-x64-portable.exe` |
-| Arm-based PCs, such as Snapdragon laptops | `table-viewer-<version>-arm64-setup.exe` | `table-viewer-<version>-arm64-portable.exe` |
+The [desktop setup guide](docs/setup-guide-desktop-app.md) explains which file to pick, how updates work, how to verify a download, and what to do when something goes wrong.
 
-Choose the `setup.exe` unless you specifically need the no-install version. The setup wizard creates a Start Menu entry, registers **Open with** handlers, and defaults to a per-user installation that does not require administrator access. The no-install `.exe` creates no Start Menu or uninstaller entry, although it does store your Table Viewer settings and register per-user **Open with** handlers. If you are unsure which architecture you have, open **Settings → System → About** and check **System type**.
+## Features
 
-Run the downloaded `.exe`. Windows builds are unsigned, so SmartScreen may show **Windows protected your PC** the first time; click **More info**, confirm that the app is Table Viewer, then click **Run anyway**. The `.blockmap` and `.yml` assets on the release are updater metadata, not installers. The `.sha256` files are optional checksums for verifying downloads.
+The [feature reference](docs/features.md) describes everything Table Viewer does, in both the desktop app and the VS Code extension. Some topics have a page of their own:
+
+- [Undo and redo](docs/undo-and-redo.md)
+- [Filtering](docs/filtering.md), with each filter condition and how to use it
+- [Inserting, deleting, and moving rows and columns](docs/rows-and-columns.md)
+- [Excel formula support](docs/excel-formulas.md)
+- [Parquet files](docs/parquet-files.md)
+- [VS Code extension settings](README.vscode.md#settings)
 
 ## Why
 
@@ -72,201 +70,9 @@ It also removes other friction from reading tables:
 
 **Limitations:** Table Viewer is *not* a full spreadsheet editor. You can't create files or sheets. You can insert, delete, and move rows and columns in `.xlsx`, CSV, and TSV worksheets, but an `.xlsx` sheet with an Excel table, a chart, notes, a PivotTable, or an array formula can't be restructured; see [Inserting, deleting, and moving rows and columns](docs/rows-and-columns.md). Formula editing and recalculation intentionally support a documented subset of Excel; see [Excel formula support](docs/excel-formulas.md).
 
-## Features
-
-**Viewing**
-- Opens `.xlsx`, `.xls`, `.csv`, `.tsv`, `.dta`, and `.parquet` files
-- Multi-sheet workbooks with horizontal or vertical tab orientation
-- Merged cells with colspan/rowspan rendering
-- `.xlsx` rich-text runs and whole-cell bold, italic, underline, and strikethrough styling
-- `.xlsx` hyperlinks, with destination information on hover and open/copy actions for external links
-- Conservatively detects Excel column-name rows, with remembered per-sheet controls for promoting the first non-hidden row or a chosen row, including column names inherited from simple two-row vertical merges
-- Uses an active Excel Header Row as a logical table for formulas such as `=SUM([Revenue])` and `=[@Revenue]*2`, without requiring an Excel table region
-- Hover briefly over horizontally truncated or vertically clipped cell content to see the displayed value in a tooltip
-- Hover over a Stata or Parquet column header to see the variable label, type, and value label set, and, for Parquet, the null count and range of values from the file's footer
-- Stable, multi-column sorting with missing values kept last
-- Per-column filters for text, comparisons, ranges, distinct-value checklists, and empty/non-empty values
-
-**Auto-refresh**
-- Watches the file on disk and reloads automatically when it changes
-- Preserves column widths, row heights, scroll position, and active sheet across reloads
-
-**Layout**
-- Drag column and row borders to resize
-- Double-click a column border to auto-fit to content
-- Double-click a row border to fit the row's height to its content, wrapping long text at the column widths. If the row is selected, every selected row is fitted, each to its own height. Rows that are not loaded yet (scrolled far out of view) are skipped with a message
-- Right-click a row number and choose **Auto-fit row height** to do the same for the row, or for the selected rows
-- Select contiguous or discontiguous rows by their row numbers, then drag a selected row boundary to resize them together
-- Select multiple columns, then drag a border of one of them to resize them together. A click on a border that does not move it changes nothing
-- **Auto-fit Columns** in the toolbar fits every column of the sheet to its content; pressed again, it puts back the widths the fit replaced. Its menu does either on all sheets: a sheet you have not opened yet is fitted when you open it
-- **Auto-fit Rows**, in the same menu, fits every row of the sheet to its content, each to its own height, and is checked while it is on; chosen again, it puts back the heights the fit replaced. It reads every row first, which on a large sheet takes a while: a progress window says how far it has got, and **Cancel** (or `Escape`) stops it with nothing changed. It fits the rows the view shows: rows a filter or a hide leaves out, and rows you have added and not yet saved, keep their heights. It writes nothing if more than 10,000 rows would need a custom height. Like Auto-fit Columns it lasts until the file is reloaded or saved, and another resize of the sheet's rows turns it off
-- Right-click a row number and choose **Reset row height** to put the row, or the selected rows, back to the default height
-- Use the searchable **Columns** menu to show, hide, restore, or hide all columns
-- Column visibility and sizing are persisted per file and sheet
-
-**Formatting toggle**
-- Switch between formatted and raw cell values with one click
-- Useful for inspecting the exact number behind a formatted display
-
-**Table diffs**
-- Compare two Excel, Stata, Parquet, CSV, or TSV files in a read-only table view — neither file is modified
-- See added, deleted, moved, and changed rows, with before-and-after values highlighted within changed cells
-- Aligns inserted, deleted, and moved rows so one structural change does not make every later row look modified
-- An optional **Only changed rows** toggle hides rows that are the same in both files
-- In VS Code, click a changed table file in the Source Control or Timeline view to open the diff — unstaged, staged, and committed changes alike
-- In the desktop app, choose **File → Compare Files…** or reopen a comparison from the Recent list
-- Files stored in Git LFS but not yet downloaded are detected on either side of a comparison, with a banner naming the object's real size and a button to fetch it
-
-**CSV/TSV modes**
-- **Open as Table**: opens the file in its own viewer tab
-- **Open Preview to the Side**: split view with the source editor on the left and the table on the right, with synchronized scrolling between them
-- Large files are indexed once and parsed in windows as the grid requests them
-- Files beyond the configured row limit show a banner for changing the limit or loading every row for that view
-
-**Selection and copy**
-- Click, drag, or shift-click to select cells
-- Arrow keys to navigate. In read-only files (`.xls`, `.dta`, Parquet, comparisons, previews), `h`/`j`/`k`/`l` navigate too; in a file you can edit, typing a letter starts editing the selected cell
-- `Ctrl+C` / `Cmd+C` to copy selected cells as tab-separated text
-- Right-click context menus for copying, selecting or hiding rows and columns, and choosing an Excel row as the header
-
-**Cell highlights**
-- Apply a semantic highlight color to selected cells as a positional annotation, identified by worksheet, source row, and source column
-- Highlights survive saves, reloads, file-content replacement, column-name changes, and first-row-header changes
-- Highlights at temporarily unavailable rows, columns, or worksheets remain stored and reappear when those positions return
-- Clear selection removes highlights only from the selected cells; Clear all removes every highlight for the file, including dormant highlights in unavailable rows, columns, or worksheets
-- Only these explicit user clear actions remove highlights
-- Unlike highlights, Sort and Filter are schema-bound view transforms and can be invalidated when their column schema is no longer meaningful
-
-**Undo and redo**
-- `Ctrl+Z` / `Cmd+Z` undoes your last change; `Ctrl+Y` or `Cmd+Shift+Z` redoes it. In the desktop app the **Edit** menu carries both, named after what they would apply — "Undo Paste", "Redo Clear all highlights" — and reading plain "Undo" or "Redo" when there is nothing left
-- Covers cell edits (values, line breaks, styling, hyperlinks), inserted, deleted, and moved rows and columns, cell highlights, and discards. **Discard** can be undone in full
-- One history per workbook, in the order you worked: undoing a change on another worksheet switches to it. The cursor moves to what changed and the region flashes briefly, so an undo you cannot see is still findable
-- Undo reaches back past a save, except a save that inserted, deleted, or moved rows or columns. The file then has unsaved changes again, and re-saving is yours to do
-- Undoing everything and then redoing it works: redo is still there after the last unsaved change is undone and **Save** goes quiet
-- Choosing, changing, and turning off an Excel header row are steps too: **Use row as header**, the **Header Row** button and its all-sheets items, and an **Unhide all** that turns a chosen header row off (one step for the rows and the header row together). The Edit menu names them: "Undo Use row 3 as header", "Redo Turn off header row". Like the other view steps they need no editing session and never make the file unsaved, and the header row the file remembers follows what you undo and redo. A new header row change clears redo, like any new step
-- Undo and redo go in order, so a header row change is undone before the edits made under the header row that came before it. Each of those edits is then undone and redone in the cell or row it was made in
-- Undo or redo pressed while the window is still finishing something it started (an undo or redo on its way, a sort, filter, or header row change being applied, a save, claiming or letting go of the editing session) waits and is carried out once that has finished, so holding the key down walks through the steps, each once, in order. Further presses in the same direction while one waits count as one, and Undo then Redo pressed meanwhile cancel each other. If what it waited for did not go through, you are told why and the waiting press is dropped; **Cancel** on a sort or filter in progress drops it too. If the window is still busy after five seconds, the press says so ("… did not run because the file is still being saved. Try again."). While a press waits, a new edit, **Save**, or view change is not started and you are asked to wait, so nothing slips in under it
-- A header row step the file can't take yet stays where it is and says why. This happens after a save. Undoing a saved edit leaves its cell unsaved again, and a header row step that would make that row the header row, stop it being the header row, or hide it then says "Save first". Save, and the same undo or redo goes through
-- A header row change that this window's history does not hold, such as one made in another window on the same file, is not a step here. After one, two kinds of change wait while the header row is somewhere they can't follow: a cell typed in a row that has since become the header row (or in a header row that is now an ordinary row), and a row change that names rows now in or above the header. Undo or redo then says which header row to use, and the change is still there when you get back to it
-- If a change is hidden by an active filter or a hidden column, it is still applied and you are told where it went rather than left watching a still cursor
-- Sorts, filters, hidden rows (and **Unhide all**), and hidden and shown columns are steps too, in the same history as your edits: "Undo Sort", "Redo Hide 3 rows". They change the view and not the file, so undoing one never makes the file unsaved, and the view the file remembers follows what you undo and redo
-- Column widths and row heights are steps as well: a dragged border (one step for the drag, with every selected column or row it resized), a double-click fit of columns or rows, **Auto-fit Columns** and **Auto-fit Rows** on and off, and **Reset row height**. The Edit menu names them: "Undo Resize column", "Redo Resize 3 rows", "Undo Auto-fit 3 row heights", "Undo Auto-fit columns", "Undo Restore column widths", "Undo Auto-fit rows", "Undo Restore row heights", "Undo Reset row height". Like the other view steps they need no editing session and never make the file unsaved, and the sizes the file remembers follow what you undo and redo. Undoing or redoing **Auto-fit Columns** or **Auto-fit Rows** leaves the toggle as that press left it
-- Three sizes are not steps: the height a row grows to when you commit a cell with several lines, the sizes of rows and columns you have added and not yet saved, and an **Auto-fit Columns** press that changes no width. Undoing a drag made while Auto-fit was on puts the dragged columns back to their fitted widths and leaves Auto-fit off
-- **Auto-fit columns on all sheets** fits each other sheet when you open it, as a step of its own. That fit waits while there is something to redo, so opening a sheet never discards a redo, and it waits for an open cell editor to close. Undoing an **Auto-fit Columns** step calls off the fits still waiting
-- A view step that no longer fits is skipped with a message and does not hold up the steps under it: a sort or filter whose columns have since changed, hidden rows that are gone or now sit above the header row, resized columns or rows that are no longer in the worksheet, row heights that would take a worksheet past 10,000 rows with a custom height, or a header row step whose row or worksheet is gone
-- A sort, a filter (opening its editor included), a hide, a column change, or a resize first commits the cell you are typing in, so that edit sits under it in history. If the text can't be committed as it stands, the change is not started and you are asked to finish or cancel the edit first
-- View changes are applied one at a time. While a sort, filter, hide, or column change you made is still being applied, or one is being undone or redone, cells do not open for editing and another view change is not started. While one is being undone or redone, a new view change does nothing, and an undo or redo pressed meanwhile waits for it. While one you made is still being applied, you are asked to try again in three cases: the one in the way is a column change, the one in the way is on another worksheet, or the new one is a column change during a sort, filter, or hide. In every other case the control is unavailable, or does nothing, until the first has finished. One exception: a second sort or filter on the same worksheet replaces a sort, filter, or hide you made that is still being applied there, and one step is recorded for what ends up applied
-- A resize is a view change in this sense. While one is being stored, another resize, **Auto-fit Columns**, or a sort, filter, or hide is not started and you are asked to wait, and so is **Save**. A resize is not started during a save either. A resize the app could not store springs back; for a column width you are told why
-- `Ctrl+Z` / `Cmd+Z` **inside** an open cell editor is ordinary text undo for what you are typing, and does not touch the workbook's history
-- History lives with the window: closing the tab, window, or app clears it. Unsaved edits are cached and survive that, so a reopened file can show edits that can no longer be undone
-
-**Find** — `Cmd+F` (macOS) or `Ctrl+F` (Windows, Linux), or **Edit → Find…** in the desktop app
-- Typing selects the first cell, from the selected cell onward, whose displayed text contains what you typed; case does not matter
-- `Enter` / `Shift+Enter` (or the arrow buttons) step to the next and previous match, wrapping around the sheet; `Escape` closes the bar and leaves the match selected
-- Searches the active worksheet as you see it: visible columns, rows left after filters, in the current sort order, including unsaved edits. The text matched is what each cell shows, so the **Formatting** toggle decides between formatted and raw values
-- Large files are read page by page until the next match turns up; the bar says **No matches** only after checking every cell
-
-**Sorting and filtering** — the [filtering guide](docs/filtering.md) explains each filter condition and how to use them
-- Right-click a column header to sort ascending or descending, add a secondary sort, or open that column's filter editor
-- Sorted headers show direction arrows and multi-column priority badges; toolbar chips let you flip, reorder, remove, enable, disable, or edit active rules
-- Keyboard shortcuts operate on the focused column: `Shift+Alt+A` / `D` sort, `Shift+Alt+F` filters, `Shift+Alt+X` clears its filter, and `Shift+Alt+0` / `9` clear all sorts or filters
-- Multiple enabled filters are combined, while disabled filters remain available for later reuse
-- Sorts and filters are view-only, persist per file and sheet, and are recomputed after reloads
-- Sorting and filtering use raw cell values rather than formatted display text
-- Empty values sort last in both directions
-- When a sorted, filtered, or column-hidden sheet contains merged cells, the view temporarily shows them unmerged. Only the original top-left cell contains the merged value; covered cells remain empty. Restoring the natural rows and all columns restores the exact merge layout.
-- Sorting, filtering, and row-hiding work alongside editing in both directions: you can sort or filter with unsaved changes, and you can edit a sheet that is already sorted or filtered. Either way the displayed order stays put while changes are unsaved, so rows stay where you left them, and the view reflects your new values once you save and the file reloads. While one tab has unsaved changes to a file, it is the tab that can change that file's view; another tab showing the same file can change it again once those changes are saved or discarded. They are unavailable in synchronized preview panes, which always show rows in source order. Column visibility remains available in every mode
-
-**Editing (`.xlsx`, CSV, and TSV)**
-- There is no edit mode to switch on. Double-click a cell, press **Enter**, or just start typing to edit it. **Delete** clears the selected cells, and paste writes into them
-- The toolbar's **Save** button lights up when there are unsaved changes. **Discard** appears beside it and drops them all, and **Diff** shows each edited cell's old value next to its new one
-- Edit, copy, cut, and recalculate `.xlsx` formulas within the [documented Excel formula support](docs/excel-formulas.md)
-- Use the **+** button at the bottom of the row numbers to add rows. Pasting a block past the last row adds the whole block's row count as one undoable change
-- **Enter** confirms and moves to the cell below. When there is no next row, it appends one and continues in the same column. **Tab** moves row-major and appends from the final visible column of the final row
-- Pending rows keep their intended physical row numbers and use the existing added-row tint. Right-click a pending row number and choose **Delete row** to remove it; right-click a pending removal to cancel it
-- Right-click a row number or column header to insert, delete, restore, or move rows and columns. Right-clicking a cell offers Insert and Delete for its row and column too. `Alt+Shift+Arrow` moves selected rows or columns, and you can drag selected rows or column headers. New rows and columns are tinted green, deleted ones red, and moved ones purple until you save. The Save button's tooltip says what Save will do, and a notice under the grid warns only when it will break formulas or change a formula's range in a way Excel might not. Details, including what an `.xlsx` sheet must not contain, are in [Inserting, deleting, and moving rows and columns](docs/rows-and-columns.md)
-- Active sorts and filters leave pending rows in a separate section at the end. **Hide row** remains visible for those rows but is disabled
-- **Shift+Enter** or **Alt+Enter** inserts a line break within a cell
-- **Escape** cancels the current edit
-- **Ctrl+S** / **Cmd+S**, or the **Save** button, saves all changes back to the file
-- Edit `.xlsx` cell styling with Markdown syntax: `**bold**`, `*italic*`, `<u>underline</u>`, and `~~strikethrough~~`
-- Add, edit, or remove `.xlsx` hyperlinks to a web address or a place in the workbook from the cell context menu
-- An `.xlsx` append adds worksheet rows. It does not enlarge an OOXML Excel Table region. Inserting, deleting, and moving rows and columns is refused on a sheet with an Excel table
-- Edited cells are highlighted with a different background color until saved
-- Rows keep their position while you have unsaved changes, so a cell stays under your cursor while you work on it. You can start editing with a sort or filter already applied, and add or change one while editing; neither moves the rows you are working on. A row you edit so that it no longer matches an active filter stays visible until you save; the view reflects your new values once the file is saved and reloaded
-- Unsaved changes are cached, so you won't lose your work if you close the tab, window, or app
-- If a cell changes in the file while you have a pending edit for that cell, an informational banner appears and the cell gets a neutral blue highlight. **Review changes** shows the original file value, the current file value, and your pending edit. You can go to the cell, dismiss the notice without changing anything, or discard that pending edit individually
-
-**Diffing**
-
-In the desktop app, choose **File → Compare Files…** and select an original (before) file and a modified (after) file. The comparison is read-only and neither file is changed.
-
-In VS Code, click a changed Excel, Stata, Parquet, CSV, or TSV file in the Source Control or Timeline view and Table Viewer opens the comparison.
-
-Added rows are banded in green, deleted rows in red, and moved rows in purple. Within a changed row, each changed cell shows its original value in red and the new value in green. The green and red follow your theme's Git decoration colors, so they match the added and deleted files in the Source Control view.
-
-## Usage
-
-**Excel files** open automatically in Table Viewer when you open an `.xlsx` or `.xls` file. Modern `.xlsx` workbooks are editable; legacy `.xls` workbooks are read-only. When the first row strongly resembles column names, it is promoted automatically. Use the per-sheet **Header Row** toolbar toggle to override the detected choice; enabling it promotes the first non-hidden row.
-
-To choose a different header row, right-click its row number and select **Use row as header**. Table Viewer hides the rows above it, preserves any hidden rows below it, and promotes the chosen row to column names in one step. The action is available only when no sort or enabled filter is changing the displayed row order. Header choices and hidden rows are remembered for that file and worksheet.
-
-You can change the header row while you have unsaved changes. Your edits stay in their cells, deleted rows stay deleted, and appended rows stay at the end. Table Viewer won't change it while the row that would become the header, or the row that is the header now, has unsaved edits, while new columns are unsaved, or while inserted or moved rows would end up under hidden rows. In those cases it says so, and nothing changes until you save.
-
-**CSV/TSV files** open automatically in Table Viewer as an editable table. An **"Open in Text Editor"** button in the title bar takes you to VS Code's built-in text editor. When a CSV/TSV file is open there, two Table Viewer buttons appear in the editor title bar:
-
-- The **preview icon** opens a read-only synced side-by-side preview (alt-click opens it in the same tab)
-- The **table icon** opens the file again as an editable table view
-
-**Stata files** open automatically as single read-only tables. Hovering over a column header shows the variable's label, storage type, display format, and value label set.
-
-**Parquet files** open automatically as single read-only tables, with dates, times, time zones, and 64-bit integers shown as they are stored. Columns Table Viewer cannot show, such as lists and structs, are left out with a warning naming them. See [Parquet files](docs/parquet-files.md).
-
-## Default editor behavior
-
-Table Viewer registers as the default editor for Excel (`.xlsx`, `.xls`), Stata (`.dta`), Parquet (`.parquet`), CSV, and TSV files. `.xlsx`, CSV, and TSV files are editable; legacy `.xls` workbooks, `.dta` datasets, and `.parquet` files are read-only. If another viewer is registered for one of these formats, VS Code may ask which editor you'd like to use.
-
-To open a CSV/TSV file as plain text, use **Open in Text Editor** in the table editor's title bar, or right-click its tab and choose **Reopen Editor With… → Text Editor**. To change the default for a file type, choose **Configure Default Editor** from the same editor picker.
-
-## Settings
-
-Table Viewer uses VS Code's editor font (`editor.fontFamily` and `editor.fontSize`) by default. Set `tableViewer.fontFamily` to a CSS font-family value such as `Hack, monospace`, or `tableViewer.fontSize` to a pixel size, if you want tables to differ from the editor.
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `tableViewer.fontFamily` | empty (editor font) | Font family used in table views. Leave empty to follow `editor.fontFamily`. |
-| `tableViewer.fontSize` | `0` (editor size) | Font size in pixels used in table views. Set to `0` to follow `editor.fontSize`. |
-| `tableViewer.tabOrientation` | `horizontal` | Default worksheet tab orientation (`horizontal` or `vertical`). Can be overridden per file. |
-| `tableViewer.diffOnByDefault` | `false` | Turn the **Diff** toggle on when you start editing, so each edited cell shows the file value it would replace beside the pending edit. If that cell changes in the file, Diff updates to the current file value. The setting can be overridden per viewer from the toolbar. |
-| `tableViewer.maxStoredFiles` | `10000` | Maximum number of files whose layout state is remembered. Least recently used entries are evicted first. |
-| `tableViewer.csvMaxRows` | `1000000` | Rows to display by default for CSV/TSV files. A banner on larger files lets you change the limit or load all rows for that view. |
-| `tableViewer.maxFileSizeMiB` | `256` | File-size threshold in MiB. Above it, Table Viewer asks before opening the file and offers **Open Anyway**. |
-
-## Standalone desktop app
-
-Table Viewer also runs as a standalone Electron desktop app that reuses the same viewer, grid, and persistence code — no VS Code required. See [desktop/README.md](desktop/README.md) for build, run, packaging, and testing instructions.
-
-See [Installation](#installation) above for the exact macOS and Windows downloads. The [desktop setup guide](docs/setup-guide-desktop-app.md) has a longer walkthrough, update behavior, checksum verification, and troubleshooting. Release maintainers can find the Homebrew tap and release plumbing in the [Homebrew tap guide](docs/homebrew-tap.md).
-
 ## Development
 
-Clone the repo and run `npm install`.
-
-**VS Code extension** (unchanged flow):
-
-- `npm run bundle && npm run bundle:webview` — build the extension and webview bundles
-- `npm test` — vitest unit tests
-- `npm run test:integration` — VS Code Extension Host integration tests
-- `npm run package` — build the `.vsix` with vsce
-
-**Desktop app:**
-
-- `npm run desktop:dev` — build the bundles and launch the app with Electron
-- `npm run desktop:package` — unsigned local macOS build (dmg + zip, under `dist/desktop-packages/`)
-- `npm run desktop:package:win` — Windows build (setup + portable exe, x64 + arm64); must be run on Windows
-- `npm run test:desktop-smoke` — Playwright Electron smoke tests (separate from the vitest suite)
-
-`./scripts/setup.sh` builds and installs both front ends locally in one go — the `.vsix` into every supported editor on `PATH`, and (on macOS) the desktop app into `/Applications`. See the [development guide](docs/development.md) for its flags and exact behavior.
+Clone the repo and run `npm install`, then `npm test` for the unit tests. The [development guide](docs/development.md) lists the build, test, and packaging scripts for both front ends, and explains `./scripts/setup.sh`, which builds and installs both locally. [desktop/README.md](desktop/README.md) covers the desktop shell, and the [Homebrew tap guide](docs/homebrew-tap.md) covers the release plumbing.
 
 ## License
 

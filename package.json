@@ -271,7 +271,7 @@
     "perf:compare": "node benchmarks/grid/compare.mjs",
     "perf:ooxml": "node benchmarks/ooxml/run.mjs --compare benchmarks/ooxml/baselines/main-string-scanner.json",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package --no-dependencies"
+    "package": "vsce package --no-dependencies --readme-path README.vscode.md"
   },
   "dependencies": {
     "@jbearak/dta-parser": "^1.1.0",
