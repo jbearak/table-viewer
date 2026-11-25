@@ -17,7 +17,7 @@ The standalone app currently supports Apple Silicon Macs running macOS 12 or lat
 
 Install Table Viewer one of two ways:
 
-- **Disk image.** Open the [latest Table Viewer release](https://github.com/jbearak/table-viewer/releases/latest), download `table-viewer-…-arm64.dmg`, open it, and drag **Table Viewer** into your Applications folder.
+- **Disk image.** Open the [latest Table Viewer release](https://github.com/jbearak/table-viewer/releases/latest), download `table-viewer-…-arm64.dmg`, open it, and drag **Table Viewer** into your Applications folder. The similarly named `.zip` and `latest-mac.yml` files are used by the automatic updater.
 - **Homebrew.** If you use [Homebrew](https://brew.sh/), run:
 
   ```sh
@@ -33,6 +33,8 @@ Open the [latest Table Viewer release](https://github.com/jbearak/table-viewer/r
 - Choose `table-viewer-…-x64-setup.exe` for most PCs.
 - Choose `table-viewer-…-arm64-setup.exe` for an Arm-based PC such as a Snapdragon laptop or Surface Pro X/11.
 - If you cannot install software, choose the matching `…-portable.exe` instead. It runs directly with no Start Menu entry and adds per-user **Open with** entries on first launch.
+
+If you are unsure which kind of PC you have, open **Settings → System → About** and check **System type**. Choose the `setup.exe` unless you specifically need the no-install version. The setup wizard creates a Start Menu entry and registers **Open with** handlers. The portable `.exe` creates no Start Menu or uninstaller entry, although it does store your Table Viewer settings. The `.blockmap` and `.yml` assets on the release are updater metadata, not installers.
 
 Run the downloaded file. The installer defaults to installing only for your account, which does not require administrator access. Windows builds are unsigned, so SmartScreen may show **Windows protected your PC** the first time. Click **More info**, confirm that the app is Table Viewer, then click **Run anyway**. If you would rather check the download first, each `.exe` on the release page has a matching `.sha256` file; run `Get-FileHash <file>` in PowerShell and compare.
 

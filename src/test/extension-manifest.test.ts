@@ -192,7 +192,7 @@ describe('extension runtime manifest', () => {
 
     it('externalizes the host-provided SQLite runtime from the one bundle it builds', () => {
         expect(manifest.scripts?.bundle).toContain('--external:node:sqlite');
-        expect(manifest.scripts?.package).toBe('vsce package --no-dependencies');
+        expect(manifest.scripts?.package).toBe('vsce package --no-dependencies --readme-path README.vscode.md');
         for (const retired of [
             'bundle:companion',
             'package:companion',
