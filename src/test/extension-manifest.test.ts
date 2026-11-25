@@ -54,7 +54,7 @@ describe('extension runtime manifest', () => {
         });
         expect(manifest.extensionKind).toEqual(['workspace']);
         expect(manifest.activationEvents).toEqual(['onStartupFinished']);
-        expect(manifest.devDependencies?.electron).toBe('43.4.0');
+        expect(manifest.devDependencies?.electron).toBe('43.8.13');
         expect(manifest.devDependencies?.['@types/node']).toBe('26.1.2');
     });
 
