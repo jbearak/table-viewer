@@ -178,9 +178,14 @@ export async function compute_transform(
                 // Operands are checked against the saved column, as a restore or a
                 // replay will check them, so a rule unsaved values let in is not
                 // one those refuse. The unsaved values only decide which rows match.
+                // Number operands pass whatever the column, so only a group with
+                // another operand needs the saved column read.
                 if (
                     overrides !== undefined
-                    && filters.some((filter) => NUMERIC_FILTER_OPERATORS.has(filter.operator))
+                    && filters.some((filter) => NUMERIC_FILTER_OPERATORS.has(filter.operator)
+                        && (!numeric_operand_text(filter.value)
+                            || (is_range_filter_operator(filter.operator)
+                                && !numeric_operand_text(filter.secondValue))))
                 ) {
                     const saved = await acquire_transform_column(
                         source,

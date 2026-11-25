@@ -6690,10 +6690,10 @@ export function App(): React.JSX.Element {
                             [],
                             kept?.id === undefined || kept_sheet === undefined ? undefined : previous[kept_sheet],
                         ));
-                        for (const dropped of pending_transform_request_ids_ref.current) {
-                            if (dropped !== undefined && dropped !== kept?.id) {
-                                transform_request_read_values_ref.current.delete(dropped);
-                            }
+                        // What any other request read, a replaced one of the action's
+                        // included, is not taken under the new source.
+                        for (const id of [...transform_request_read_values_ref.current.keys()]) {
+                            if (id !== kept?.id) transform_request_read_values_ref.current.delete(id);
                         }
                         pending_transform_request_ids_ref.current = keep([], kept?.id);
                         pending_transform_states_ref.current = keep([], kept?.state);
@@ -7410,6 +7410,11 @@ export function App(): React.JSX.Element {
                             ...msg.projection,
                         } satisfies HostMessage,
                     } as MessageEvent);
+                }
+                // A replaced request the host settles without an install read
+                // values nothing will take.
+                if (pending_transform_request_ids_ref.current[msg.sheetIndex] !== msg.requestId) {
+                    transform_request_read_values_ref.current.delete(msg.requestId);
                 }
                 settle_view_action_ref.current(msg);
                 return;
