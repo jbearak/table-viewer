@@ -27,9 +27,9 @@ A file stored in Git LFS but not yet downloaded shows a banner with the real siz
 ## Highlights
 
 - [Sorts, filters, and hidden columns](docs/features.md#sorting-and-filtering) change the view, never the file, and are still there the next time you open it.
-- When a report puts titles and notes above the table, right-click the real header row and choose [**Use row as header**](docs/features.md#opening-files).
+- When an Excel sheet has titles and notes above the table, right-click the row number beside the real header and choose [**Use row as header**](docs/features.md#opening-files).
 - [Highlight cells](docs/features.md#cell-highlights) from the right-click menu. Highlights survive saves, reloads, and a regenerated file.
-- [Edit](docs/features.md#editing-xlsx-csv-and-tsv) `.xlsx`, CSV, and TSV cells in place, insert and move rows and columns, and [undo](docs/undo-and-redo.md) any of it.
+- [Edit](docs/features.md#editing-xlsx-csv-and-tsv) `.xlsx`, CSV, and TSV cells in place, and insert, delete, and move rows and columns. [Undo](docs/undo-and-redo.md) steps back through edits, row and column changes, sorts, filters, and resizes.
 - [CSV and TSV files](docs/features.md#csvtsv-modes) can go past Excel's 1,048,576-row limit. Table Viewer shows a million rows by default and can load the rest.
 - Over Remote - SSH it works the same as on a local file, and it uses your editor's theme and font.
 

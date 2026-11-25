@@ -21,7 +21,7 @@ You can change the header row while you have unsaved changes. Your edits stay in
 
 **Parquet files** open automatically as single read-only tables, with dates, times, time zones, and 64-bit integers shown as they are stored. Columns Table Viewer cannot show, such as lists and structs, are left out with a warning naming them. See [Parquet files](parquet-files.md).
 
-## Default editor behavior
+## Default editor behavior in VS Code
 
 Table Viewer registers as the default editor for Excel (`.xlsx`, `.xls`), Stata (`.dta`), Parquet (`.parquet`), CSV, and TSV files. `.xlsx`, CSV, and TSV files are editable; legacy `.xls` workbooks, `.dta` datasets, and `.parquet` files are read-only. If another viewer is registered for one of these formats, VS Code may ask which editor you'd like to use.
 
