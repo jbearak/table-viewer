@@ -6690,10 +6690,16 @@ export function App(): React.JSX.Element {
                             [],
                             kept?.id === undefined || kept_sheet === undefined ? undefined : previous[kept_sheet],
                         ));
-                        // What any other request read, a replaced one of the action's
-                        // included, is not taken under the new source.
+                        // What any other request read is not taken, a replaced one of
+                        // the action's included when the source changed. On the same
+                        // source the action stays, and the host still answers its
+                        // requests.
+                        const surviving = view_action_ref.current;
                         for (const id of [...transform_request_read_values_ref.current.keys()]) {
-                            if (id !== kept?.id) transform_request_read_values_ref.current.delete(id);
+                            if (
+                                id !== kept?.id
+                                && !(surviving !== undefined && view_action_owns(surviving.action, id))
+                            ) transform_request_read_values_ref.current.delete(id);
                         }
                         pending_transform_request_ids_ref.current = keep([], kept?.id);
                         pending_transform_states_ref.current = keep([], kept?.state);
