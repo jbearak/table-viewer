@@ -699,26 +699,34 @@ test('a number in a Pending Column shows the format and digits it has after Save
 
     // Find matches what each cell paints: 19/9 as General and as 0%, 0.125 as 0%.
     const find_input = page.locator('input[aria-label="Find"]');
+    // Find searches once per query, and a result arrives some time after the
+    // edit that asks for it, so search again until it matches.
     const painted = async (text: string, column: number, row: number) => {
         if (await find_input.count() === 0) await page.keyboard.press('ControlOrMeta+F');
-        await find_input.fill(text);
-        await expect(page.locator(`#glide-cell-${column}-${row}`)).toHaveAttribute('aria-selected', 'true');
+        await expect(async () => {
+            await find_input.fill('');
+            await find_input.fill(text);
+            await expect(page.locator(`#glide-cell-${column}-${row}`))
+                .toHaveAttribute('aria-selected', 'true', { timeout: 2_000 });
+        }).toPass({ timeout: 30_000 });
     };
     const not_painted = async (text: string) => {
         await find_input.fill(text);
         await expect(page.locator('.find-bar-status')).toHaveText('No matches');
     };
+    // The painted checks come first, so the absent ones run on settled results.
     const expect_painted = async () => {
         await painted('2.111111111', 2, 0);
-        await not_painted('2.1111111111');
         await painted('211%', 4, 0);
         await painted('13%', 4, 1);
+        await not_painted('2.1111111111');
         await not_painted('0.125');
     };
     await save_screenshot(page, '14-xlsx-pending-column-before-save');
     await expect_painted();
 
-    await save_changes(page);
+    // Past the read-back, which remounts the grid and ends a search in flight.
+    await save_and_reread(app!, page);
     await expect_painted();
     await save_screenshot(page, '15-xlsx-pending-column-after-save');
     // The file gives D1 and D2 B's 0% and B1 no format. Save writes a new
