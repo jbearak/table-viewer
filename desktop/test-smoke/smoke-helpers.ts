@@ -21,17 +21,54 @@ export function isolated_user_data(prefix: string): string {
 }
 
 /** Launch the built desktop bundle against `user_data_dir`, opening `files`. */
-export function launch_app(
+export async function launch_app(
     user_data_dir: string,
     files: readonly string[] = [],
     env: NodeJS.ProcessEnv = {},
 ): Promise<ElectronApplication> {
     expect(fs.existsSync(main_js), 'run npm run bundle:desktop first').toBe(true);
-    return electron.launch({
+    return answer_main_evaluates_after_main_yields(await electron.launch({
         args: [main_js, ...files],
         cwd: repo_dir,
         env: { ...process.env, ...env, TABLE_VIEWER_USER_DATA_DIR: user_data_dir },
-    });
+    }));
+}
+
+/**
+ * Make every `app.evaluate` hold its result until the main process yields.
+ *
+ * Playwright evaluates with `awaitPromise`, and V8's inspector holds the
+ * settled result promise only weakly until it sends the reply. While main is
+ * busy (a Save parsing a workbook) the reply waits, and a garbage collection in
+ * that gap answers "Promise was collected", which Playwright reports as
+ * "Execution context was destroyed, most likely because of a navigation".
+ * A result still pending in a `setImmediate` cannot be collected, and it
+ * settles once main is idle, when the reply goes out at once.
+ *
+ * The function runs from its source, as Playwright runs it anyway.
+ */
+export function answer_main_evaluates_after_main_yields(app: ElectronApplication): ElectronApplication {
+    const evaluate = app.evaluate.bind(app) as (
+        fn: (electron: unknown, arg: { source: string; argument: unknown }) => Promise<unknown>,
+        arg: { source: string; argument: unknown },
+    ) => Promise<unknown>;
+    app.evaluate = ((fn: (...args: unknown[]) => unknown, argument?: unknown) => evaluate(
+        async (electron, { source, argument: passed }) => {
+            const run = (0, eval)(`(${source})`) as (electron: unknown, arg: unknown) => unknown;
+            let settled: { value: unknown } | { error: unknown };
+            try {
+                settled = { value: await run(electron, passed) };
+            } catch (error) {
+                settled = { error };
+            }
+            return new Promise((resolve, reject) => setImmediate(() => {
+                if ('error' in settled) reject(settled.error);
+                else resolve(settled.value);
+            }));
+        },
+        { source: fn.toString(), argument },
+    )) as ElectronApplication['evaluate'];
+    return app;
 }
 
 export type ParsedWorkbook = Awaited<ReturnType<typeof parse_xlsx>>;
