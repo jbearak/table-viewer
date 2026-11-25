@@ -18048,18 +18048,109 @@ describe('stale-view banner', () => {
         expect_no_call_to_action();
     });
 
-    it('reads saved values for a sort chosen mid-edit', async () => {
+    it('reads unsaved values for a sort chosen after an edit', async () => {
         const post_message = await session_sorted_on_column_0();
         await commit_edits(dirty('0:0'));
+        expect(banner()?.textContent).toContain(BANNER_TEXT);
         await act(async () => (
             container!.querySelector('.stub-header-transform') as HTMLButtonElement
         ).click());
         const request = latest_transform_request(post_message);
-        // Only Reapply applies unsaved values; a choice moves no row by an edit.
-        expect(request.cellValues).toBeUndefined();
+        // A sort chosen after the edit sorts by it, so the order is not stale.
+        expect(request.cellValues).toEqual({ '0:0': 'dirty-0:0' });
         await acknowledge_transform(request, 3);
-        expect(banner()?.textContent).toContain(BANNER_TEXT);
-        expect_no_call_to_action();
+        expect(banner()).toBeNull();
+    });
+
+    it('keeps what a replaced choice read when its install lands and the newer one is refused', async () => {
+        const post_message = await session_sorted_on_column_0();
+        await commit_edits(dirty('0:0'));
+        const click = (name: string) => act(async () => (
+            container!.querySelector(name) as HTMLButtonElement
+        ).click());
+        await click('.stub-header-transform');
+        const first = latest_transform_request(post_message);
+        await click('.stub-shortcut-transform');
+        const second = latest_transform_request(post_message);
+        expect(second.requestId).not.toBe(first.requestId);
+
+        // The replaced sort still installs, by the edit it read.
+        await acknowledge_transform(first, 3);
+        await dispatch_host_message({
+            type: 'transformRefused',
+            sheetIndex: second.sheetIndex,
+            requestId: second.requestId,
+            intent: second.intent,
+            reason: 'Refused.',
+            terminal: true,
+        });
+        expect(grid_stub().getAttribute('data-generation')).toBe('3');
+        expect(banner()).toBeNull();
+    });
+
+    it('keeps what a replaced choice read across a same-source refresh', async () => {
+        const post_message = await session_sorted_on_column_0();
+        await commit_edits(dirty('0:0'));
+        const click = (name: string) => act(async () => (
+            container!.querySelector(name) as HTMLButtonElement
+        ).click());
+        await click('.stub-header-transform');
+        const first = latest_transform_request(post_message);
+        await click('.stub-shortcut-transform');
+        const second = latest_transform_request(post_message);
+
+        // Another change moved the view generation on the same source: the host
+        // still answers both requests.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1'], false), {
+            generation: 3,
+            sourceGeneration: 1,
+            reason: 'other',
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'test-edit-session',
+            },
+            state: {
+                transforms: [{
+                    sort: [{ colIndex: 0, direction: 'asc' }],
+                    filters: [],
+                    schema: '["Sheet1",1,null]',
+                }],
+            },
+        }));
+        expect(latest_transform_request(post_message).requestId).toBe(second.requestId);
+
+        await acknowledge_transform(first, 4);
+        await dispatch_host_message({
+            type: 'transformRefused',
+            sheetIndex: second.sheetIndex,
+            requestId: second.requestId,
+            intent: second.intent,
+            reason: 'Refused.',
+            terminal: true,
+        });
+        expect(grid_stub().getAttribute('data-generation')).toBe('4');
+        expect(banner()).toBeNull();
+    });
+
+    it('reads unsaved values for a hide, which installs the sort again', async () => {
+        const post_message = await session_sorted_on_column_0();
+        await commit_edits(dirty('0:0'));
+        const props = () => grid_shell_mock.latest_props as unknown as GridShellProps;
+        await act(async () => props().on_hide_rows?.([{ start: 0, end: 0 }]));
+        const question = post_message.mock.calls.map((call) => call[0] as WebviewMessage)
+            .filter((message): message is Extract<WebviewMessage, { type: 'resolveHiddenRows' }> => (
+                message.type === 'resolveHiddenRows'
+            )).at(-1)!;
+        await dispatch_host_message({
+            type: 'hiddenRowsResolved', sheetIndex: 0, requestId: question.requestId, sourceRows: [0],
+        });
+        const hide = latest_transform_request(post_message);
+        expect(hide.state.hiddenRows).toEqual([0]);
+        // The sort the hide installs again reads the edit, as the hide's own choice.
+        expect(hide.cellValues).toEqual({ '0:0': 'dirty-0:0' });
+        await acknowledge_transform(hide, 3);
+        expect(banner()?.textContent ?? '').not.toContain(BANNER_TEXT);
     });
 
     it('announces a dismissed edit again once a Reapply read it and it changed', async () => {

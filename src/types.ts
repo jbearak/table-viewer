@@ -342,8 +342,8 @@ export type SheetViewRecord =
          * Computed on the host because that is the only place both halves of the
          * question exist at once — the permutation and the durable dirty map.
          * Membership moves only at an install: an installed filter never recomputes
-         * as the user types (an install reads saved values, or for a Reapply the
-         * unsaved ones its `cellValues` carry), and the user can only type into rows
+         * as the user types (an install reads saved values, or for a view choice or a
+         * Reapply the unsaved ones its `cellValues` carry), and the user can only type into rows
          * the view is showing.
          *
          * Keys rather than a bare count, and this is the refinement worth keeping
@@ -4076,7 +4076,8 @@ export type WebviewMessage =
      */
     | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; unhideAll?: boolean; headerRow?: number; target?: ExcelHeaderTarget; requestId: string; generation: number; sourceGeneration: number }
     /**
-     * `cellValues`, sent only by the stale-view banner's Reapply, is the window's
+     * `cellValues`, sent by the person's sort, filter and hide choices and by the
+     * stale-view banner's Reapply (not by a replay, restore or cancel), is the window's
      * unsaved text for cells in columns these rules read, keyed
      * `"sourceRow:sourceColumn"`. The install reads them in place of the saved values,
      * so the order follows what is on screen. They only shape this install: nothing

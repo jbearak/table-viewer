@@ -403,8 +403,9 @@ export function transform_read_values(
  * The keys where the installed order and the values on screen disagree: an edit the
  * order has not read (made since the install, or changed again since), and an edit the
  * order read that is gone again (undone or discarded, so the cell shows its saved
- * value). `read_values` is what a Reapply read (`transform_read_values`); a view
- * installed any other way read none, which leaves every edit stale, as before Reapply.
+ * value). `read_values` is what the installing choice or Reapply read
+ * (`transform_read_values`); a view a replay, restore or cancel installed read none,
+ * which leaves every edit stale.
  */
 export function stale_dirty_keys(
     state: SheetTransformState | undefined,

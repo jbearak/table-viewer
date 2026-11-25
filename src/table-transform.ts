@@ -103,7 +103,7 @@ export async function compute_transform(
      *  deliberately ignorant of compare mode. */
     changed_rows?: readonly number[],
     /** Per column, cells read in place of the source's, keyed by projected row:
-     *  the unsaved values a Reapply reads. */
+     *  the unsaved values a view choice or a Reapply reads. */
     cell_overrides?: TransformCellOverrides,
 ): Promise<TransformResult> {
     const sheet = source.meta().sheets[sheet_index];
@@ -174,6 +174,33 @@ export async function compute_transform(
             survivor_count = 0;
             let first_group = hidden_rows.size === 0 && only_changed === undefined;
             for (const [column_index, filters] of filter_groups) {
+                const overrides = cell_overrides?.get(column_index);
+                // Operands are checked against the saved column, as a restore or a
+                // replay will check them, so a rule unsaved values let in is not
+                // one those refuse. The unsaved values only decide which rows match.
+                // Number operands pass whatever the column, so only a group with
+                // another operand needs the saved column read.
+                if (
+                    overrides !== undefined
+                    && filters.some((filter) => NUMERIC_FILTER_OPERATORS.has(filter.operator)
+                        && (!numeric_operand_text(filter.value)
+                            || (is_range_filter_operator(filter.operator)
+                                && !numeric_operand_text(filter.secondValue))))
+                ) {
+                    const saved = await acquire_transform_column(
+                        source,
+                        sheet_index,
+                        column_index,
+                        sheet.rowCount,
+                        false,
+                        column_cache,
+                        is_cancelled,
+                        sort_instrumentation,
+                    );
+                    const saved_numeric = saved.columnKind === 'numeric';
+                    release_transform_column(saved, sort_instrumentation);
+                    validate_filter_operands(filters, saved_numeric);
+                }
                 const column = await acquire_transform_column(
                     source,
                     sheet_index,
@@ -183,17 +210,16 @@ export async function compute_transform(
                     column_cache,
                     is_cancelled,
                     sort_instrumentation,
-                    cell_overrides?.get(column_index),
+                    overrides,
                 );
                 try {
                     const compiled = compile_filter_group(
                         filters,
                         column.columnKind === 'numeric',
-                        // Strict for rules being chosen. Unsaved values only ever
-                        // accompany a Reapply of installed rules, and an edit that
-                        // turns a text column numeric must not refuse the filter
-                        // the person already has.
-                        cell_overrides?.has(column_index) !== true,
+                        // Strict over saved values. Over unsaved ones, checked above
+                        // against the saved column: an edit that turns a text column
+                        // numeric must not refuse the filter the person already has.
+                        overrides === undefined,
                         sort_instrumentation,
                         await present_special_filter_identities(
                             column,
@@ -715,7 +741,7 @@ function compile_filter(
             strict_numeric_operands,
             instrumentation,
         );
-        // Lenient compilation (a Reapply over unsaved values) can read one bound as
+        // Lenient compilation (over unsaved values) can read one bound as
         // a number and not the other; a range compares both bounds one way, so it
         // falls back to text for both.
         if ((lower.numeric === undefined) !== (upper.numeric === undefined)) {

@@ -1199,6 +1199,30 @@ describe('ViewerPanelCore', () => {
             .toMatchObject({ type: 'transformInstalled', view: { rowCount: 0 } });
     });
 
+    it('refuses a text operand on a saved numeric column whatever the unsaved values', async () => {
+        const { panel, posted } = make_panel();
+        const values = ['1', '2', '3'];
+        const source = new TrackingColumnSource(3, 1, 1, (_sheet, _column, row) => values[row]);
+        const core = new ViewerPanelCore(panel, source);
+        const state: SheetTransformState = {
+            sort: [],
+            filters: [{
+                id: 'f', colIndex: 0, operator: 'equals', value: 'open',
+                caseSensitive: false, enabled: true,
+            }],
+            schema: '["Sheet1",1,null]',
+        };
+        // The unsaved value makes the column text, but a restore reads the saved,
+        // numeric one and would refuse the rule, so it is refused now.
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'choice',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state, cellValues: { '0:0': 'open' },
+        });
+        expect(posted.find((message) => message.requestId === 'choice'))
+            .toMatchObject({ type: 'transformRefused' });
+    });
+
     it('reapplies a range whose bounds read differently once edits make the column numeric', async () => {
         const { panel, posted } = make_panel();
         const values = ['2024-06-01', '2024-03-01'];
