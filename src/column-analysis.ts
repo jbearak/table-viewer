@@ -223,7 +223,7 @@ export async function acquire_column_analysis(
     cache: ColumnAnalysisCache | undefined,
     is_cancelled: () => boolean,
     /** Cells to read in place of the source's, keyed by projected row: the unsaved
-     *  values a Reapply sorts and filters by. An analysis built from them describes
+     *  values a view choice or a Reapply sorts and filters by. An analysis built from them describes
      *  no saved column, so it neither comes from the cache nor goes into it. */
     overrides?: ReadonlyMap<number, RawCell | null>,
 ): Promise<ColumnAnalysis> {

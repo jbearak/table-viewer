@@ -3116,6 +3116,9 @@ export function App(): React.JSX.Element {
     const transform_request_read_values_ref = useRef(
         new Map<string, Readonly<Record<string, string>>>(),
     );
+    // Each sheet's latest Reapply request id. A choice reads unsaved values too, so
+    // having read values does not make a request a Reapply.
+    const reapply_request_ids_ref = useRef<(string | undefined)[]>([]);
     // Keys the *host* refused a save over, from a saveResult's `rejection`. These
     // exist because the webview cannot inspect a filtered-out row, an evicted page,
     // or a row past the current row count. Without this state the review could not
@@ -4097,9 +4100,9 @@ export function App(): React.JSX.Element {
         // Given for a gesture that records a step and for a replay; a restore
         // and a cancel give none.
         view?: Omit<PendingViewTransform, 'requestId'>,
-        // Reapply only: the install reads the unsaved values on screen. Every other
-        // request reads saved values, so a hide, a replay or a new sort moves no row
-        // by an edit the person did not ask to apply.
+        // The person's view choices and Reapply: the install reads the unsaved values
+        // on screen, so a sort or filter chosen after an edit sorts and filters by it.
+        // A replay, a restore and a cancel read saved values.
         read_unsaved = false,
     ): string => {
         const request_id = [
@@ -4112,12 +4115,12 @@ export function App(): React.JSX.Element {
         pending_transform_request_ids_ref.current[sheet_index] = request_id;
         pending_transform_states_ref.current[sheet_index] = state;
         pending_transform_origins_ref.current[sheet_index] = origin;
-        // A Reapply replaced by the next request on its sheet (a Cancel, say) is
-        // superseded: its install is not taken, so neither are its read values.
+        // A request that read unsaved values, replaced by the next request on its
+        // sheet (a Cancel, say), is superseded: its read values are not taken.
         if (previous_request_id !== undefined) {
             transform_request_read_values_ref.current.delete(previous_request_id);
         }
-        // Only a Reapply reads unsaved values. An XLSX formula has no result the
+        // An XLSX formula has no result the
         // host can read before Save, so it is not sent, and the notice keeps counting
         // it as stale. An unstyled XLSX number is sent as the reload would read it
         // (`1.` as `1`); a styled one saves as text, and dates and booleans, which
@@ -4208,6 +4211,7 @@ export function App(): React.JSX.Element {
                 baseline: action.baseline,
                 target: action.requested,
             },
+            !cancel,
         );
         view_action_ref.current = {
             ...pending,
@@ -7532,8 +7536,9 @@ export function App(): React.JSX.Element {
                 set_generation(view.basis.generation);
                 generation_ref.current = view.basis.generation;
                 if (recomputed) {
-                    // Every install that recomputed replaces it: what a Reapply read,
-                    // or nothing for any other request, which read saved values.
+                    // Every install that recomputed replaces it: what a choice or a
+                    // Reapply read, or nothing for a replay, restore or cancel, which
+                    // read saved values.
                     set_installed_read_values((prev) => {
                         const next = [...prev];
                         next[msg.sheetIndex] = view.permuted
@@ -11178,7 +11183,7 @@ export function App(): React.JSX.Element {
                 return false;
             }
             if (active_sheet === undefined || schema === undefined) {
-                request_transform(active_sheet_index, sanitized, 'user', origin);
+                request_transform(active_sheet_index, sanitized, 'user', origin, undefined, true);
                 return true;
             }
             const worksheet: WorksheetTarget = {
@@ -11215,6 +11220,7 @@ export function App(): React.JSX.Element {
                     baseline: action.baseline,
                     target: sanitized,
                 },
+                true,
             );
             view_action_ref.current = {
                 action: choose_in_view_action(action, sanitized, request_id),
@@ -11280,7 +11286,7 @@ export function App(): React.JSX.Element {
         // A view request like any sort, so editors, Save and history wait for it
         // as they do for one, with a baseline equal to its target: the install
         // records no step.
-        request_transform(sheet_index, installed.rules, 'user', 'grid', {
+        reapply_request_ids_ref.current[sheet_index] = request_transform(sheet_index, installed.rules, 'user', 'grid', {
             worksheet: {
                 sheetIndex: sheet_index,
                 sheetName: sheet.name,
@@ -11404,7 +11410,7 @@ export function App(): React.JSX.Element {
             schema: pending.schema,
             baseline: taken.baseline,
             target: requested,
-        });
+        }, true);
         view_action_ref.current = {
             ...pending,
             action: choose_in_view_action(taken, requested, request_id),
@@ -12059,9 +12065,9 @@ export function App(): React.JSX.Element {
             ?? state_ref.current.transforms?.[active_sheet_index];
         // A Reapply asks for the rules already installed, and is still worth
         // stopping: its order is not the one on screen.
-        const reapply_pending = transform_request_read_values_ref.current.has(
-            pending_transform_request_ids_ref.current[active_sheet_index] ?? '',
-        );
+        const pending_request_id = pending_transform_request_ids_ref.current[active_sheet_index];
+        const reapply_pending = pending_request_id !== undefined
+            && reapply_request_ids_ref.current[active_sheet_index] === pending_request_id;
         if (
             pending_state !== undefined
             && transforms_semantically_equal(current, previous)
@@ -12525,7 +12531,7 @@ export function App(): React.JSX.Element {
                         || save_lifecycle_correlation(msg.lifecycle)?.editSessionId
                             === current_session_id);
                 if (!matching) return;
-                // Saved, the values a Reapply read are the file's own, so an order
+                // Saved, the values a choice or Reapply read are the file's own, so an order
                 // computed from them is no longer stale for edits the save consumed.
                 // Below the guards above, so a repeated result for a save already
                 // settled cannot clear what a later Reapply recorded.
@@ -14769,9 +14775,9 @@ export function App(): React.JSX.Element {
         ? installed_view.hiddenEditedCellKeys
         : []).filter((key) => live_edits?.[key] !== undefined);
     const hidden_edited_cells = hidden_edited_cell_keys.length;
-    // Only edits where the installed order and the screen disagree: a Reapply reads
-    // the unsaved values on screen, and those edits are then reflected until they
-    // change again or are undone.
+    // Only edits where the installed order and the screen disagree: a sort, filter or
+    // Reapply reads the unsaved values on screen, and those edits are then reflected
+    // until they change again or are undone.
     const dirty_keys = stale_dirty_keys(
         installed_rules,
         live_edits,

@@ -103,7 +103,7 @@ export async function compute_transform(
      *  deliberately ignorant of compare mode. */
     changed_rows?: readonly number[],
     /** Per column, cells read in place of the source's, keyed by projected row:
-     *  the unsaved values a Reapply reads. */
+     *  the unsaved values a view choice or a Reapply reads. */
     cell_overrides?: TransformCellOverrides,
 ): Promise<TransformResult> {
     const sheet = source.meta().sheets[sheet_index];
@@ -189,8 +189,7 @@ export async function compute_transform(
                     const compiled = compile_filter_group(
                         filters,
                         column.columnKind === 'numeric',
-                        // Strict for rules being chosen. Unsaved values only ever
-                        // accompany a Reapply of installed rules, and an edit that
+                        // Strict over saved values. Over unsaved ones, an edit that
                         // turns a text column numeric must not refuse the filter
                         // the person already has.
                         cell_overrides?.has(column_index) !== true,
@@ -715,7 +714,7 @@ function compile_filter(
             strict_numeric_operands,
             instrumentation,
         );
-        // Lenient compilation (a Reapply over unsaved values) can read one bound as
+        // Lenient compilation (over unsaved values) can read one bound as
         // a number and not the other; a range compares both bounds one way, so it
         // falls back to text for both.
         if ((lower.numeric === undefined) !== (upper.numeric === undefined)) {

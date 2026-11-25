@@ -1,6 +1,6 @@
 // Rows stay where they are while the person edits a sorted or filtered table, and
 // the notice that says so offers Reapply, which sorts and filters again by the
-// values on screen, unsaved ones included.
+// values on screen, unsaved ones included. A sort chosen after an edit reads it too.
 //
 // Nothing here uses the application menu, so nothing depends on OS focus.
 import * as fs from 'fs';
@@ -114,5 +114,23 @@ for (const kind of ['csv', 'xlsx'] as const) {
         if (kind === 'csv') {
             expect(fs.readFileSync(file, 'utf8')).toContain('Bob,1,London');
         }
+    });
+
+    test(`${kind}: a sort chosen after an edit sorts by it`, async () => {
+        const { page } = await open_file(`sort-after-edit.${kind}`, fixture(kind));
+        // Bob, second and 25, becomes the oldest before any sort is chosen.
+        await type_into_cell(page, 2, 1, '99');
+        await expect.poll(() => body(page)).toEqual(
+            ['Alice|30|New York', 'Bob|99|London', 'Charlie|35|Paris', 'Dora|28|Oslo'],
+        );
+
+        const menu = await open_column_menu(page, 1);
+        await menu.getByRole('menuitemcheckbox', { name: 'Sort descending' }).click();
+        await expect.poll(() => body(page))
+            .toEqual(['Bob|99|London', 'Charlie|35|Paris', 'Alice|30|New York', 'Dora|28|Oslo']);
+        // The order already reads the edit, so there is nothing to reapply.
+        await expect(notice(page)).toHaveCount(0);
+        // The sort is a step of its own, above the edit.
+        await expect.poll(() => undo_menu_label(app!)).toBe('Undo Sort');
     });
 }
