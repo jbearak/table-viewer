@@ -48,26 +48,27 @@ export async function launch_app(
  * The function runs from its source, as Playwright runs it anyway.
  */
 export function answer_main_evaluates_after_main_yields(app: ElectronApplication): ElectronApplication {
-    const evaluate = app.evaluate.bind(app) as (
-        fn: (electron: unknown, arg: { source: string; argument: unknown }) => Promise<unknown>,
-        arg: { source: string; argument: unknown },
-    ) => Promise<unknown>;
-    app.evaluate = ((fn: (...args: unknown[]) => unknown, argument?: unknown) => evaluate(
-        async (electron, { source, argument: passed }) => {
-            const run = (0, eval)(`(${source})`) as (electron: unknown, arg: unknown) => unknown;
-            let settled: { value: unknown } | { error: unknown };
-            try {
-                settled = { value: await run(electron, passed) };
-            } catch (error) {
-                settled = { error };
-            }
-            return new Promise((resolve, reject) => setImmediate(() => {
-                if ('error' in settled) reject(settled.error);
-                else resolve(settled.value);
-            }));
-        },
-        { source: fn.toString(), argument },
-    )) as ElectronApplication['evaluate'];
+    const evaluate = app.evaluate.bind(app) as (fn: unknown, arg?: unknown) => Promise<unknown>;
+    const held = async (
+        electron: unknown,
+        { source, argument }: { source: string; argument: unknown },
+    ): Promise<unknown> => {
+        const run = (0, eval)(`(${source})`) as (electron: unknown, arg: unknown) => unknown;
+        let settled: { value: unknown } | { error: unknown };
+        try {
+            settled = { value: await run(electron, argument) };
+        } catch (error) {
+            settled = { error };
+        }
+        return new Promise((resolve, reject) => setImmediate(() => {
+            if ('error' in settled) reject(settled.error);
+            else resolve(settled.value);
+        }));
+    };
+    // A string is an expression, which Playwright evaluates as it is.
+    app.evaluate = ((fn: unknown, argument?: unknown) => typeof fn === 'string'
+        ? evaluate(fn, argument)
+        : evaluate(held, { source: String(fn), argument })) as ElectronApplication['evaluate'];
     return app;
 }
 
